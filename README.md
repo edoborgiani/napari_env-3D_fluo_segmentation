@@ -12,14 +12,17 @@ This repository provides a set of Jupyter notebooks and tools for 3D nuclei segm
 ```
 .
 ├── Fluo_3D_nuc_seg_v1.2.1.ipynb   # Notebook: v1.2.1 workflow
-├── Fluo_3D_nuc_seg_v1.2.2.ipynb   # Notebook: v1.2.2 workflow (latest)
+├── Fluo_3D_nuc_seg_v1.2.2.ipynb   # Notebook: v1.2.2 workflow
 ├── Fluo_3D_nuc_seg_v1.2.ipynb     # Notebook: v1.2 workflow
-├── Fluo_3D_nuc_seg_v1.3.ipynb     # Notebook: v1.3 workflow (experimental)
+├── Fluo_3D_nuc_seg_v1.3.ipynb     # Notebook: v1.3 workflow
+├── Fluo_3D_nuc_seg_v1.3.1.ipynb   # Notebook: v1.3.1 workflow (latest, recommended)
+├── Fluo_3D_nuc_seg_v1.3a.ipynb    # Notebook: v1.3a workflow (alternative/experimental)
+├── Fluo_3D_nuc_seg_v1.3.1.ipynb.bak # Backup of v1.3.1 notebook
 └── old_v/
-    ├── Fluo_3D_nuc_seg_v1.1.1.ipynb
-    ├── Fluo_3D_nuc_seg_v1.1.ipynb
-    ├── Fluo_3D_nuc_seg_v1.2.ipynb
-    └── Fluo_3D_nuclei_segmentation.ipynb
+   ├── Fluo_3D_nuc_seg_v1.1.1.ipynb
+   ├── Fluo_3D_nuc_seg_v1.1.ipynb
+   ├── Fluo_3D_nuc_seg_v1.2.ipynb
+   └── Fluo_3D_nuclei_segmentation.ipynb
 ```
 
 ## Getting Started
@@ -33,17 +36,16 @@ This repository provides a set of Jupyter notebooks and tools for 3D nuclei segm
    - Install dependencies (see below).
 
 3. **Install dependencies**
+   Install all required dependencies using:
    ```powershell
    pip install -r requirements.txt
-   # or install manually:
-   pip install napari[all] numpy scipy scikit-image matplotlib jupyter
    ```
 
 4. **Launch Jupyter Notebook**
    ```powershell
    jupyter notebook
    ```
-   Open one of the `Fluo_3D_nuc_seg_*.ipynb` notebooks to get started.
+   Open one of the `Fluo_3D_nuc_seg_*.ipynb` notebooks to get started. For the latest and recommended workflow, use `Fluo_3D_nuc_seg_v1.3.1.ipynb`. For experimental features, see `Fluo_3D_nuc_seg_v1.3a.ipynb`.
 
 ## Usage
 - Follow the instructions in the notebooks to load your 3D fluorescence images, run segmentation, and visualize results.
@@ -121,7 +123,7 @@ pip install napari[all] aicsimageio[nd2] nd2reader xlsxwriter pyvista simpleitk 
 
 ## Requirements
 - Python 3.8+
-- napari
+- napari[all]
 - numpy
 - scipy
 - scikit-image
@@ -138,6 +140,9 @@ pip install napari[all] aicsimageio[nd2] nd2reader xlsxwriter pyvista simpleitk 
 - tetgen
 - meshlib
 - pandas
+- vispy
+- reportlab
+- Pillow
 
 ## Contributing
 Contributions are welcome! Please open issues or pull requests for bug fixes, improvements, or new features.
