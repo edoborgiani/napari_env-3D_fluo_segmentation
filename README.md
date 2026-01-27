@@ -11,17 +11,18 @@ This repository provides a set of Jupyter notebooks and tools for 3D nuclei segm
 ## Repository Structure
 ```
 .
-├── Fluo_3D_nuc_seg_v1.2.1.ipynb   # Notebook: v1.2.1 workflow
-├── Fluo_3D_nuc_seg_v1.2.2.ipynb   # Notebook: v1.2.2 workflow
-├── Fluo_3D_nuc_seg_v1.2.ipynb     # Notebook: v1.2 workflow
-├── Fluo_3D_nuc_seg_v1.3.ipynb     # Notebook: v1.3 workflow
-├── Fluo_3D_nuc_seg_v1.3.1.ipynb   # Notebook: v1.3.1 workflow (latest, recommended)
-├── Fluo_3D_nuc_seg_v1.3a.ipynb    # Notebook: v1.3a workflow (alternative/experimental)
-├── Fluo_3D_nuc_seg_v1.3.1.ipynb.bak # Backup of v1.3.1 notebook
+├── Fluo_3D_nuc_seg_v1.2.3.ipynb   # Notebook: v1.2.3 workflow
+├── Fluo_3D_nuc_seg_v1.3.2.ipynb   # Notebook: v1.3.2 workflow (latest, recommended)
+├── requirements.txt               # Python dependencies
+├── README.md                      # This file
 └── old_v/
-   ├── Fluo_3D_nuc_seg_v1.1.1.ipynb
-   ├── Fluo_3D_nuc_seg_v1.1.ipynb
+   ├── Fluo_3D_nuc_seg_v1.2.1.ipynb
+   ├── Fluo_3D_nuc_seg_v1.2.2.ipynb
    ├── Fluo_3D_nuc_seg_v1.2.ipynb
+   ├── Fluo_3D_nuc_seg_v1.3.ipynb
+   ├── Fluo_3D_nuc_seg_v1.3.1.ipynb
+   ├── Fluo_3D_nuc_seg_v1.3.1.ipynb.bak
+   ├── Fluo_3D_nuc_seg_v1.3a.ipynb
    └── Fluo_3D_nuclei_segmentation.ipynb
 ```
 
@@ -45,7 +46,7 @@ This repository provides a set of Jupyter notebooks and tools for 3D nuclei segm
    ```powershell
    jupyter notebook
    ```
-   Open one of the `Fluo_3D_nuc_seg_*.ipynb` notebooks to get started. For the latest and recommended workflow, use `Fluo_3D_nuc_seg_v1.3.1.ipynb`. For experimental features, see `Fluo_3D_nuc_seg_v1.3a.ipynb`.
+   Open `Fluo_3D_nuc_seg_v1.3.2.ipynb` for the latest and recommended workflow.
 
 ## Usage
 - Follow the instructions in the notebooks to load your 3D fluorescence images, run segmentation, and visualize results.
@@ -53,9 +54,9 @@ This repository provides a set of Jupyter notebooks and tools for 3D nuclei segm
 - Each notebook version may contain different approaches or improvements—see notebook headers for details.
 
 
-## Detailed Guide: Using `Fluo_3D_nuc_seg_v1.3.ipynb`
+## Detailed Guide: Using `Fluo_3D_nuc_seg_v1.3.2.ipynb`
 
-The `Fluo_3D_nuc_seg_v1.3.ipynb` notebook provides an advanced, modular workflow for 3D segmentation and quantification of nuclei and cellular structures in fluorescence microscopy images. Below is a step-by-step guide to using this notebook:
+The `Fluo_3D_nuc_seg_v1.3.2.ipynb` notebook provides an advanced, user-friendly workflow for 3D segmentation and quantification of nuclei and cellular structures in fluorescence microscopy images. Below is a step-by-step guide to using this notebook:
 
 ### 1. Install Required Packages
 The notebook will attempt to install some dependencies automatically, but you may need to ensure the following are installed:
