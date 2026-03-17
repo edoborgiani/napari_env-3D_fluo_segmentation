@@ -173,6 +173,37 @@ def napari_contrast_gamma_uint8(image, contrast_limits, gamma):
     return (img * 255).round().astype(np.uint8)
 
 
+def _to_rgb_safe(color_value):
+    """Convert a color value to RGB with a gray fallback."""
+    try:
+        return np.array(mcolors.to_rgb(color_value))
+    except Exception:
+        return np.array(mcolors.to_rgb("gray"))
+
+
+def _display_uint8(image, contrast_limits=None, gamma=None):
+    """Render to uint8 using the same contrast/gamma logic used for Napari display."""
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros_like(arr, dtype=np.uint8)
+
+    if contrast_limits is not None:
+        cmin = float(contrast_limits[0])
+        cmax = float(contrast_limits[1])
+        if cmax <= cmin:
+            cmin = float(np.min(arr))
+            cmax = float(np.max(arr))
+    else:
+        cmin = float(np.min(arr))
+        cmax = float(np.max(arr))
+
+    if cmax <= cmin:
+        return np.zeros_like(arr, dtype=np.uint8)
+
+    gamma_value = 1.0 if gamma is None else float(gamma)
+    return napari_contrast_gamma_uint8(arr, (cmin, cmax), gamma_value)
+
+
 def remove_small_islands(binary_matrix, area_threshold):
     """Remove small connected components from a binary mask."""
     labeled_array, num_features = ndi.label(binary_matrix)
@@ -263,23 +294,22 @@ def voxel_volume(ri_x, ri_y, ri_z, zooms):
     return (ri_x * ri_y * ri_z) / np.prod(zooms)
 
 
-def save_raw_png(arr, filename, contrast_limits=None, gamma=None):
-    """Save a 2D array to PNG, optionally matching Napari display settings."""
+def save_raw_png(arr, filename, contrast_limits=None, gamma=None, color=None):
+    """Save a 2D array to PNG, with optional Napari-like display and colorization."""
     arr = np.asarray(arr)
 
-    if contrast_limits is not None:
-        clim = contrast_limits
-        gamma_value = 1.0 if gamma is None else float(gamma)
-        try:
-            out = napari_contrast_gamma_uint8(
-                arr.astype(np.float32),
-                (float(clim[0]), float(clim[1])),
-                gamma_value,
-            )
-            PILImage.fromarray(out).save(filename)
+    try:
+        if (contrast_limits is not None) or (gamma is not None):
+            out = _display_uint8(arr, contrast_limits=contrast_limits, gamma=gamma)
+            if color is not None:
+                rgb = _to_rgb_safe(color)
+                out_rgb = np.clip((out.astype(np.float32) / 255.0)[..., None] * rgb, 0.0, 1.0)
+                PILImage.fromarray((out_rgb * 255).astype(np.uint8)).save(filename)
+            else:
+                PILImage.fromarray(out).save(filename)
             return filename
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     if arr.dtype in (np.uint8, np.uint16):
         PILImage.fromarray(arr).save(filename)
@@ -458,8 +488,8 @@ def save_merged_figure(
         else:
             img_normalized = img_small / (img_small.max() + 1e-6)
 
-        color = np.array(mcolors.to_rgb(condition_colors.get(condition, "gray")))
-        merged_rgb += img_normalized[..., None] * color * 0.6
+        color = _to_rgb_safe(condition_colors.get(condition, "gray"))
+        merged_rgb += img_normalized[..., None] * color
 
     merged_rgb = np.clip(merged_rgb, 0, 1.0)
     merged_uint8 = (merged_rgb * 255).astype(np.uint8)
@@ -1155,6 +1185,11 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
             img = crop_dict.get(condition)
             arr = np.zeros((min_h, min_w)) if img is None or img.size == 0 else img[:min_h, :min_w]
             fname = f"crop_png/n{nucleus_id}_{condition}.png"
+            color = stain_complete_df.loc[condition, "Color"] if (
+                condition in stain_complete_df.index and "Color" in stain_complete_df.columns
+            ) else "gray"
+            if color == "WHITE":
+                color = "GRAY"
             if condition in stain_complete_df.index and "Cont_min" in stain_complete_df.columns:
                 try:
                     clim = (
@@ -1162,11 +1197,11 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
                         stain_complete_df.loc[condition, "Cont_max"],
                     )
                     gamma_value = stain_complete_df.loc[condition, "Gamma"] if "Gamma" in stain_complete_df.columns else 1.0
-                    save_raw_png(arr, fname, contrast_limits=clim, gamma=gamma_value)
+                    save_raw_png(arr, fname, contrast_limits=clim, gamma=gamma_value, color=color)
                 except Exception:
-                    save_raw_png(arr, fname)
+                    save_raw_png(arr, fname, color=color)
             else:
-                save_raw_png(arr, fname)
+                save_raw_png(arr, fname, color=color)
             channel_pngs.append(fname)
 
         merged_png = save_merged_figure(
