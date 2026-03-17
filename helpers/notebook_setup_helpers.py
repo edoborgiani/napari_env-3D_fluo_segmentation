@@ -46,6 +46,7 @@ def load_common_imports(
     imported["np"] = importlib.import_module("numpy")
     imported["plt"] = importlib.import_module("matplotlib.pyplot")
     imported["mcolors"] = importlib.import_module("matplotlib.colors") if profile == "nuclei" else None
+    imported["Line2D"] = importlib.import_module("matplotlib.lines").Line2D if profile == "nuclei" else None
     imported["sitk"] = importlib.import_module("SimpleITK") if profile == "nuclei" else None
     imported["skimage"] = importlib.import_module("skimage")
 
