@@ -41,6 +41,7 @@ __all__ = [
     "save_merged_figure",
     "save_raw_png",
     "save_single_channel_png",
+    "segment_nuclei_watershed",
     "set_notebook_context",
     "shrink_to_markers",
     "shrink_to_markers_robust",
@@ -1392,3 +1393,322 @@ def detect_peaks_xy_with_best_z(
         peak_coords_3d.append((z_i, y_i, x_i))
     
     return peak_coords_3d
+
+def segment_nuclei_watershed(
+    binary_mask,
+    r_zX,
+    r_zY,
+    r_zZ,
+    nuclei_diameter,
+    nuclei_z_anisotropy_factor=1.0,
+    nuclei_bridge_shrink_factor=0.28,
+    nuclei_split_diameter_min_factor=0.2,
+    nuclei_split_diameter_max_factor=1.0,
+    nuclei_split_diameter_scales=3,
+    nuclei_seed_min_fraction=0.5,
+):
+    """
+    Segment nuclei using watershed with multi-scale erosion and EDT peak fallback.
+    
+    Implements a robust watershed-based segmentation algorithm that:
+    1. Handles Z-anisotropy by adjusting erosion depths
+    2. Uses multi-scale erosion to create multiple seed points for dumbbell/multi-lobed nuclei
+    3. Falls back to EDT peak detection when erosion fails to split nuclei
+    4. Detects boundary-touching components to apply gentler erosion
+    5. Preserves isolated single-nuclei labels during cleanup
+    
+    Parameters
+    ----------
+    binary_mask : ndarray, shape (Z, Y, X), dtype bool
+        Binary mask of foreground (nuclear) regions.
+    
+    r_zX, r_zY, r_zZ : float
+        Voxel physical spacing in micrometers along X, Y, Z axes.
+    
+    nuclei_diameter : float
+        Approximate nucleus diameter in micrometers (used for erosion scaling).
+    
+    nuclei_z_anisotropy_factor : float, optional
+        Scaling factor for Z-axis weighting (default=1.0).
+        Values > 1 reduce Z erosion; < 1 increase it.
+    
+    nuclei_bridge_shrink_factor : float, optional
+        Fraction of nucleus diameter to erode for bridge-breaking (default=0.28).
+        Range [0.1, 0.5]; higher values = more aggressive erosion.
+    
+    nuclei_split_diameter_min_factor : float, optional
+        Minimum erosion scale as fraction of diameter (default=0.2).
+    
+    nuclei_split_diameter_max_factor : float, optional
+        Maximum erosion scale as fraction of diameter (default=1.0).
+    
+    nuclei_split_diameter_scales : int, optional
+        Number of erosion scales to evaluate (default=3).
+    
+    nuclei_seed_min_fraction : float, optional
+        Minimum seed size as fraction of expected nucleus volume (default=0.5).
+    
+    Returns
+    -------
+    im_out : ndarray, shape (Z, Y, X), dtype int32
+        Labeled nucleus segmentation (label value per voxel). Label 0 = background.
+    
+    debug_info : dict
+        Debugging information with keys:
+        - 'z_anisotropy': Computed Z anisotropy factor
+        - 'z_split_weight': Effective Z-weighting applied to erosion
+        - 'scales_with_seeds': Number of erosion scales that produced markers
+        - 'added_peak_seed_count': Number of seeds added via EDT peak detection
+        - 'added_seed_count': Number of fallback seeds added
+        - 'erosion_triplets': List of (z, y, x) erosion radii attempted
+        - 'boundary_components': Number of boundary-touching components
+        - 'restored_isolated_count': Voxels restored after cleanup
+        - 'dmin', 'dmax', 'n_scales': Diameter scaling parameters
+        - 'min_seed_vox': Minimum seed size threshold in voxels
+    
+    Notes
+    -----
+    - Modifies parameter r_zZ by computing effective_r_zZ for Z-anisotropy handling
+    - Uses peak_local_max from skimage.feature for EDT-based fallback
+    - Applies watershed transform with negative distance map to favor markers
+    - Removes small island labels but preserves those touching image boundaries
+    
+    Example
+    -------
+    >>> binary = im_threshold > 0  # Binary foreground mask
+    >>> nuclei, debug = segment_nuclei_watershed(
+    ...     binary,
+    ...     r_zX=0.1, r_zY=0.1, r_zZ=0.2,
+    ...     nuclei_diameter=30.0,
+    ...     nuclei_bridge_shrink_factor=0.28,
+    ... )
+    >>> print(f"Nuclei found: {int(nuclei.max())}, Peak-based seeds: {debug['added_peak_seed_count']}")
+    """
+    from skimage import morphology
+    from scipy import ndimage as ndi
+    from skimage.measure import label
+    from skimage.segmentation import watershed, relabel_sequential
+
+    # Derive Z weighting from the actual voxel anisotropy so depth
+    # separation follows the measured Z versus XY resolution.
+    xy_spacing = max(1e-6, float(np.mean([r_zY, r_zX])))
+    z_anisotropy = max(1.0, float(r_zZ / xy_spacing))
+    z_split_weight = z_anisotropy * max(0.25, float(nuclei_z_anisotropy_factor))
+    effective_r_zZ = r_zZ / z_split_weight
+
+    # Identify boundary-touching components to apply gentler erosion.
+    boundary_mask = np.zeros_like(binary_mask, dtype=bool)
+    boundary_margin = 3
+    boundary_mask[0:boundary_margin, :, :] = True
+    boundary_mask[-boundary_margin:, :, :] = True
+    boundary_mask[:, 0:boundary_margin, :] = True
+    boundary_mask[:, -boundary_margin:, :] = True
+    boundary_mask[:, :, 0:boundary_margin] = True
+    boundary_mask[:, :, -boundary_margin:] = True
+
+    boundary_components = set()
+    cc_labels_for_boundary, _ = label(binary_mask)
+    for cc_id in np.unique(cc_labels_for_boundary):
+        if cc_id == 0:
+            continue
+        cc_mask = cc_labels_for_boundary == cc_id
+        if np.any(cc_mask & boundary_mask):
+            boundary_components.add(int(cc_id))
+
+    # Evaluate several size priors from strong to weak erosion.
+    dmin = max(0.2, float(nuclei_split_diameter_min_factor))
+    dmax = max(dmin, float(nuclei_split_diameter_max_factor))
+    n_scales = max(2, int(nuclei_split_diameter_scales))
+    diameter_factors = np.linspace(dmax, dmin, n_scales)
+
+    min_diameter_um = nuclei_diameter * dmin
+    min_radius_um = min_diameter_um * 0.5
+    min_nucleus_volume_um3 = (4.0 * np.pi * (min_radius_um ** 3.0)) / 3.0
+    voxel_um3 = r_zZ * r_zY * r_zX
+    min_expected_nucleus_vox = max(1, int(min_nucleus_volume_um3 / voxel_um3))
+    min_seed_vox = max(8, int(min_expected_nucleus_vox * nuclei_seed_min_fraction))
+    min_seed_vox_boundary = max(4, int(min_seed_vox * 0.6))
+
+    markers = np.zeros_like(binary_mask, dtype=np.int32)
+    next_marker = 0
+    erosion_triplets = []
+    scales_with_seeds = 0
+
+    for d_factor in diameter_factors:
+        shrink_um = nuclei_diameter * d_factor * nuclei_bridge_shrink_factor
+        er_z_i = max(1, int(shrink_um / effective_r_zZ))
+        er_y_i = max(1, int(shrink_um / r_zY))
+        er_x_i = max(1, int(shrink_um / r_zX))
+        erosion_fp_i = make_anisotropic_footprint(er_z_i, er_y_i, er_x_i)
+        eroded_i = morphology.binary_erosion(binary_mask, footprint=erosion_fp_i)
+        erosion_triplets.append((er_z_i, er_y_i, er_x_i))
+
+        if not np.any(eroded_i):
+            continue
+
+        mk_i, num_i = label(eroded_i)
+        if num_i == 0:
+            continue
+
+        valid_ids = []
+        for seed_id in range(1, num_i + 1):
+            seed_mask = mk_i == seed_id
+            seed_size = int(np.sum(seed_mask))
+
+            overlaps_boundary = False
+            overlapping_cc_ids = np.unique(cc_labels_for_boundary[seed_mask])
+            overlapping_cc_ids = overlapping_cc_ids[overlapping_cc_ids > 0]
+            if len(overlapping_cc_ids) > 0:
+                overlaps_boundary = any(
+                    int(cc_id) in boundary_components for cc_id in overlapping_cc_ids
+                )
+
+            threshold = min_seed_vox_boundary if overlaps_boundary else min_seed_vox
+            if seed_size >= threshold:
+                valid_ids.append(seed_id)
+
+        if len(valid_ids) == 0:
+            continue
+
+        scales_with_seeds += 1
+
+        for seed_id in valid_ids:
+            seed_mask = mk_i == seed_id
+            if np.any(markers[seed_mask]):
+                continue
+            next_marker += 1
+            markers[seed_mask] = next_marker
+
+    num = int(markers.max())
+
+    # If all scales are too strong, relax once with half radii.
+    if num == 0:
+        for er_z_i, er_y_i, er_x_i in erosion_triplets:
+            er_z_r = max(1, er_z_i // 2)
+            er_y_r = max(1, er_y_i // 2)
+            er_x_r = max(1, er_x_i // 2)
+            erosion_fp_r = make_anisotropic_footprint(er_z_r, er_y_r, er_x_r)
+            eroded_r = morphology.binary_erosion(binary_mask, footprint=erosion_fp_r)
+            if not np.any(eroded_r):
+                continue
+            mk_r, num_r = label(eroded_r)
+            if num_r == 0:
+                continue
+
+            for seed_id in range(1, num_r + 1):
+                seed_mask = mk_r == seed_id
+                seed_size = int(np.sum(seed_mask))
+
+                overlaps_boundary = False
+                overlapping_cc_ids = np.unique(cc_labels_for_boundary[seed_mask])
+                overlapping_cc_ids = overlapping_cc_ids[overlapping_cc_ids > 0]
+                if len(overlapping_cc_ids) > 0:
+                    overlaps_boundary = any(
+                        int(cc_id) in boundary_components for cc_id in overlapping_cc_ids
+                    )
+
+                threshold = min_seed_vox_boundary if overlaps_boundary else min_seed_vox
+                if seed_size < threshold:
+                    continue
+                if np.any(markers[seed_mask]):
+                    continue
+                next_marker += 1
+                markers[seed_mask] = next_marker
+
+        num = int(markers.max())
+
+    # Fallback: if shrinking removes everything, keep one seed per
+    # connected component of the original mask rather than failing.
+    if num == 0:
+        markers, num = label(binary_mask)
+
+    distance = ndi.distance_transform_edt(
+        binary_mask, sampling=[effective_r_zZ, r_zY, r_zX]
+    )
+
+    cc_labels, num_cc = label(binary_mask)
+    next_marker = int(markers.max())
+    added_seed_count = 0
+    added_peak_seed_count = 0
+    peak_min_distance_xy = max(
+        1,
+        int((0.45 * nuclei_diameter) / max(1e-6, np.mean([r_zX, r_zY]))),
+    )
+    peak_threshold_fraction = 0.45
+
+    for cc_id in range(1, num_cc + 1):
+        cc_mask = cc_labels == cc_id
+        cc_marker_ids = np.unique(markers[cc_mask])
+        cc_marker_ids = cc_marker_ids[cc_marker_ids > 0]
+        local_distance = np.where(cc_mask, distance, 0.0)
+
+        # Recovery for dumbbell-like nuclei: if erosion still leaves only
+        # one seed, try to split the component using multiple EDT peaks.
+        # Uses 2D XY projection to prevent over-splitting across Z.
+        if cc_marker_ids.size <= 1 and np.any(cc_mask):
+            peak_coords_3d = detect_peaks_xy_with_best_z(
+                local_distance,
+                peak_min_distance_xy,
+                peak_threshold_fraction,
+            )
+
+            if len(peak_coords_3d) >= 2:
+                if cc_marker_ids.size == 1:
+                    markers[(markers == int(cc_marker_ids[0])) & cc_mask] = 0
+                for peak_coord in peak_coords_3d:
+                    if markers[peak_coord] != 0:
+                        continue
+                    next_marker += 1
+                    markers[peak_coord] = next_marker
+                    added_peak_seed_count += 1
+                cc_marker_ids = np.unique(markers[cc_mask])
+                cc_marker_ids = cc_marker_ids[cc_marker_ids > 0]
+
+        if cc_marker_ids.size == 0:
+            seed_pos = np.unravel_index(np.argmax(local_distance), local_distance.shape)
+            next_marker += 1
+            markers[seed_pos] = next_marker
+            added_seed_count += 1
+
+    im_out = watershed(-distance, markers, mask=binary_mask)
+
+    preserve_labels = set()
+    for cc_id in range(1, num_cc + 1):
+        cc_vals = np.unique(im_out[cc_labels == cc_id])
+        cc_vals = cc_vals[cc_vals > 0]
+        if cc_vals.size == 1:
+            preserve_labels.add(int(cc_vals[0]))
+        if cc_id in boundary_components:
+            for val in cc_vals:
+                preserve_labels.add(int(val))
+
+    im_out_before_cleanup = im_out.copy()
+    _, im_out = remove_small_island_labels(
+        im_out, connectivity=1, size_ratio_thresh=0.5
+    )
+
+    restored_isolated_count = 0
+    if len(preserve_labels) > 0:
+        preserve_mask = np.isin(im_out_before_cleanup, list(preserve_labels))
+        restore_mask = preserve_mask & (im_out == 0)
+        restored_isolated_count = int(np.count_nonzero(restore_mask))
+        im_out[restore_mask] = im_out_before_cleanup[restore_mask]
+
+    im_out, _, _ = relabel_sequential(im_out)
+
+    debug_info = {
+        'z_anisotropy': z_anisotropy,
+        'z_split_weight': z_split_weight,
+        'scales_with_seeds': scales_with_seeds,
+        'added_peak_seed_count': added_peak_seed_count,
+        'added_seed_count': added_seed_count,
+        'erosion_triplets': erosion_triplets,
+        'boundary_components': boundary_components,
+        'restored_isolated_count': restored_isolated_count,
+        'dmin': dmin,
+        'dmax': dmax,
+        'n_scales': n_scales,
+        'min_seed_vox': min_seed_vox,
+    }
+
+    return im_out, debug_info
