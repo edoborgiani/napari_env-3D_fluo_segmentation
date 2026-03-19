@@ -1495,7 +1495,6 @@ def segment_nuclei_watershed(
     """
     from skimage import morphology
     from scipy import ndimage as ndi
-    from skimage.measure import label
     from skimage.segmentation import watershed, relabel_sequential
 
     # Derive Z weighting from the actual voxel anisotropy so depth
@@ -1516,7 +1515,7 @@ def segment_nuclei_watershed(
     boundary_mask[:, :, -boundary_margin:] = True
 
     boundary_components = set()
-    cc_labels_for_boundary, _ = label(binary_mask)
+    cc_labels_for_boundary, _ = ndi.label(binary_mask)
     for cc_id in np.unique(cc_labels_for_boundary):
         if cc_id == 0:
             continue
@@ -1555,7 +1554,7 @@ def segment_nuclei_watershed(
         if not np.any(eroded_i):
             continue
 
-        mk_i, num_i = label(eroded_i)
+        mk_i, num_i = ndi.label(eroded_i)
         if num_i == 0:
             continue
 
@@ -1600,7 +1599,7 @@ def segment_nuclei_watershed(
             eroded_r = morphology.binary_erosion(binary_mask, footprint=erosion_fp_r)
             if not np.any(eroded_r):
                 continue
-            mk_r, num_r = label(eroded_r)
+            mk_r, num_r = ndi.label(eroded_r)
             if num_r == 0:
                 continue
 
@@ -1629,13 +1628,13 @@ def segment_nuclei_watershed(
     # Fallback: if shrinking removes everything, keep one seed per
     # connected component of the original mask rather than failing.
     if num == 0:
-        markers, num = label(binary_mask)
+        markers, num = ndi.label(binary_mask)
 
     distance = ndi.distance_transform_edt(
         binary_mask, sampling=[effective_r_zZ, r_zY, r_zX]
     )
 
-    cc_labels, num_cc = label(binary_mask)
+    cc_labels, num_cc = ndi.label(binary_mask)
     next_marker = int(markers.max())
     added_seed_count = 0
     added_peak_seed_count = 0
