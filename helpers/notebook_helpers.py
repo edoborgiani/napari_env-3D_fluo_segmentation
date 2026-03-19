@@ -23,6 +23,7 @@ __all__ = [
     "contr_stretch",
     "create_row_pdf",
     "crop_nucleus_with_padding",
+    "detect_peaks_xy_with_best_z",
     "double_plateau_hist_equalization_nd",
     "gamma_trans",
     "get_stain_name",
@@ -1304,3 +1305,90 @@ def grow_markers_within_islands_limited(markers: np.ndarray, islands: np.ndarray
     expanded = expand_labels(markers, distance=max_distance)
     expanded[~islands.astype(bool)] = 0
     return expanded
+
+def detect_peaks_xy_with_best_z(
+    local_distance,
+    peak_min_distance_xy,
+    peak_threshold_fraction,
+):
+    """
+    Detect multiple peaks in a distance-transform volume using 2D XY projection.
+    
+    Useful for identifying multiple seed points in dumbbell-shaped or multi-lobed
+    nuclei where standard erosion fails to create separate seeds. Prevents 
+    over-fragmentation across Z slices by projecting to 2D for peak detection,
+    then mapping each XY peak to its best Z coordinate.
+    
+    Parameters
+    ----------
+    local_distance : ndarray, shape (Z, Y, X)
+        Distance transform (EDT) computed for a single nucleus or connected component.
+        Typically obtained from scipy.ndimage.distance_transform_edt.
+    
+    peak_min_distance_xy : int
+        Minimum pixel distance between detected peaks in the XY plane.
+        Typical values: 45% of nucleus diameter in voxels.
+    
+    peak_threshold_fraction : float
+        Fraction of the maximum distance value to use as threshold.
+        Peaks below this threshold are excluded.
+        Typical values: 0.45 (45% of max EDT value).
+    
+    Returns
+    -------
+    peak_coords_3d : list of tuples
+        List of (z, y, x) coordinates for detected peaks.
+        Each tuple represents a 3D location where a peak was found.
+        Returns empty list if fewer than 2 peaks are detected or if
+        all peaks are below threshold.
+    
+    Notes
+    -----
+    - Projects distance transform to 2D via max along Z: xy_distance = np.max(local_distance, axis=0)
+    - Detects peaks only in the 2D projection
+    - For each XY peak, finds the Z coordinate with maximum distance (z_i = argmax(z_line))
+    - Only includes peaks where max distance along Z exceeds the threshold
+    - Prevents Z-layer fragmentation by assigning one seed per unique XY location
+    
+    Example
+    -------
+    >>> distance = scipy.ndimage.distance_transform_edt(binary_mask, sampling=[0.2, 0.1, 0.1])
+    >>> local_dist = np.where(component_mask, distance, 0.0)
+    >>> peaks = detect_peaks_xy_with_best_z(local_dist, peak_min_distance_xy=10, peak_threshold_fraction=0.45)
+    >>> print(f"Found {len(peaks)} peaks")
+    """
+    if not np.any(local_distance):
+        return []
+    
+    # Step 1: Project distance to 2D via max along Z
+    xy_distance = np.max(local_distance, axis=0)
+    
+    # Step 2: Compute threshold
+    peak_threshold = max(
+        0.0,
+        peak_threshold_fraction * float(local_distance[local_distance > 0].max()),
+    )
+    
+    # Step 3: Find peaks in XY plane
+    peak_coords_xy = peak_local_max(
+        xy_distance,
+        min_distance=peak_min_distance_xy,
+        threshold_abs=peak_threshold,
+        exclude_border=False,
+    )
+    
+    # Step 4: For each XY peak, find best Z and validate
+    peak_coords_3d = []
+    for yx in peak_coords_xy:
+        y_i, x_i = int(yx[0]), int(yx[1])
+        z_line = local_distance[:, y_i, x_i]
+        z_max = float(np.max(z_line))
+        
+        # Only include if peak value in Z direction exceeds threshold
+        if z_max < peak_threshold:
+            continue
+        
+        z_i = int(np.argmax(z_line))
+        peak_coords_3d.append((z_i, y_i, x_i))
+    
+    return peak_coords_3d
