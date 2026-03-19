@@ -15,6 +15,11 @@ from skimage.segmentation import watershed
 
 
 __all__ = [
+    "apply_contrast_gamma_per_channel",
+    "apply_gaussian_smoothing",
+    "apply_histogram_equalization_per_channel",
+    "apply_median_denoise",
+    "apply_per_channel_filter",
     "assign_labels",
     "compute_full_marker_stats_for_marker",
     "compute_marker_stats_for_marker",
@@ -25,6 +30,8 @@ __all__ = [
     "crop_nucleus_with_padding",
     "detect_peaks_xy_with_best_z",
     "double_plateau_hist_equalization_nd",
+    "extract_roi_from_metadata",
+    "fix_image_axes_order",
     "gamma_trans",
     "get_stain_name",
     "grow_labels",
@@ -36,8 +43,10 @@ __all__ = [
     "merge_touching_labels",
     "napari_gamma",
     "napari_contrast_gamma_uint8",
+    "normalize_image_channels",
     "remove_small_island_labels",
     "remove_small_islands",
+    "resample_to_isotropic",
     "save_merged_figure",
     "save_raw_png",
     "save_single_channel_png",
@@ -1712,3 +1721,236 @@ def segment_nuclei_watershed(
     }
 
     return im_out, debug_info
+
+def normalize_image_channels(image_stack):
+    """
+    Normalize each channel to [0, 255] range independently.
+    
+    Parameters
+    ----------
+    image_stack : ndarray, shape (Z, Y, X, C)
+        Multi-channel 3D image stack.
+    
+    Returns
+    -------
+    normalized : ndarray, shape (Z, Y, X, C), dtype uint8
+        Normalized image with each channel stretched to [0, 255].
+    """
+    im_out = image_stack.copy()
+    for c in range(image_stack.shape[3]):
+        im_channel = image_stack[:, :, :, c].copy()
+        normalized = (im_channel - im_channel.min()) / (im_channel.max() - im_channel.min() + 1e-8) * 255
+        im_out[:, :, :, c] = np.clip(normalized, 0, 255).astype('uint8')
+    return im_out
+
+
+def apply_per_channel_filter(image_stack, filter_func):
+    """
+    Apply a filter function independently to each channel.
+    
+    Parameters
+    ----------
+    image_stack : ndarray, shape (Z, Y, X, C)
+        Multi-channel 3D image stack.
+    
+    filter_func : callable
+        Function that takes a single 3D array and returns filtered 3D array.
+    
+    Returns
+    -------
+    filtered : ndarray, shape (Z, Y, X, C)
+        Filtered image stack, same dtype as input.
+    """
+    im_out = np.zeros_like(image_stack)
+    for c in range(image_stack.shape[3]):
+        im_out[:, :, :, c] = filter_func(image_stack[:, :, :, c])
+    return im_out
+
+
+def apply_median_denoise(image_stack):
+    """Apply median filter to each channel independently."""
+    from scipy import ndimage as ndi
+    from skimage import filters
+    return apply_per_channel_filter(image_stack, lambda ch: filters.median(ch))
+
+
+def apply_gaussian_smoothing(image_stack, sigma=0.5):
+    """Apply Gaussian filter to each channel independently."""
+    from skimage import filters
+    return apply_per_channel_filter(
+        image_stack, 
+        lambda ch: filters.gaussian(ch, sigma, preserve_range=True)
+    )
+
+
+def apply_contrast_gamma_per_channel(image_stack, stain_df):
+    """
+    Apply contrast and gamma adjustments per channel using stain_df settings.
+    
+    Parameters
+    ----------
+    image_stack : ndarray, shape (Z, Y, X, C)
+        Multi-channel 3D image stack.
+    
+    stain_df : DataFrame
+        Must have index matching channels and columns 'Cont_min', 'Cont_max', 'Gamma'.
+    
+    Returns
+    -------
+    adjusted : ndarray, shape (Z, Y, X, C), dtype uint8
+        Contrast and gamma adjusted image.
+    """
+    im_out = image_stack.copy()
+    for c in range(image_stack.shape[3]):
+        idx = stain_df.index[c]
+        cont_min = stain_df.loc[idx, 'Cont_min']
+        cont_max = stain_df.loc[idx, 'Cont_max']
+        gamma = stain_df.loc[idx, 'Gamma']
+        im_out[:, :, :, c] = napari_contrast_gamma_uint8(
+            image_stack[:, :, :, c],
+            (cont_min, cont_max),
+            gamma
+        )
+    return im_out
+
+
+def apply_histogram_equalization_per_channel(image_stack, num_plateaus=2, plateau_factor=0.7):
+    """Apply histogram equalization to each channel independently."""
+    im_out = np.zeros_like(image_stack)
+    for c in range(image_stack.shape[3]):
+        equalized = double_plateau_hist_equalization_nd(
+            image_stack[:, :, :, c].astype('uint8'), 
+            num_plateaus=num_plateaus, 
+            plateau_factor=plateau_factor
+        )
+        im_ori = equalized.copy()
+        normalized = (im_ori - im_ori.min()) / (im_ori.max() - im_ori.min() + 1e-8) * 255
+        im_out[:, :, :, c] = np.clip(normalized, 0, 255).astype('uint8')
+    return im_out
+
+
+def resample_to_isotropic(image_stack, zoom_factors, meta=None):
+    """
+    Resample image stack to isotropic voxel spacing.
+    
+    Parameters
+    ----------
+    image_stack : ndarray, shape (Z, Y, X, C)
+        Original image stack.
+    
+    zoom_factors : list of 3 floats
+        Scaling factors [Z, Y, X] for resampling.
+    
+    meta : optional
+        Metadata object with physical_pixel_sizes. If provided, returns updated voxel sizes.
+    
+    Returns
+    -------
+    resampled : ndarray
+        Resampled image stack.
+    
+    r_zX, r_zY, r_zZ : float (if meta provided)
+        Updated physical voxel sizes in micrometers.
+    """
+    from scipy.ndimage import zoom as scipy_zoom
+    
+    new_shape = (
+        round(image_stack.shape[0] * zoom_factors[0]),
+        round(image_stack.shape[1] * zoom_factors[1]),
+        round(image_stack.shape[2] * zoom_factors[2]),
+        image_stack.shape[3]
+    )
+    im_out = np.zeros(new_shape, dtype=image_stack.dtype)
+    
+    for c in range(image_stack.shape[3]):
+        resampled = scipy_zoom(image_stack[:, :, :, c], zoom=zoom_factors, order=1)
+        resampled = resampled - np.min(resampled)
+        normalized = (resampled - resampled.min()) / (resampled.max() - resampled.min() + 1e-8) * 255
+        im_out[:, :, :, c] = np.clip(normalized, 0, 255).astype('uint8')
+    
+    if meta is not None:
+        r_zX = meta.physical_pixel_sizes.X / zoom_factors[2]
+        r_zY = meta.physical_pixel_sizes.Y / zoom_factors[1]
+        r_zZ = meta.physical_pixel_sizes.Z / zoom_factors[0]
+        return im_out, r_zX, r_zY, r_zZ
+    
+    return im_out
+
+
+def extract_roi_from_metadata(meta, roi_coords, big_image=True):
+    """
+    Extract a region of interest from an ND2 file.
+    
+    Parameters
+    ----------
+    meta : AICSImage
+        Metadata object from bioio.AICSImage.
+    
+    roi_coords : list of 6 ints
+        [x0, x1, y0, y1, z0, z1] coordinates. Use 0 to keep full range.
+    
+    big_image : bool
+        If True, uses dask for lazy loading. If False, loads full image.
+    
+    Returns
+    -------
+    image : ndarray, shape (Z, Y, X, C)
+        Extracted image in ZYX order.
+    
+    roi_used : list
+        Actual ROI coordinates used (with 0s replaced by full ranges).
+    """
+    from aicsimageio import AICSImage
+    
+    x0, x1, y0, y1, z0, z1 = roi_coords
+    
+    # Replace 0s with full range
+    if x1 == 0:
+        x1 = meta.shape[4]
+    if y1 == 0:
+        y1 = meta.shape[3]
+    if z1 == 0:
+        z1 = meta.shape[2]
+    
+    if big_image:
+        lazy = meta.get_image_dask_data("ZYXC")
+        sub = lazy[z0:z1, y0:y1, x0:x1, :]
+        image = sub.compute()
+    else:
+        image = meta.get_image_data("ZYXC", T=0)
+    
+    return image, [x0, x1, y0, y1, z0, z1]
+
+
+def fix_image_axes_order(original_image):
+    """
+    Fix image axes order and shape for multi-channel 3D stacks.
+    
+    Ensures image has shape (Z, Y, X, C) and channels are last.
+    
+    Parameters
+    ----------
+    original_image : ndarray
+        Image array of shape (Z, Y, X, C[, T]) or similar.
+    
+    Returns
+    -------
+    fixed : ndarray
+        Image with standard shape (Z, Y, X, C).
+    """
+    orig = original_image.copy()
+    shape = orig.shape
+    
+    # Drop singleton time axis if present (common order Z,Y,X,C,T)
+    if len(shape) == 5 and shape[4] == 1:
+        orig = orig[..., 0]
+    
+    # Ensure channels are last
+    if len(orig.shape) == 4:
+        # If last axis looks large (likely X), detect small axis as channel
+        if orig.shape[-1] > 50:
+            chan_axis = next((i for i, s in enumerate(orig.shape) if s < 50), None)
+            if chan_axis is not None and chan_axis != 3:
+                orig = np.moveaxis(orig, chan_axis, -1)
+    
+    return orig
