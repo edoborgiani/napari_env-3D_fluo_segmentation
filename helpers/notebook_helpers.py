@@ -1403,6 +1403,46 @@ def detect_peaks_xy_with_best_z(
     
     return peak_coords_3d
 
+
+def _filter_labels_by_roundness_xy(label_img, min_roundness):
+    """Remove 3D labels whose largest XY slice is less circular than threshold."""
+    threshold = max(0.0, float(min_roundness))
+    if threshold <= 0.0:
+        return label_img, 0
+
+    out = np.asarray(label_img).copy()
+    max_label = int(np.max(out))
+    removed = 0
+
+    for label_id in range(1, max_label + 1):
+        mask = out == label_id
+        if not np.any(mask):
+            continue
+
+        z_counts = np.count_nonzero(mask, axis=(1, 2))
+        z_best = int(np.argmax(z_counts))
+        slice_mask = mask[z_best]
+        area = int(np.count_nonzero(slice_mask))
+
+        if area <= 2:
+            out[mask] = 0
+            removed += 1
+            continue
+
+        contours, _ = cv2.findContours(
+            slice_mask.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE,
+        )
+        perimeter = float(sum(cv2.arcLength(cnt, True) for cnt in contours))
+        roundness = 0.0 if perimeter <= 0.0 else float((4.0 * np.pi * area) / (perimeter ** 2))
+
+        if roundness < threshold:
+            out[mask] = 0
+            removed += 1
+
+    return out, removed
+
 def segment_nuclei_watershed(
     binary_mask,
     r_zX,
@@ -1415,6 +1455,7 @@ def segment_nuclei_watershed(
     nuclei_split_diameter_max_factor=1.0,
     nuclei_split_diameter_scales=3,
     nuclei_seed_min_fraction=0.5,
+    nuclei_min_roundness=0.0,
 ):
     """
     Segment nuclei using watershed with multi-scale erosion and EDT peak fallback.
@@ -1456,6 +1497,10 @@ def segment_nuclei_watershed(
     
     nuclei_seed_min_fraction : float, optional
         Minimum seed size as fraction of expected nucleus volume (default=0.5).
+
+    nuclei_min_roundness : float, optional
+        Minimum circularity on the largest XY slice for a nucleus to be kept.
+        Uses circularity = 4*pi*area/perimeter^2. Typical range is [0.0, 1.0].
     
     Returns
     -------
@@ -1702,6 +1747,11 @@ def segment_nuclei_watershed(
         restored_isolated_count = int(np.count_nonzero(restore_mask))
         im_out[restore_mask] = im_out_before_cleanup[restore_mask]
 
+    im_out, removed_by_roundness = _filter_labels_by_roundness_xy(
+        im_out,
+        nuclei_min_roundness,
+    )
+
     im_out, _, _ = relabel_sequential(im_out)
 
     debug_info = {
@@ -1717,6 +1767,8 @@ def segment_nuclei_watershed(
         'dmax': dmax,
         'n_scales': n_scales,
         'min_seed_vox': min_seed_vox,
+        'nuclei_min_roundness': float(max(0.0, nuclei_min_roundness)),
+        'removed_by_roundness': removed_by_roundness,
     }
 
     return im_out, debug_info
