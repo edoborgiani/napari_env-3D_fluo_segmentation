@@ -5,6 +5,7 @@ import cv2
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import skimage
 from PIL import Image as PILImage
 from scipy import ndimage as ndi
@@ -21,6 +22,9 @@ __all__ = [
     "apply_median_denoise",
     "apply_per_channel_filter",
     "assign_labels",
+    "build_full_labels_dict",
+    "build_labels_dict",
+    "collect_histogram_data",
     "compute_full_marker_stats_for_marker",
     "compute_marker_stats_for_marker",
     "compute_nuclei_cytoplasm_stats",
@@ -30,20 +34,29 @@ __all__ = [
     "crop_nucleus_with_padding",
     "detect_peaks_xy_with_best_z",
     "double_plateau_hist_equalization_nd",
+    "export_channel_histograms",
+    "export_quantification_to_excel",
     "extract_roi_from_metadata",
     "fix_image_axes_order",
     "gamma_trans",
+    "get_nuclei_split_config",
     "get_stain_name",
     "grow_labels",
     "grow_markers_within_islands_limited",
     "hist_plot",
     "ImageProcessing",
+    "labels_dict_to_dataframe",
     "make_anisotropic_footprint",
     "merge_small_touching_labels",
     "merge_touching_labels",
     "napari_gamma",
     "napari_contrast_gamma_uint8",
     "normalize_image_channels",
+    "plot_nucleus_kdes",
+    "plot_size_distributions",
+    "plot_spatial_distributions",
+    "prepare_stain_settings",
+    "print_population_summary",
     "remove_small_island_labels",
     "remove_small_islands",
     "resample_to_isotropic",
@@ -145,6 +158,47 @@ def truncate_cell(val, width=15):
     """Truncate long table values for display."""
     val_str = str(val)
     return val_str if len(val_str) <= width else val_str[: width - 3] + "..."
+
+
+def get_nuclei_split_config(profile="aggressive", **overrides):
+    """Return the recommended shrink-based nuclei splitting settings for the notebook.
+
+    Parameters
+    ----------
+    profile : {"conservative", "balanced", "aggressive"}, optional
+        Preset controlling how strongly touching nuclei are separated.
+        - conservative -> less splitting, lower risk of over-segmentation
+        - balanced     -> middle-ground starting point
+        - aggressive   -> stronger bridge breaking for clustered nuclei
+    **overrides : dict
+        Any keyword arguments matching `segment_nuclei_watershed` options.
+
+    Returns
+    -------
+    dict
+        A parameter dictionary ready to pass into `segment_nuclei_watershed(..., **config)`.
+    """
+    profiles = {
+        "conservative": 0.18,
+        "balanced": 0.22,
+        "aggressive": 0.28,
+    }
+    if profile not in profiles:
+        raise ValueError(
+            f"Unknown profile '{profile}'. Choose from {tuple(profiles)}."
+        )
+
+    config = {
+        "nuclei_z_anisotropy_factor": 1.0,
+        "nuclei_bridge_shrink_factor": profiles[profile],
+        "nuclei_split_diameter_min_factor": 0.5,
+        "nuclei_split_diameter_max_factor": 1.5,
+        "nuclei_split_diameter_scales": 3,
+        "nuclei_seed_min_fraction": 0.03,
+        "nuclei_min_roundness": 0.45,
+    }
+    config.update(overrides)
+    return config
 
 
 def hist_plot(im_in, stain_complete_df, thresh=0, legend=False):
@@ -1084,6 +1138,825 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
     )
 
 
+LABELS_TABLE_COLUMNS = [
+    "Condition",
+    "Laser",
+    "Color",
+    "Number",
+    "Shared labels",
+    "Mean nuclei positions [um]",
+    "Mean cytoplasm positions [um]",
+    "Nuclei size [um3]",
+    "Cytoplasm size [um3]",
+    "Marker size [um3]",
+    "Avg. marker intensity",
+    "STD marker intensity",
+    "Marker size cytoplasm [um3]",
+    "Avg. marker intensity cytoplasm",
+    "STD marker intensity cytoplasm",
+    "Marker size PCM [um3]",
+    "Avg. marker intensity PCM",
+    "STD marker intensity PCM",
+]
+
+
+def _progress_iter(iterable, progress=None, desc=None, **kwargs):
+    """Wrap an iterable with an optional notebook progress helper."""
+    if progress is None:
+        return iterable
+    if desc is None:
+        return progress(iterable, **kwargs)
+    return progress(iterable, desc=desc, **kwargs)
+
+
+def _make_labels_record(
+    condition,
+    laser,
+    color,
+    number,
+    shared_labels=(),
+    nucleus_positions=(),
+    cytoplasm_positions=(),
+    nucleus_sizes=(),
+    cytoplasm_sizes=(),
+    marker_sizes=(),
+    avg_marker=(),
+    std_marker=(),
+    marker_cyto_sizes=(),
+    avg_cyto_marker=(),
+    std_cyto_marker=(),
+    marker_pcm_sizes=(),
+    avg_pcm_marker=(),
+    std_pcm_marker=(),
+):
+    """Create one quantification row in the shared notebook output format."""
+    return [
+        condition,
+        laser,
+        color,
+        int(number),
+        tuple(shared_labels),
+        tuple(nucleus_positions),
+        tuple(cytoplasm_positions),
+        tuple(nucleus_sizes),
+        tuple(cytoplasm_sizes),
+        tuple(marker_sizes),
+        tuple(avg_marker),
+        tuple(std_marker),
+        tuple(marker_cyto_sizes),
+        tuple(avg_cyto_marker),
+        tuple(std_cyto_marker),
+        tuple(marker_pcm_sizes),
+        tuple(avg_pcm_marker),
+        tuple(std_pcm_marker),
+    ]
+
+
+def _condition_color(condition, stain_complete_df, stain_df=None):
+    """Return a display color for a single condition or a marker combination."""
+    def _normalize(color_value):
+        if not color_value or color_value == "WHITE":
+            return "GRAY"
+        return color_value
+
+    if np.size(condition) == 1 and not isinstance(condition, tuple):
+        if condition in stain_complete_df.index and "Color" in stain_complete_df.columns:
+            return _normalize(stain_complete_df.loc[condition, "Color"])
+        return "BLUE"
+
+    rgb_list = []
+    values = condition if isinstance(condition, tuple) else (condition,)
+    for item in values:
+        color_value = None
+        if item in stain_complete_df.index and "Color" in stain_complete_df.columns:
+            color_value = stain_complete_df.loc[item, "Color"]
+        elif stain_df is not None and item in stain_df.index and "Color" in stain_df.columns:
+            color_value = stain_df.loc[item, "Color"]
+        rgb_list.append(_normalize(color_value or "GRAY"))
+
+    colors_rgb = [mcolors.to_rgb(name) for name in rgb_list]
+    r_final = min(sum(rgb[0] for rgb in colors_rgb), 1.0)
+    g_final = min(sum(rgb[1] for rgb in colors_rgb), 1.0)
+    b_final = min(sum(rgb[2] for rgb in colors_rgb), 1.0)
+    return (r_final, g_final, b_final)
+
+
+def prepare_stain_settings(
+    im_in,
+    stain_df,
+    name_setup,
+    use_setup=True,
+    settings=None,
+    napari_module=None,
+    progress=None,
+):
+    """Load or interactively collect contrast/gamma settings for each channel."""
+    stain_df = stain_df.reset_index(drop=False)
+    stain_initial_df = stain_df.copy()
+    stain_initial_df.set_index(["Condition", "Marker", "Laser"], inplace=True)
+    stain_initial_df[["Cont_min", "Cont_max", "Gamma"]] = [0, 255, 1]
+    stain_complete_df = stain_initial_df.copy()
+
+    setup_path = f"{name_setup}_setup.csv"
+    setup_exists = os.path.exists(setup_path)
+
+    if use_setup and setup_exists:
+        stain_setup_df = pd.read_csv(setup_path)
+        stain_setup_df.set_index(["Condition", "Marker", "Laser"], inplace=True)
+        for idx in _progress_iter(stain_complete_df.index, progress, desc="Step 05A - Load Setup Rows"):
+            if idx in stain_setup_df.index:
+                stain_complete_df.loc[idx] = stain_setup_df.loc[idx]
+                stain_complete_df["Color"] = stain_initial_df["Color"]
+            else:
+                use_setup = False
+                break
+
+    if not use_setup or not setup_exists:
+        if settings is None:
+            from napari.settings import get_settings
+            settings = get_settings()
+        if napari_module is None:
+            import napari as napari_module
+
+        stain_complete_df = stain_initial_df.copy()
+        settings.application.ipy_interactive = False
+        viewer = napari_module.Viewer()
+
+        for _, idx in _progress_iter(
+            enumerate(stain_complete_df.index),
+            progress,
+            desc="Step 05B - Prepare Setup Viewer",
+            total=len(stain_complete_df.index),
+            leave=False,
+        ):
+            im_channel = im_in[:, :, :, _]
+            imin = float(im_channel.min())
+            imax = float(im_channel.max())
+            if imax <= imin:
+                im_view = np.zeros_like(im_channel, dtype=np.uint8)
+            else:
+                im_view = ((im_channel - imin) / (imax - imin) * 255).clip(0, 255).astype(np.uint8)
+            viewer.add_image(
+                im_view,
+                name=f"{idx[0]} ({idx[1]})",
+                colormap=stain_initial_df.loc[idx]["Color"],
+                blending="additive",
+            )
+
+        napari_module.run()
+        image_layers = [layer for layer in viewer.layers if isinstance(layer, napari_module.layers.Image)]
+        contrast_limits = {layer.name: layer.contrast_limits for layer in image_layers}
+        gamma_values = {layer.name: layer.gamma for layer in image_layers}
+
+        stain_complete_df.sort_index(inplace=True)
+        for _, idx in _progress_iter(
+            enumerate(stain_complete_df.index),
+            progress,
+            desc="Step 05C - Collect Setup Values",
+            total=len(stain_complete_df.index),
+            leave=False,
+        ):
+            name = f"{idx[0]} ({idx[1]})"
+            stain_complete_df.loc[idx, "Cont_min"] = int(contrast_limits[name][0])
+            stain_complete_df.loc[idx, "Cont_max"] = int(contrast_limits[name][1])
+            stain_complete_df.loc[idx, "Gamma"] = gamma_values[name]
+
+        if setup_exists:
+            stain_setup_df = pd.read_csv(setup_path)
+            stain_setup_df.set_index(["Condition", "Marker", "Laser"], inplace=True)
+            for idx in _progress_iter(stain_complete_df.index, progress, desc="Step 05D - Write Setup Rows"):
+                stain_setup_df.loc[idx] = stain_complete_df.loc[idx]
+        else:
+            stain_setup_df = stain_complete_df.copy()
+
+        stain_csv_setup_df = stain_setup_df.reset_index().sort_values(by="Condition")
+        stain_csv_setup_df = stain_csv_setup_df[["Condition", "Marker", "Laser", "Cont_min", "Cont_max", "Gamma"]]
+        stain_csv_setup_df.to_csv(setup_path, index=False)
+
+    stain_df = stain_df.set_index("Condition")
+    stain_complete_df = stain_complete_df.reset_index().set_index("Condition")
+    stain_complete_df = stain_complete_df.loc[stain_df.index]
+    stain_complete_df = stain_complete_df[["Marker", "Laser", "Color", "Cont_min", "Cont_max", "Gamma"]]
+    original_stain_complete_df = stain_complete_df.copy()
+    return stain_df, stain_complete_df, original_stain_complete_df
+
+
+def export_channel_histograms(im_in, stain_complete_df, output_path, progress=None):
+    """Export one histogram sheet per channel to Excel."""
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        for channel_index in _progress_iter(range(im_in.shape[3]), progress, desc="Step 08 - Export Histograms"):
+            im3d = im_in[:, :, :, channel_index].copy()
+            values, counts = np.unique(im3d.astype(int), return_counts=True)
+            hist = np.zeros(256, dtype=int)
+            hist[values] = counts
+
+            total = hist.sum()
+            percentage = (hist / total) * 100 if total > 0 else np.zeros_like(hist, dtype=float)
+            cumulative = np.cumsum(hist)
+            cumulative_percentage = np.cumsum(percentage)
+
+            df = pd.DataFrame(
+                {
+                    "Pixel_Value": np.arange(256),
+                    "Count": hist,
+                    "Percentage": percentage,
+                    "Cumulative_Count": cumulative,
+                    "Cumulative_Percentage": cumulative_percentage,
+                }
+            )
+
+            condition = stain_complete_df.index[channel_index]
+            marker = stain_complete_df.loc[condition, "Marker"]
+            df.to_excel(writer, sheet_name=str(marker)[:31], index=False)
+
+    return output_path
+
+
+def build_labels_dict(
+    im_segmentation_stack,
+    filtered_img,
+    stain_complete_df,
+    stain_df,
+    r_xyz,
+    zooms,
+    multilabel=False,
+    progress=None,
+):
+    """Build the compact per-marker quantification dictionary used by the notebook."""
+    labels_dict = {}
+    nuc_positions, nuc_sizes, cyto_positions, cyto_sizes = compute_nuclei_cytoplasm_stats(
+        im_segmentation_stack,
+        r_xyz,
+        zooms,
+    )
+
+    if "NUCLEI" in stain_complete_df.index:
+        nuc_row = stain_complete_df.loc["NUCLEI"]
+        labels_dict[nuc_row["Marker"]] = _make_labels_record(
+            "NUCLEI",
+            nuc_row["Laser"],
+            nuc_row["Color"],
+            np.max(im_segmentation_stack["Nuclei"]),
+            nucleus_positions=nuc_positions,
+            nucleus_sizes=nuc_sizes,
+        )
+
+    if "CYTOPLASM" in stain_complete_df.index:
+        cyto_row = stain_complete_df.loc["CYTOPLASM"]
+        labels_dict[cyto_row["Marker"]] = _make_labels_record(
+            "CYTOPLASM",
+            cyto_row["Laser"],
+            cyto_row["Color"],
+            np.max(im_segmentation_stack["Cytoplasm"]),
+            cytoplasm_positions=cyto_positions,
+            cytoplasm_sizes=cyto_sizes,
+        )
+
+    num_channels = filtered_img.shape[3]
+    for c in _progress_iter(range(num_channels), progress, desc="Step 14A - Quantify Marker Stats"):
+        condition = stain_complete_df.index[c]
+        if condition in ["NUCLEI", "CYTOPLASM", "PCM"]:
+            continue
+
+        marker = stain_complete_df.loc[condition, "Marker"]
+        (
+            shared_labels,
+            m_sizes,
+            m_avg,
+            m_std,
+            m_cyto_sizes,
+            m_cyto_avg,
+            m_cyto_std,
+            m_pcm_sizes,
+            m_pcm_avg,
+            m_pcm_std,
+        ) = compute_marker_stats_for_marker(c, im_segmentation_stack, filtered_img, r_xyz, zooms)
+
+        labels_dict[marker] = _make_labels_record(
+            condition,
+            stain_complete_df.loc[condition, "Laser"],
+            stain_complete_df.loc[condition, "Color"],
+            len(shared_labels),
+            shared_labels=sorted(shared_labels),
+            nucleus_positions=(nuc_positions[i - 1] for i in shared_labels),
+            cytoplasm_positions=(cyto_positions[i - 1] for i in shared_labels),
+            nucleus_sizes=(nuc_sizes[i - 1] for i in shared_labels),
+            cytoplasm_sizes=(cyto_sizes[i - 1] for i in shared_labels),
+            marker_sizes=m_sizes,
+            avg_marker=m_avg,
+            std_marker=m_std,
+            marker_cyto_sizes=m_cyto_sizes,
+            avg_cyto_marker=m_cyto_avg,
+            std_cyto_marker=m_cyto_std,
+            marker_pcm_sizes=m_pcm_sizes,
+            avg_pcm_marker=m_pcm_avg,
+            std_pcm_marker=m_pcm_std,
+        )
+
+    if multilabel:
+        non_nuc_channels = [
+            i for i in range(num_channels) if stain_complete_df.index[i] not in ["NUCLEI", "CYTOPLASM", "PCM"]
+        ]
+        max_combo_size = min(3, max(2, len(non_nuc_channels)))
+        marker_index_to_shared = {}
+        for c in _progress_iter(non_nuc_channels, progress, desc="Step 14B - Prepare Multilabel Sets"):
+            marker_name = stain_complete_df.iloc[c]["Marker"]
+            marker_index_to_shared[c] = set(labels_dict.get(marker_name, [(), (), (), (), ()])[4])
+
+        from itertools import combinations
+
+        for combo_size in _progress_iter(range(2, max_combo_size + 1), progress, desc="Step 14C - Build Multilabel Combos"):
+            for comb in combinations(non_nuc_channels, combo_size):
+                combo_markers = tuple(stain_complete_df.iloc[i]["Marker"] for i in comb)
+                combo_sets = [marker_index_to_shared.get(i, set()) for i in comb]
+                if not combo_sets:
+                    continue
+                combo_labels = sorted(set.intersection(*combo_sets))
+                if not combo_labels:
+                    continue
+
+                labels_dict[combo_markers] = _make_labels_record(
+                    tuple(stain_complete_df.index[i] for i in comb),
+                    (),
+                    (),
+                    len(combo_labels),
+                    shared_labels=combo_labels,
+                    nucleus_positions=(nuc_positions[i - 1] for i in combo_labels),
+                    cytoplasm_positions=(cyto_positions[i - 1] for i in combo_labels),
+                    nucleus_sizes=(nuc_sizes[i - 1] for i in combo_labels),
+                    cytoplasm_sizes=(cyto_sizes[i - 1] for i in combo_labels),
+                )
+
+    return labels_dict
+
+
+def build_full_labels_dict(
+    im_segmentation_stack,
+    im_final_stack,
+    filtered_img,
+    stain_complete_df,
+    r_xyz,
+    zooms,
+    progress=None,
+):
+    """Build the full per-marker quantification dictionary for exports and meshes."""
+    labels_full_dict = {}
+    nuc_positions, nuc_sizes, cyto_positions, cyto_sizes = compute_nuclei_cytoplasm_stats(
+        im_segmentation_stack,
+        r_xyz,
+        zooms,
+    )
+
+    if "NUCLEI" in stain_complete_df.index:
+        nuc_row = stain_complete_df.loc["NUCLEI"]
+        labels_full_dict[nuc_row["Marker"]] = _make_labels_record(
+            "NUCLEI",
+            nuc_row["Laser"],
+            nuc_row["Color"],
+            np.max(im_segmentation_stack["Nuclei"]),
+            nucleus_positions=nuc_positions,
+            nucleus_sizes=nuc_sizes,
+        )
+
+    if "CYTOPLASM" in stain_complete_df.index:
+        cyto_row = stain_complete_df.loc["CYTOPLASM"]
+        labels_full_dict[cyto_row["Marker"]] = _make_labels_record(
+            "CYTOPLASM",
+            cyto_row["Laser"],
+            cyto_row["Color"],
+            np.max(im_segmentation_stack["Cytoplasm"]),
+            cytoplasm_positions=cyto_positions,
+            cytoplasm_sizes=cyto_sizes,
+        )
+
+    num_channels = filtered_img.shape[3]
+    for c in _progress_iter(range(num_channels), progress, desc="Step 14H - Quantify Full Marker Stats"):
+        condition = stain_complete_df.index[c]
+        if condition in ["NUCLEI", "CYTOPLASM", "PCM"]:
+            continue
+
+        marker = stain_complete_df.iloc[c]["Marker"]
+        (
+            full_labels,
+            m_full_sizes,
+            m_full_avg,
+            m_full_std,
+            m_full_cyto_sizes,
+            m_full_cyto_avg,
+            m_full_cyto_std,
+            m_full_pcm_sizes,
+            m_full_pcm_avg,
+            m_full_pcm_std,
+        ) = compute_full_marker_stats_for_marker(c, im_final_stack, im_segmentation_stack, filtered_img, r_xyz, zooms)
+
+        labels_full_dict[marker] = _make_labels_record(
+            condition,
+            stain_complete_df.iloc[c]["Laser"],
+            stain_complete_df.iloc[c]["Color"],
+            len(full_labels),
+            shared_labels=sorted(full_labels),
+            nucleus_positions=(nuc_positions[i - 1] for i in full_labels),
+            cytoplasm_positions=(cyto_positions[i - 1] for i in full_labels),
+            nucleus_sizes=(nuc_sizes[i - 1] for i in full_labels),
+            cytoplasm_sizes=(cyto_sizes[i - 1] for i in full_labels),
+            marker_sizes=m_full_sizes,
+            avg_marker=m_full_avg,
+            std_marker=m_full_std,
+            marker_cyto_sizes=m_full_cyto_sizes,
+            avg_cyto_marker=m_full_cyto_avg,
+            std_cyto_marker=m_full_cyto_std,
+            marker_pcm_sizes=m_full_pcm_sizes,
+            avg_pcm_marker=m_full_pcm_avg,
+            std_pcm_marker=m_full_pcm_std,
+        )
+
+    return labels_full_dict
+
+
+def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None):
+    """Convert a quantification dictionary to the standard notebook DataFrame."""
+    labels_df = pd.DataFrame.from_dict(labels_dict, orient="index", columns=LABELS_TABLE_COLUMNS)
+    labels_df.index.name = "Combination"
+
+    if not truncate:
+        return labels_df
+
+    truncated_df = labels_df.copy()
+    truncate_columns = [
+        "Shared labels",
+        "Mean nuclei positions [um]",
+        "Mean cytoplasm positions [um]",
+        "Nuclei size [um3]",
+        "Cytoplasm size [um3]",
+        "Marker size [um3]",
+        "Avg. marker intensity",
+        "STD marker intensity",
+        "Marker size cytoplasm [um3]",
+        "Avg. marker intensity cytoplasm",
+        "STD marker intensity cytoplasm",
+        "Marker size PCM [um3]",
+        "Avg. marker intensity PCM",
+        "STD marker intensity PCM",
+    ]
+    for column in _progress_iter(truncate_columns, progress, desc="Step 14D - Truncate Display Columns"):
+        truncated_df[column] = truncated_df[column].apply(lambda value: truncate_cell(value))
+
+    return labels_df, truncated_df
+
+
+def print_population_summary(labels_df, stain_complete_df, stain_df, progress=None):
+    """Print the compact summary block used in the analysis section."""
+    nuclei_rows = labels_df[labels_df["Condition"] == "NUCLEI"]
+    total_cells = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_df.iloc[0]["Number"])
+
+    print("TOT CELLS =", int(total_cells))
+    print(" ")
+    for _, marker in _progress_iter(
+        enumerate(labels_df.index),
+        progress,
+        desc="Step 14E - Summary Percentages",
+        total=len(labels_df.index),
+    ):
+        condition = labels_df.iloc[_]["Condition"]
+        if condition not in ["NUCLEI", "CYTOPLASM", "NUCLEI + CYTOPLASM"]:
+            print(f" PERC {condition} ({marker}) = {100.0 * labels_df.iloc[_]['Number'] / total_cells} %")
+
+    print("_" * 80)
+    if not nuclei_rows.empty:
+        print("MEAN SIZE NUCLEI =", np.mean(nuclei_rows.iloc[0]["Nuclei size [um3]"]), "um3")
+    cyto_rows = labels_df[labels_df["Condition"] == "CYTOPLASM"]
+    if "CYTOPLASM" in stain_df.index and not cyto_rows.empty:
+        print("MEAN SIZE CYTOPLASM =", np.mean(cyto_rows.iloc[0]["Cytoplasm size [um3]"]), "um3")
+
+    for _, marker in _progress_iter(
+        enumerate(labels_df.index),
+        progress,
+        desc="Step 14F - Summary Sizes",
+        total=len(labels_df.index),
+    ):
+        condition = labels_df.iloc[_]["Condition"]
+        if condition not in ["NUCLEI", "CYTOPLASM", "NUCLEI + CYTOPLASM"]:
+            print(" ")
+            print(f" MEAN SIZE NUCLEI {condition} ({marker}) = {np.mean(labels_df.iloc[_]['Nuclei size [um3]'])} um3")
+            if "CYTOPLASM" in stain_df.index:
+                print(f" MEAN SIZE CYTOPLASM {condition} ({marker}) = {np.mean(labels_df.iloc[_]['Cytoplasm size [um3]'])} um3")
+
+    print("_" * 80)
+    for _, marker in _progress_iter(
+        enumerate(labels_df.index),
+        progress,
+        desc="Step 14G - Summary Marker Size",
+        total=len(labels_df.index),
+    ):
+        if labels_df.iloc[_]["Marker size [um3]"] != ():
+            print(f"MEAN SIZE {labels_df.iloc[_]['Condition']} ({marker}) = {np.mean(labels_df.iloc[_]['Marker size [um3]'])} um3")
+
+
+def collect_histogram_data(im_segmentation_stack, filtered_img, stain_df, stain_complete_df, progress=None):
+    """Collect per-nucleus intensity values for all non-nuclear markers."""
+    hist_data = {}
+    intensity_ranges = {}
+
+    for c in _progress_iter(range(filtered_img.shape[3]), progress, desc="Step 15A - Collect Histogram Data"):
+        if stain_df.index[c] == "NUCLEI":
+            continue
+
+        condition = stain_complete_df.index[c]
+        marker_img = filtered_img[:, :, :, c]
+        intensity_ranges[condition] = (float(marker_img.min()), float(marker_img.max()))
+        max_n = int(np.max(im_segmentation_stack["Nuclei"]))
+
+        for nucleus_id in _progress_iter(range(1, max_n + 1), progress, desc=f"Step 15B - {condition} Nuclei"):
+            hist_data.setdefault(nucleus_id, {})
+            hist_data[nucleus_id].setdefault(condition, [])
+
+            nuc_mask = im_segmentation_stack["Nuclei"] == nucleus_id
+            cyto_mask = im_segmentation_stack["Cytoplasm"] == nucleus_id
+            pcm_mask = im_segmentation_stack["PCM"] == nucleus_id
+            mask_marker = (marker_img > 0) & ((nuc_mask + cyto_mask + pcm_mask) > 0)
+
+            if np.any(mask_marker):
+                values = marker_img[mask_marker]
+                if values.size > 0:
+                    hist_data[nucleus_id][condition].extend(values.tolist())
+
+    return hist_data, intensity_ranges
+
+
+def plot_nucleus_kdes(hist_data, stain_complete_df, progress=None, max_subplots=20):
+    """Plot one KDE row per nucleus for the collected intensity values."""
+    from matplotlib.lines import Line2D
+    from scipy.stats import gaussian_kde
+
+    nuclei = sorted(hist_data.keys())
+    if len(nuclei) == 0:
+        raise ValueError("hist_data is empty. Fill hist_data before plotting.")
+
+    all_conditions = sorted({condition for nucleus_data in hist_data.values() for condition in nucleus_data.keys()})
+    max_subplots = min(max(len(nuclei), 1), max_subplots)
+    height = min(3 * max_subplots, 60)
+
+    fig, axes = plt.subplots(max_subplots, 1, figsize=(10, height), sharex=True)
+    if max_subplots == 1:
+        axes = [axes]
+
+    x_grid = np.linspace(0, 255, 400)
+    nuclei_to_plot = nuclei[:max_subplots]
+
+    for idx, nucleus_id in _progress_iter(
+        enumerate(nuclei_to_plot),
+        progress,
+        desc="Step 15C - Plot Nucleus KDEs",
+        total=len(nuclei_to_plot),
+    ):
+        ax = axes[idx]
+        ax.set_title(f"Nucleus {nucleus_id}")
+        ax.set_xlim(0, 255)
+        ax.set_ylim(0, 1.05)
+        ax.grid(alpha=0.2)
+
+        for condition in all_conditions:
+            vals = np.asarray(hist_data.get(nucleus_id, {}).get(condition, []))
+            color = stain_complete_df.loc[condition, "Color"] if condition in stain_complete_df.index else "GRAY"
+            if color == "WHITE":
+                color = "GRAY"
+            if vals.size == 0:
+                continue
+
+            try:
+                kde = gaussian_kde(vals)
+                y_grid = kde(x_grid)
+            except Exception:
+                mean_val = vals.mean()
+                y_grid = np.exp(-0.5 * ((x_grid - mean_val) / 1.0) ** 2)
+
+            y_norm = y_grid / y_grid.max() if y_grid.max() > 0 else y_grid
+            ax.plot(x_grid, y_norm, linewidth=2, color=color)
+
+            mean_val = float(vals.mean())
+            std_val = float(vals.std())
+            ax.axvline(mean_val, linestyle="--", linewidth=1.5, color=color)
+            y_at_mean = np.interp(mean_val, x_grid, y_norm)
+            ax.hlines(y_at_mean, max(0.0, mean_val - std_val), min(255.0, mean_val + std_val), linewidth=2, color=color)
+
+        legend_handles = [
+            Line2D([0], [0], color=(stain_complete_df.loc[c, "Color"] if stain_complete_df.loc[c, "Color"] != "WHITE" else "GRAY"), lw=2)
+            for c in all_conditions
+        ]
+        ax.legend(legend_handles, all_conditions, loc="upper right", framealpha=0.9)
+        if nucleus_id == nuclei_to_plot[-1]:
+            ax.set_xlabel("Intensity (0–255)")
+
+    axes[0].set_ylabel("Relative Density (0–1)")
+    plt.tight_layout()
+    plt.show()
+    return fig, axes, x_grid
+
+
+def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_in, r_X, r_Y, r_Z, zoom_factors, progress=None):
+    """Plot X/Y/Z spatial distributions for each population."""
+    fig, axs = plt.subplots(3, 1, figsize=(15, 15))
+
+    for idx, marker in _progress_iter(
+        enumerate(labels_df.index),
+        progress,
+        desc="Step 16 - Plot Spatial Distributions",
+        total=len(labels_df.index),
+    ):
+        xcoor = [t[0] for t in labels_df.iloc[idx]["Mean cytoplasm positions [um]"]]
+        ycoor = [t[1] for t in labels_df.iloc[idx]["Mean cytoplasm positions [um]"]]
+        zcoor = [t[2] for t in labels_df.iloc[idx]["Mean cytoplasm positions [um]"]]
+
+        xcount, xbins = np.histogram(xcoor, range=(0, im_in.shape[2] * r_X / zoom_factors[2]), bins=30)
+        ycount, ybins = np.histogram(ycoor, range=(0, im_in.shape[1] * r_Y / zoom_factors[1]), bins=30)
+        zcount, zbins = np.histogram(zcoor, range=(0, im_in.shape[0] * r_Z / zoom_factors[0]), bins=30)
+        xbin_centers = (xbins[:-1] + xbins[1:]) / 2
+        ybin_centers = (ybins[:-1] + ybins[1:]) / 2
+        zbin_centers = (zbins[:-1] + zbins[1:]) / 2
+
+        condition = labels_df.iloc[idx]["Condition"]
+        color = _condition_color(condition, stain_complete_df, stain_df=stain_df)
+        if np.size(marker) == 1 and condition != "NUCLEI":
+            axs[0].plot(xbin_centers, xcount, label=str(condition), color=color)
+            axs[1].plot(ybin_centers, ycount, label=str(condition), color=color)
+            axs[2].plot(zbin_centers, zcount, label=str(condition), color=color)
+        elif np.size(marker) != 1:
+            linestyle = (0, (2, max(np.size(marker) - 1, 1)))
+            axs[0].plot(xbin_centers, xcount, label=str(condition), linestyle=linestyle, color=color)
+            axs[1].plot(ybin_centers, ycount, label=str(condition), linestyle=linestyle, color=color)
+            axs[2].plot(zbin_centers, zcount, label=str(condition), linestyle=linestyle, color=color)
+
+    axs[0].set_title("NUCLEI X DISTRIBUTION")
+    axs[0].set_xlabel("[μm]")
+    axs[0].legend(loc="upper right")
+    axs[0].set_facecolor("black")
+    axs[1].set_title("NUCLEI Y DISTRIBUTION")
+    axs[1].set_xlabel("[μm]")
+    axs[1].legend(loc="upper right")
+    axs[1].set_facecolor("black")
+    axs[2].set_title("NUCLEI Z DISTRIBUTION")
+    axs[2].set_xlabel("[μm]")
+    axs[2].legend(loc="upper right")
+    axs[2].set_facecolor("black")
+    return fig, axs
+
+
+def plot_size_distributions(labels_df, stain_complete_df, stain_df, progress=None):
+    """Plot nuclei and cytoplasm size histograms for each population."""
+    fig, axs = plt.subplots(2, 1, figsize=(15, 10))
+    nuclei_max_size = max(x for values in labels_df["Nuclei size [um3]"] for x in values)
+    cytoplasm_max_size = max(x for values in labels_df["Cytoplasm size [um3]"] for x in values)
+
+    for idx, marker in _progress_iter(
+        enumerate(labels_df.index),
+        progress,
+        desc="Step 17 - Plot Size Distributions",
+        total=len(labels_df.index),
+    ):
+        nuclei_sizes = list(labels_df.iloc[idx]["Nuclei size [um3]"])
+        cell_sizes = list(labels_df.iloc[idx]["Cytoplasm size [um3]"])
+        condition = labels_df.iloc[idx]["Condition"]
+        color = _condition_color(condition, stain_complete_df, stain_df=stain_df)
+
+        if condition != "CYTOPLASM":
+            axs[0].hist(
+                nuclei_sizes,
+                range=(0, nuclei_max_size),
+                bins=30,
+                label=str(condition),
+                alpha=1 / max(len(labels_df), 1),
+                color=color,
+            )
+        if condition != "NUCLEI":
+            axs[1].hist(
+                cell_sizes,
+                range=(0, cytoplasm_max_size),
+                bins=30,
+                label=str(condition),
+                alpha=1 / max(len(labels_df) - 1, 1),
+                color=color,
+            )
+
+    axs[0].set_title("NUCLEI SIZE DISTRIBUTION")
+    axs[0].set_xlabel("[μm3]")
+    axs[0].legend(loc="upper right")
+    axs[1].set_title("CELL SIZE DISTRIBUTION")
+    axs[1].set_xlabel("[μm3]")
+    axs[1].legend(loc="upper right")
+    return fig, axs
+
+
+def export_quantification_to_excel(output_path, original_stain_complete_df, labels_full_df, progress=None):
+    """Write the main Excel report with staining, nuclei, cytoplasm, and recap sheets."""
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        original_stain_complete_df.to_excel(writer, sheet_name="Staining", index=True)
+
+        nuclei_rows = labels_full_df[labels_full_df["Condition"] == "NUCLEI"]
+        if not nuclei_rows.empty:
+            nuclei_row = nuclei_rows.iloc[0]
+            nuclei_dict = {}
+            for k in _progress_iter(range(1, int(nuclei_row["Number"])), progress, desc="Step 20A - Write Nuclei Sheet"):
+                position = nuclei_row["Mean nuclei positions [um]"][k - 1]
+                nuclei_dict[k] = [position[0], position[1], position[2], nuclei_row["Nuclei size [um3]"][k - 1]]
+            cell_df = pd.DataFrame.from_dict(
+                nuclei_dict,
+                orient="index",
+                columns=["X position [um]", "Y position [um]", "Z position [um]", "Nuclei size [um3]"],
+            )
+            cell_df.to_excel(writer, sheet_name="NUCLEI", index=True)
+
+        cyto_rows = labels_full_df[labels_full_df["Condition"] == "CYTOPLASM"]
+        if not cyto_rows.empty:
+            cytoplasm_row = cyto_rows.iloc[0]
+            xlsx_dict = {}
+            columns = ["X position [um]", "Y position [um]", "Z position [um]", "Cytoplasm size [um3]"]
+
+            single_marker_rows = []
+            for idx, marker in _progress_iter(
+                enumerate(labels_full_df.index),
+                progress,
+                desc="Step 20B - Prepare Cytoplasm Columns",
+                total=len(labels_full_df.index),
+            ):
+                condition = labels_full_df.iloc[idx]["Condition"]
+                if condition not in ["NUCLEI", "CYTOPLASM"] and np.size(condition) == 1:
+                    single_marker_rows.append((idx, marker))
+                    columns.extend(
+                        [
+                            f"{marker} marker size [um3]",
+                            f"{marker} marker size cytoplasm [um3]",
+                            f"{marker} marker size PCM [um3]",
+                            f"{marker} intensity [-]",
+                            f"{marker} STD",
+                            f"{marker} intensity cytoplasm [-]",
+                            f"{marker} STD",
+                            f"{marker} intensity PCM [-]",
+                            f"{marker} STD",
+                        ]
+                    )
+
+            for k in _progress_iter(range(1, int(cytoplasm_row["Number"])), progress, desc="Step 20C - Write Cytoplasm Sheet"):
+                position = cytoplasm_row["Mean cytoplasm positions [um]"][k - 1]
+                row = [position[0], position[1], position[2], cytoplasm_row["Cytoplasm size [um3]"][k - 1]]
+                for idx, marker in single_marker_rows:
+                    shared = labels_full_df.iloc[idx]["Shared labels"]
+                    if k in shared:
+                        shared_idx = list(shared).index(k)
+                        row.extend(
+                            [
+                                labels_full_df.iloc[idx]["Marker size [um3]"][shared_idx],
+                                labels_full_df.iloc[idx]["Marker size cytoplasm [um3]"][shared_idx],
+                                labels_full_df.iloc[idx]["Marker size PCM [um3]"][shared_idx],
+                                labels_full_df.iloc[idx]["Avg. marker intensity"][shared_idx],
+                                labels_full_df.iloc[idx]["STD marker intensity"][shared_idx],
+                                labels_full_df.iloc[idx]["Avg. marker intensity cytoplasm"][shared_idx],
+                                labels_full_df.iloc[idx]["STD marker intensity cytoplasm"][shared_idx],
+                                labels_full_df.iloc[idx]["Avg. marker intensity PCM"][shared_idx],
+                                labels_full_df.iloc[idx]["STD marker intensity PCM"][shared_idx],
+                            ]
+                        )
+                    else:
+                        row.extend([" "] * 9)
+                xlsx_dict[k] = row
+
+            cell_df = pd.DataFrame.from_dict(xlsx_dict, orient="index", columns=columns)
+            cell_df.to_excel(writer, sheet_name="CYTOPLASM", index=True)
+
+        resume_df = labels_full_df.drop(
+            columns=[
+                "Shared labels",
+                "Mean nuclei positions [um]",
+                "Mean cytoplasm positions [um]",
+                "Nuclei size [um3]",
+                "Cytoplasm size [um3]",
+                "Marker size [um3]",
+                "Avg. marker intensity",
+                "Marker size cytoplasm [um3]",
+                "Avg. marker intensity cytoplasm",
+                "Marker size PCM [um3]",
+                "Avg. marker intensity PCM",
+            ]
+        ).copy()
+        resume_df["Laser"] = [labels_full_df.iloc[t]["Laser"] if np.size(labels_full_df.iloc[t]["Condition"]) == 1 else "" for t in range(len(labels_full_df))]
+        resume_df["Color"] = [labels_full_df.iloc[t]["Color"] if np.size(labels_full_df.iloc[t]["Condition"]) == 1 else "" for t in range(len(labels_full_df))]
+
+        nuclei_rows = labels_full_df[labels_full_df["Condition"] == "NUCLEI"]
+        total_cells = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_full_df.iloc[0]["Number"])
+        resume_df["%"] = [
+            100.0 * labels_full_df.iloc[t]["Number"] / total_cells if labels_full_df.iloc[t]["Condition"] != "NUCLEI" else ""
+            for t in range(len(labels_full_df))
+        ]
+        resume_df["Mean nuclei size [um3]"] = [np.mean(values) if len(values) > 0 else 0.0 for values in labels_full_df["Nuclei size [um3]"]]
+        resume_df["Mean cytoplasm size [um3]"] = [np.mean(values) if len(values) > 0 else 0.0 for values in labels_full_df["Cytoplasm size [um3]"]]
+        resume_df["Mean marker size [um3]"] = [
+            np.mean(values) if labels_full_df.iloc[t]["Condition"] not in ["NUCLEI", "CYTOPLASM"] and np.size(labels_full_df.iloc[t]["Condition"]) == 1 and len(values) > 0 else ""
+            for t, values in enumerate(labels_full_df["Marker size [um3]"])
+        ]
+        resume_df.to_excel(writer, sheet_name="RECAP", index=True)
+
+    return output_path
+
+
 class ImageProcessing:
     """Minimal wrapper used by the reporting helpers."""
 
@@ -1451,11 +2324,11 @@ def segment_nuclei_watershed(
     nuclei_diameter,
     nuclei_z_anisotropy_factor=1.0,
     nuclei_bridge_shrink_factor=0.28,
-    nuclei_split_diameter_min_factor=0.2,
-    nuclei_split_diameter_max_factor=1.0,
+    nuclei_split_diameter_min_factor=0.5,
+    nuclei_split_diameter_max_factor=1.5,
     nuclei_split_diameter_scales=3,
-    nuclei_seed_min_fraction=0.5,
-    nuclei_min_roundness=0.0,
+    nuclei_seed_min_fraction=0.03,
+    nuclei_min_roundness=0.45,
 ):
     """
     Segment nuclei using watershed with multi-scale erosion and EDT peak fallback.
@@ -1487,19 +2360,19 @@ def segment_nuclei_watershed(
         Range [0.1, 0.5]; higher values = more aggressive erosion.
     
     nuclei_split_diameter_min_factor : float, optional
-        Minimum erosion scale as fraction of diameter (default=0.2).
+        Minimum erosion scale as fraction of diameter (default=0.5).
     
     nuclei_split_diameter_max_factor : float, optional
-        Maximum erosion scale as fraction of diameter (default=1.0).
+        Maximum erosion scale as fraction of diameter (default=1.5).
     
     nuclei_split_diameter_scales : int, optional
         Number of erosion scales to evaluate (default=3).
     
     nuclei_seed_min_fraction : float, optional
-        Minimum seed size as fraction of expected nucleus volume (default=0.5).
+        Minimum seed size as fraction of expected nucleus volume (default=0.03).
 
     nuclei_min_roundness : float, optional
-        Minimum circularity on the largest XY slice for a nucleus to be kept.
+        Minimum circularity on the largest XY slice for a nucleus to be kept (default=0.45).
         Uses circularity = 4*pi*area/perimeter^2. Typical range is [0.0, 1.0].
     
     Returns
