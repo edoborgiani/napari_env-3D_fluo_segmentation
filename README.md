@@ -1,152 +1,131 @@
-# 3D Fluorescence Nuclei Segmentation with Napari
+﻿# 3D Fluorescence Segmentation with Napari
 
-This repository provides a set of Jupyter notebooks and tools for 3D nuclei segmentation in fluorescence microscopy images using the Napari ecosystem. The project is designed for researchers and practitioners in bioimage analysis who need robust, reproducible workflows for segmenting and analyzing 3D nuclear structures.
+This repository provides Jupyter notebooks and shared Python helpers for 3D segmentation and quantification of nuclei and fluorescence structures in microscopy images, using the Napari ecosystem. It targets researchers in bioimage analysis who need robust, reproducible workflows for volumetric fluorescence data.
+
+> **Disclaimer:** This repository is freely available for use. The associated pipeline is currently being prepared for publication — please contact [Edoardo Borgiani](https://github.com/edoborgiani) for more information on how to use the pipeline or for collaboration enquiries.
 
 ## Features
-- **Jupyter Notebooks**: Step-by-step segmentation pipelines with code and explanations.
-- **3D Image Processing**: Tools for handling and segmenting volumetric fluorescence data.
-- **Napari Integration**: Interactive visualization and manual correction using Napari.
-- **Versioned Workflows**: Multiple notebook versions to track improvements and changes.
+- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.4.2`) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.0`).
+- **Shared helper library** (`helpers/`): processing, quantification, visualization, and report-export functions shared across notebooks.
+- **Profile-aware imports** (`helpers/notebook_setup_helpers.py`): the `nuclei` and `ld` profiles load only the dependencies each workflow needs, avoiding unnecessary overhead.
+- **3D Image Processing**: normalization, resampling to isotropic voxel size, denoising, thresholding, watershed and StarDist-based segmentation.
+- **Napari Integration**: interactive visualization and manual correction at each processing step.
+- **Quantification & Export**: per-cell marker statistics, spatial distributions, Excel reports, per-nucleus PDF rows, and 3D mesh export (VTK/STL/INP).
 
 ## Repository Structure
 ```
 .
-├── Fluo_3D_nuc_seg_v1.2.3.ipynb   # Notebook: v1.2.3 workflow
-├── Fluo_3D_nuc_seg_v1.3.2.ipynb   # Notebook: v1.3.2 workflow (latest, recommended)
+├── Fluo_3D_nuc_seg_v1.4.2.ipynb   # Nuclei segmentation — latest recommended version
+├── Fluo_3D_LD_seg_v1.0.ipynb      # Live/Dead segmentation — v1.0
 ├── requirements.txt               # Python dependencies
 ├── README.md                      # This file
-└── old_v/
-   ├── Fluo_3D_nuc_seg_v1.2.1.ipynb
-   ├── Fluo_3D_nuc_seg_v1.2.2.ipynb
-   ├── Fluo_3D_nuc_seg_v1.2.ipynb
-   ├── Fluo_3D_nuc_seg_v1.3.ipynb
-   ├── Fluo_3D_nuc_seg_v1.3.1.ipynb
-   ├── Fluo_3D_nuc_seg_v1.3.1.ipynb.bak
-   ├── Fluo_3D_nuc_seg_v1.3a.ipynb
-   └── Fluo_3D_nuclei_segmentation.ipynb
+└── helpers/
+    ├── __init__.py
+    ├── notebook_helpers.py        # Core processing, segmentation, and export functions
+    └── notebook_setup_helpers.py  # Package installation and profile-aware import loader
 ```
 
+> **Note:** The `old_v/` folder (containing earlier notebook versions v1.0–v1.4.1) and Python `__pycache__` directories are excluded from version control and exist only locally.
+
 ## Getting Started
+
 1. **Clone the repository**
    ```powershell
    git clone https://github.com/edoborgiani/napari_env-3D_fluo_segmentation.git
    cd napari_env-3D_fluo_segmentation
    ```
-2. **Set up a Python environment**
-   - Python 3.8 or newer is recommended.
-   - Install dependencies (see below).
+
+2. **Create a virtual environment** (recommended)
+   ```powershell
+   python -m venv .venv
+   .venv\Scripts\Activate.ps1
+   ```
 
 3. **Install dependencies**
-   Install all required dependencies using:
    ```powershell
    pip install -r requirements.txt
    ```
 
-4. **Launch Jupyter Notebook**
+4. **Launch Jupyter**
    ```powershell
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.3.2.ipynb` for the latest and recommended workflow.
+   Open `Fluo_3D_nuc_seg_v1.4.2.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.0.ipynb` for Live/Dead segmentation.
 
 ## Usage
-- Follow the instructions in the notebooks to load your 3D fluorescence images, run segmentation, and visualize results.
-- Use Napari for interactive visualization and manual corrections.
-- Each notebook version may contain different approaches or improvements—see notebook headers for details.
 
+- Follow the notebook cells in order: setup → image loading → preprocessing → segmentation → quantification → export.
+- The first cells call `notebook_setup_helpers.install_required_packages()` and `load_common_imports(profile=...)` to bootstrap the environment automatically.
+- Use Napari for interactive visualization and manual corrections at any step.
+- All shared processing logic lives in `helpers/notebook_helpers.py` — customize functions there rather than duplicating code across notebooks.
 
-## Detailed Guide: Using `Fluo_3D_nuc_seg_v1.3.2.ipynb`
+## Detailed Workflow: `Fluo_3D_nuc_seg_v1.4.2.ipynb`
 
-The `Fluo_3D_nuc_seg_v1.3.2.ipynb` notebook provides an advanced, user-friendly workflow for 3D segmentation and quantification of nuclei and cellular structures in fluorescence microscopy images. Below is a step-by-step guide to using this notebook:
+### 1. Environment Setup
+The notebook installs optional packages automatically via `notebook_setup_helpers` and loads all imports using `load_common_imports(profile='nuclei')`.
 
-### 1. Install Required Packages
-The notebook will attempt to install some dependencies automatically, but you may need to ensure the following are installed:
-```
-pip install napari[all] aicsimageio[nd2] nd2reader xlsxwriter pyvista simpleitk scikit-image csbdeep stardist meshio tetgen meshlib matplotlib pandas
-```
+### 2. Load Image Data
+- Set `input_file` to your `.nd2` or `.tif` file path.
+- Physical pixel sizes are extracted from metadata for correct spatial scaling.
 
-### 2. Load Your Image Data
-- Set the `input_file` variable to your `.nd2` or `.tif` file.
-- The notebook reads metadata and extracts the 3D image stack and channel information.
-- Physical pixel sizes are automatically extracted for correct scaling.
+### 3. Define Sample & Staining Information
+- Configure `stain_dict` to map channels to biological markers and display colors.
+- `prepare_stain_settings()` and `build_labels_dict()` from `notebook_helpers` build the working data structures.
 
-### 3. Define Sample and Staining Information
-- Set parameters such as `nuclei_diameter`, `cell_diameter`, and the `stain_dict` dictionary to match your experiment.
-- The notebook will create a DataFrame mapping channels to biological markers and colors.
+### 4. ROI & Scaling
+- Adjust `ROI` and `scale_factor` to crop or downsample for faster iteration.
 
-### 4. Select Region of Interest (ROI) and Scaling
-- Adjust the `ROI` and `scale_factor` variables to crop and/or downsample your data for faster processing.
-
-### 5. Setup and Visualization
-- The notebook supports loading or saving a CSV setup file for channel contrast/gamma settings.
-- Napari is used for interactive visualization and adjustment of each channel.
+### 5. Setup & Per-Channel Contrast/Gamma
+- Load or save a CSV setup file for per-channel contrast and gamma settings.
+- Napari is used for interactive inspection and adjustment.
 
 ### 6. Image Preprocessing
-- **Normalization**: All channels are normalized to [0, 255].
-- **Resampling**: Images are resampled to isotropic voxel size if needed.
-- **Denoising**: Median and Gaussian filters are applied.
-- **Contrast/Gamma Correction**: Per-channel adjustments based on setup.
-- **Histogram Export**: Histograms for each channel are saved to Excel.
+- **Normalization**: channels normalized to [0, 255] via `normalize_image_channels()`.
+- **Resampling**: isotropic voxel resampling via `resample_to_isotropic()`.
+- **Denoising**: median and Gaussian filters via `apply_median_denoise()` / `apply_gaussian_smoothing()`.
+- **Histogram export**: per-channel histograms saved to Excel via `export_channel_histograms()`.
 
 ### 7. Thresholding
-- Multiple thresholding methods are combined (Otsu, Sauvola, statistical background, intensity gain) for robust segmentation.
-- Small islands are removed from binary masks.
+- Combined thresholding (Otsu, Sauvola, statistical background, intensity gain) for robust binary masks.
+- Small artefact islands removed via `remove_small_islands()`.
 
 ### 8. Segmentation
-- **Nuclei**: Segmented using either 3D watershed or StarDist2D (slice-by-slice, then merged in 3D).
-- **Cytoplasm/PCM**: Segmented by growing from nuclei or using additional channels.
-- **Assignment**: Labels are assigned to other channels for marker quantification.
-- **Aggregates**: Large cell aggregates are identified.
+- **Nuclei**: 3D watershed (`segment_nuclei_watershed()`) or StarDist2D slice-by-slice with 3D merging (`stardist3d_from_2d()`).
+- **Cytoplasm / PCM**: grown from nuclei via `grow_labels()` or from additional channels.
+- **Label assignment**: `assign_labels()` maps segmented structures to marker channels.
+- **Aggregate detection**: large multi-cell aggregates flagged separately.
 
 ### 9. Visualization
-- Napari is used to visualize all processing steps, including overlays of original, denoised, thresholded, and segmented images.
+- Napari overlays for raw, denoised, thresholded, and labelled images at each stage.
 
 ### 10. Quantification
-- The notebook computes:
-   - Number and size of nuclei and cells
-   - Marker intensities and volumes per cell
-   - Spatial distributions (X, Y, Z)
-- Results are exported to Excel for further analysis.
+- `compute_nuclei_cytoplasm_stats()` and `compute_marker_stats_for_marker()` compute per-cell volumes, intensities, and spatial distributions (X, Y, Z).
+- `collect_histogram_data()` collects per-channel statistics.
+- `print_population_summary()` prints a summary to the notebook.
 
-### 11. 3D Export
-- **.VTK and .STL**: 3D meshes for nuclei, cytoplasm, PCM, and markers are generated for visualization in external tools (e.g., ParaView).
-- **Finite Element Analysis**: Optionally, a `.inp` file for FEA is created using tetrahedralization.
-
-### 12. Customization
-- The notebook is modular—functions for each processing step can be adapted to your needs.
-- Parameters for segmentation, filtering, and quantification are easily adjustable at the top of the notebook.
+### 11. Export
+- **Excel**: full quantification tables via `export_quantification_to_excel()`.
+- **PDF**: per-nucleus image rows via `create_row_pdf()`.
+- **3D meshes**: VTK / STL files for nuclei, cytoplasm, PCM, and markers for visualization in ParaView or similar.
+- **FEA**: optional `.inp` file generated via tetrahedralization (`tetgen`).
 
 ### Tips
-- For large datasets, consider cropping or downsampling to speed up processing.
-- Use Napari’s interactive tools to inspect and manually correct segmentations if needed.
-- Review the exported Excel files for quantitative results and quality control.
+- For large datasets, use `ROI` cropping and a reduced `scale_factor` during development.
+- Use Napari's layer controls to inspect intermediate results before committing to full-resolution runs.
+- Review exported Excel files for quantitative QC before downstream analysis.
 
 ---
 
 ## Requirements
-- Python 3.8+
-- napari[all]
-- numpy
-- scipy
-- scikit-image
-- matplotlib
-- jupyter
-- aicsimageio[nd2]
-- nd2reader
-- xlsxwriter
-- pyvista
-- simpleitk
-- csbdeep
-- stardist
-- meshio
-- tetgen
-- meshlib
-- pandas
-- vispy
-- reportlab
-- Pillow
+See `requirements.txt` for the full list. Key dependencies:
+- `napari[all]`, `numpy`, `scipy`, `scikit-image`, `matplotlib`, `pandas`
+- `aicsimageio[nd2]`, `nd2reader`
+- `pyvista`, `SimpleITK`, `csbdeep`, `stardist`
+- `meshio`, `tetgen`, `meshlib`
+- `xlsxwriter`, `reportlab`, `Pillow`, `vispy`
 
 ## Contributing
-Contributions are welcome! Please open issues or pull requests for bug fixes, improvements, or new features.
+Contributions are welcome. Please open issues or pull requests for bug fixes, improvements, or new features.
 
 ## License
 This project is licensed under the MIT License.
