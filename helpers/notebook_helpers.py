@@ -1279,6 +1279,7 @@ def prepare_stain_settings(
             import napari as napari_module
 
         stain_complete_df = stain_initial_df.copy()
+        napari_module.Viewer.close_all()
         settings.application.ipy_interactive = False
         viewer = napari_module.Viewer()
 
