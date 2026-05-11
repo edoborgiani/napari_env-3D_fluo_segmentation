@@ -1281,7 +1281,7 @@ def prepare_stain_settings(
         stain_complete_df = stain_initial_df.copy()
         napari_module.Viewer.close_all()
         settings.application.ipy_interactive = False
-        viewer = napari_module.Viewer()
+        viewer = napari_module.Viewer(title="Channels setup - adjust contrast and gamma, then close viewer to continue", ndisplay=3)
 
         for _, idx in _progress_iter(
             enumerate(stain_complete_df.index),
