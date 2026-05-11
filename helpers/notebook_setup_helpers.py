@@ -10,6 +10,7 @@ from typing import Any
 
 DEFAULT_PIP_PACKAGES = [
     "aicsimageio[nd2]",
+    "aicspylibczi",
     "nd2reader",
     "xlsxwriter",
     "reportlab",
@@ -79,7 +80,10 @@ def load_common_imports(
     imported["combinations"] = importlib.import_module("itertools").combinations if profile == "nuclei" else None
     imported["defaultdict"] = importlib.import_module("collections").defaultdict if profile == "nuclei" else None
     imported["AICSImage"] = importlib.import_module("aicsimageio").AICSImage
-    imported["ND2Reader"] = importlib.import_module("nd2reader").ND2Reader
+    try:
+        imported["ND2Reader"] = importlib.import_module("nd2reader").ND2Reader
+    except ImportError:
+        imported["ND2Reader"] = None
     imported["Colormap"] = importlib.import_module("vispy.color").Colormap if profile == "nuclei" else None
     imported["to_rgb"] = importlib.import_module("matplotlib.colors").to_rgb if profile == "nuclei" else None
     imported["normalize"] = importlib.import_module("csbdeep.utils").normalize if profile == "nuclei" else None
