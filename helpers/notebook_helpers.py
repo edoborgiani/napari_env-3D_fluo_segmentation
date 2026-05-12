@@ -55,7 +55,10 @@ __all__ = [
     "plot_nucleus_kdes",
     "plot_size_distributions",
     "plot_spatial_distributions",
+    "build_stain_dataframe",
+    "prepare_image_stack",
     "prepare_stain_settings",
+    "view_original_channels",
     "print_population_summary",
     "read_file_metadata",
     "remove_small_island_labels",
@@ -2933,3 +2936,153 @@ def fix_image_axes_order(original_image):
                 orig = np.moveaxis(orig, chan_axis, -1)
     
     return orig
+
+
+def prepare_image_stack(img, meta, ROI, big_image, nuclei_diameter, cell_diameter):
+    """Compute geometry parameters and build the initial image stack.
+
+    Derives nuclei/cell radii and volumes from diameter inputs, applies ROI
+    cropping for the non-big-image case, casts to float32, and fixes axes
+    order so the result is always (Z, Y, X, C).
+
+    Parameters
+    ----------
+    img : ndarray
+        Image array already loaded into memory (shape Z, Y, X, C or similar).
+    meta : AICSImage
+        Opened AICSImage object.
+    ROI : list of 6 ints
+        [x0, x1, y0, y1, z0, z1]. Zero values are replaced by the image extent.
+    big_image : bool
+        If True the full img is used as-is; if False a sub-region is read
+        from meta and cropped according to ROI.
+    nuclei_diameter : float
+        Approximate nucleus diameter in µm.
+    cell_diameter : float
+        Approximate whole-cell diameter in µm.
+
+    Returns
+    -------
+    im_final_stack : dict
+        {'Original image': ndarray (Z, Y, X, C)}
+    nuclei_radius : float
+    cell_radius : float
+    nuclei_volume : float
+    cell_volume : float
+    """
+    nuclei_radius = nuclei_diameter * 0.5
+    cell_radius = cell_diameter * 0.5
+    nuclei_volume = np.ceil(4.0 * (nuclei_radius ** 3.0) * np.pi / 3.0)
+    cell_volume = np.ceil(4.0 * (cell_radius ** 3.0) * np.pi / 3.0)
+
+    x0, x1, y0, y1, z0, z1 = ROI
+    if x1 == 0:
+        x1 = img.shape[0]
+    if y1 == 0:
+        y1 = img.shape[1]
+    if z1 == 0:
+        z1 = img.shape[2]
+
+    if big_image:
+        im_original = img.astype('float32')
+        im_original_ROI = im_original.copy()
+    else:
+        im_original = meta.get_image_data("ZYXC", S=0, T=0).astype('float32')
+        im_original_ROI = im_original[z0:z1, y0:y1, x0:x1, :]
+
+    # Fix axes order: ensure (Z, Y, X, C), drop singleton T axis if present
+    orig = im_original_ROI
+    if len(orig.shape) == 5 and orig.shape[4] == 1:
+        orig = orig[..., 0]
+    if len(orig.shape) == 4 and orig.shape[-1] > 50:
+        chan_axis = next((i for i, s in enumerate(orig.shape) if s < 50), None)
+        if chan_axis is not None and chan_axis != 3:
+            orig = np.moveaxis(orig, chan_axis, -1)
+
+    print(f"Image stack ready — shape: {orig.shape}")
+    return {'Original image': orig}, nuclei_radius, cell_radius, nuclei_volume, cell_volume
+
+
+def build_stain_dataframe(stain_dict: dict, file_meta: dict) -> "pd.DataFrame":
+    """Build and sort the staining metadata DataFrame.
+
+    Normalises all string keys/values in *stain_dict* to uppercase, constructs
+    a DataFrame with columns ``['Marker', 'Laser', 'Color']``, then sorts rows
+    to match the channel order reported by *file_meta*.
+
+    Parameters
+    ----------
+    stain_dict : dict
+        User-defined mapping of condition name to [marker, laser/channel, color].
+    file_meta : dict
+        Output of ``read_file_metadata``; must contain a ``'channels'`` list.
+
+    Returns
+    -------
+    stain_df : pd.DataFrame
+        Sorted staining table indexed by condition name.
+    """
+    norm = {
+        k.upper(): [item.upper() if isinstance(item, str) else item for item in v]
+        for k, v in stain_dict.items()
+    }
+    stain_df = pd.DataFrame.from_dict(norm, orient='index', columns=['Marker', 'Laser', 'Color'])
+    stain_df.index.name = 'Condition'
+
+    laser_order = file_meta.get("channels") or []
+    order_map = {name.strip().upper(): i for i, name in enumerate(laser_order)}
+    stain_df['order'] = stain_df['Laser'].map(order_map)
+    stain_df = stain_df.sort_values('order').drop(columns='order')
+
+    if 'NUCLEI' not in stain_df.index:
+        print('[build_stain_dataframe] Warning: no NUCLEI condition found!')
+
+    return stain_df
+
+
+def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
+                            napari_module, progress=None) -> object:
+    """Open a napari viewer and add each channel of the original image.
+
+    Each channel is normalised to uint8 [0, 255] before display.
+
+    Parameters
+    ----------
+    im_final_stack : dict
+        Must contain ``'Original image'`` with shape (Z, Y, X, C).
+    stain_df : pd.DataFrame
+        Staining table from ``build_stain_dataframe``.
+    napari_module : module
+        The imported ``napari`` module.
+    progress : callable, optional
+        A ``tqdm``-compatible progress wrapper (e.g. ``step_progress``).
+
+    Returns
+    -------
+    viewer : napari.Viewer
+    """
+    if progress is None:
+        def progress(x, **kw): return x
+
+    im_in = im_final_stack['Original image'].copy()
+    viewer = napari_module.Viewer(title="Original Image Channels")
+
+    for c, c_name in progress(
+        enumerate(stain_df['Marker']),
+        total=len(stain_df['Marker']),
+        desc='Step 04 - Visualize Channels',
+        leave=False,
+    ):
+        im_channel = im_in[:, :, :, c]
+        ch_min, ch_max = im_channel.min(), im_channel.max()
+        im_8b = ((im_channel - ch_min) / (ch_max - ch_min + 1e-8) * 255).clip(0, 255).astype('uint8')
+        viewer.add_image(
+            im_8b,
+            name=f"{stain_df.index[c]} ({c_name})",
+            colormap=stain_df['Color'].iloc[c],
+            blending='additive',
+        )
+
+    viewer.scale_bar.visible = True
+    viewer.scale_bar.unit = 'um'
+    return viewer
