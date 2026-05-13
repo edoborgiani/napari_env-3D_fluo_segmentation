@@ -37,6 +37,9 @@ __all__ = [
     "detect_peaks_xy_with_best_z",
     "double_plateau_hist_equalization_nd",
     "export_channel_histograms",
+    "build_vtk_volumes",
+    "export_fea_mesh",
+    "export_marker_stl",
     "export_nucleus_vtk_crop",
     "export_quantification_to_excel",
     "extract_roi_from_metadata",
@@ -3727,3 +3730,306 @@ def export_nucleus_vtk_crop(
     out_path = str(_Path(input_file).stem + f"_nuc{nuc_label}_3Dcrop.vtk")
     grid.save(out_path)
     print(f"Saved: {out_path}  ({size}^3 voxels, {2 + len(marker_crops)} channels)")
+
+
+# ---------------------------------------------------------------------------
+# VTK / STL / FEA export helpers
+# ---------------------------------------------------------------------------
+
+def build_vtk_volumes(
+    im_segmentation_stack,
+    labels_full_df,
+    stain_complete_df,
+    input_file,
+    r_xyz,
+    zoom_factors,
+    progress=None,
+):
+    """Build labelled VTK volume meshes for nuclei, cytoplasm and PCM and save to disk.
+
+    Parameters
+    ----------
+    im_segmentation_stack : dict
+        Must contain 'Nuclei', 'Cytoplasm', and 'PCM'.
+    labels_full_df : DataFrame
+        Full quantification table produced by build_full_labels_dict / labels_dict_to_dataframe.
+    stain_complete_df : DataFrame
+        Staining metadata (columns 'Condition', 'Marker', …).
+    input_file : str or Path
+        Source image path (used to derive output filenames).
+    r_xyz : tuple of float
+        Physical voxel sizes (r_X, r_Y, r_Z) in µm/px.
+    zoom_factors : list of float
+        Zoom factors [Z, Y, X] applied during isotropic resampling.
+    progress : callable or None
+        tqdm-compatible wrapper used for the per-nucleus loop.
+    """
+    import pyvista as pv
+    import meshlib.mrmeshpy as mr
+    import meshlib.mrmeshnumpy as mrn
+    from pathlib import Path as _Path
+    from IPython.display import clear_output
+
+    r_X, r_Y, r_Z = r_xyz
+    nuc_max = int(np.max(im_segmentation_stack['Nuclei']))
+    cyto_max = int(np.max(im_segmentation_stack['Cytoplasm']))
+    pcm_max = int(np.max(im_segmentation_stack['PCM']))
+
+    blocks_nuclei = pv.MultiBlock()
+    blocks_cyto = pv.MultiBlock()
+    blocks_PCM = pv.MultiBlock()
+
+    nuc_vol = np.zeros((nuc_max + 1,))
+    nuc_coord = np.zeros((nuc_max + 1, 3))
+    cyto_vol = np.zeros((cyto_max + 1,))
+    cyto_coord = np.zeros((cyto_max + 1, 3))
+    PCM_vol = np.zeros((pcm_max + 1,))
+    PCM_coord = np.zeros((pcm_max + 1, 3))
+
+    iter_ = (
+        progress(range(1, nuc_max + 1), desc='Step 18 - Build VTK Volumes')
+        if progress else range(1, nuc_max + 1)
+    )
+    k = 0
+    for j in iter_:
+        clear_output(wait=True)
+        print(f'NUCLEI {j} / {nuc_max}')
+
+        # --- nuclei ---
+        simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Nuclei'] == j))
+        floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
+        mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+        mr.saveMesh(mesh_stl, "part_nuclei_mesh.stl")
+
+        mesh_nuclei = pv.read("part_nuclei_mesh.stl")
+        if mesh_nuclei.volume > 0.0:
+            mesh_nuclei.decimate(target_reduction=0.8, inplace=True)
+            nuc_vol[k] = mesh_nuclei.volume
+            nuc_coord[k] = mesh_nuclei.center
+
+            mesh_nuclei.cell_data['ID'] = np.ones(mesh_nuclei.n_cells) * (k + 1)
+            mesh_nuclei.cell_data['Nuclei volume (um3)'] = (
+                np.ones(mesh_nuclei.n_cells) * nuc_vol[k] * r_X * r_Y * r_Z / np.prod(zoom_factors)
+            )
+            mesh_nuclei.cell_data['Z nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][0] * r_Z / zoom_factors[0]
+            mesh_nuclei.cell_data['Y nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][1] * r_Y / zoom_factors[1]
+            mesh_nuclei.cell_data['X nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][2] * r_X / zoom_factors[2]
+            blocks_nuclei.append(mesh_nuclei)
+            k += 1
+
+        # --- cytoplasm ---
+        simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Cytoplasm'] == j))
+        floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
+        mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+        mr.saveMesh(mesh_stl, "part_cyto_mesh.stl")
+        mesh_cyto = pv.read("part_cyto_mesh.stl")
+
+        # --- PCM ---
+        simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['PCM'] == j))
+        floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
+        mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+        mr.saveMesh(mesh_stl, "part_PCM_mesh.stl")
+        mesh_PCM = pv.read("part_PCM_mesh.stl")
+
+        if mesh_cyto.volume > 0.0:
+            mesh_cyto.decimate(target_reduction=0.8, inplace=True)
+            mesh_PCM.decimate(target_reduction=0.8, inplace=True)
+
+            cyto_vol[k] = mesh_cyto.volume
+            cyto_coord[k] = mesh_cyto.center
+            PCM_vol[k] = mesh_PCM.volume
+            PCM_coord[k] = mesh_PCM.center
+
+            voxel_scale = r_X * r_Y * r_Z / np.prod(zoom_factors)
+
+            mesh_cyto.cell_data['ID'] = np.ones(mesh_cyto.n_cells) * (k + 1)
+            mesh_PCM.cell_data['ID'] = np.ones(mesh_PCM.n_cells) * (k + 1)
+            mesh_cyto.cell_data['Cellular volume (um3)'] = np.ones(mesh_cyto.n_cells) * cyto_vol[k] * voxel_scale
+            mesh_PCM.cell_data['PCM volume (um3)'] = np.ones(mesh_PCM.n_cells) * PCM_vol[k] * voxel_scale
+            mesh_cyto.cell_data['Z cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][0] * r_Z / zoom_factors[0]
+            mesh_cyto.cell_data['Y cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][1] * r_Y / zoom_factors[1]
+            mesh_cyto.cell_data['X cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][2] * r_X / zoom_factors[2]
+            mesh_PCM.cell_data['Z PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][0] * r_Z / zoom_factors[0]
+            mesh_PCM.cell_data['Y PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][1] * r_Y / zoom_factors[1]
+            mesh_PCM.cell_data['X PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][2] * r_X / zoom_factors[2]
+
+            for i, marker in enumerate(labels_full_df.index):
+                cond = labels_full_df['Condition'][i]
+                if cond in ('NUCLEI', 'CYTOPLASM') or np.size(marker) != 1:
+                    continue
+                shared = list(labels_full_df['Shared labels'][i])
+                if j in shared:
+                    idx = shared.index(j)
+                    vol_um3 = labels_full_df['Marker size [um3]'][i][idx]
+                    cyto_combined = (cyto_vol[k] + PCM_vol[k]) * voxel_scale
+                    mesh_cyto.cell_data[marker + ' volume (um3)'] = np.ones(mesh_cyto.n_cells) * vol_um3
+                    mesh_PCM.cell_data[marker + ' volume (um3)'] = np.ones(mesh_PCM.n_cells) * vol_um3
+                    mesh_cyto.cell_data[marker + ' volume cytoplasm (um3)'] = np.ones(mesh_cyto.n_cells) * labels_full_df['Marker size cytoplasm [um3]'][i][idx]
+                    mesh_PCM.cell_data[marker + ' volume PCM (um3)'] = np.ones(mesh_PCM.n_cells) * labels_full_df['Marker size PCM [um3]'][i][idx]
+                    mesh_cyto.cell_data[marker + ' rel. vol. (-)'] = np.ones(mesh_cyto.n_cells) * (vol_um3 / cyto_combined)
+                    mesh_PCM.cell_data[marker + ' rel. vol. (-)'] = np.ones(mesh_PCM.n_cells) * (vol_um3 / cyto_combined)
+                    mesh_cyto.cell_data[marker + ' rel. vol. cytoplasm (-)'] = np.ones(mesh_cyto.n_cells) * (labels_full_df['Marker size cytoplasm [um3]'][i][idx] / (cyto_vol[k] * voxel_scale))
+                    mesh_PCM.cell_data[marker + ' rel. vol. PCM (-)'] = np.ones(mesh_PCM.n_cells) * (labels_full_df['Marker size PCM [um3]'][i][idx] / (PCM_vol[k] * voxel_scale))
+                    mesh_cyto.cell_data[marker + ' avg. intensity (-)'] = np.ones(mesh_cyto.n_cells) * labels_full_df['Avg. marker intensity'][i][idx]
+                    mesh_PCM.cell_data[marker + ' avg. intensity (-)'] = np.ones(mesh_PCM.n_cells) * labels_full_df['Avg. marker intensity'][i][idx]
+                    mesh_cyto.cell_data[marker + ' avg. cytoplasm int. (-)'] = np.ones(mesh_cyto.n_cells) * labels_full_df['Avg. marker intensity cytoplasm'][i][idx]
+                    mesh_PCM.cell_data[marker + ' avg. PCM int. (-)'] = np.ones(mesh_PCM.n_cells) * labels_full_df['Avg. marker intensity PCM'][i][idx]
+                else:
+                    mesh_cyto.cell_data[marker + ' expression (um3)'] = np.zeros(mesh_cyto.n_cells)
+                    mesh_cyto.cell_data[marker + ' rel. expr. (-)'] = np.zeros(mesh_cyto.n_cells)
+
+            blocks_cyto.append(mesh_cyto)
+            blocks_PCM.append(mesh_PCM)
+
+    stem = str(_Path(input_file).stem)
+    blocks_nuclei.extract_geometry().save(stem + '_NUCLEI_labelled.vtk')
+    blocks_cyto.extract_geometry().save(stem + '_CYTOPLASM_labelled.vtk')
+    blocks_PCM.extract_geometry().save(stem + '_PCM_labelled.vtk')
+
+
+def export_marker_stl(
+    im_segmentation_stack,
+    stain_df,
+    stain_complete_df,
+    input_file,
+    progress=None,
+):
+    """Export per-marker binary volumes as STL mesh files.
+
+    Parameters
+    ----------
+    im_segmentation_stack : dict
+        Segmentation stack containing per-marker threshold images.
+    stain_df : DataFrame
+        Staining DataFrame with condition index and 'Marker' column.
+    stain_complete_df : DataFrame
+        Complete staining DataFrame used to filter NUCLEI/CYTOPLASM/PCM.
+    input_file : str or Path
+        Source image path (used to derive output filenames).
+    progress : callable or None
+        tqdm-compatible wrapper.
+    """
+    import meshlib.mrmeshpy as mr
+    import meshlib.mrmeshnumpy as mrn
+    from pathlib import Path as _Path
+
+    iter_ = (
+        progress(
+            enumerate(stain_complete_df.index),
+            total=len(stain_complete_df.index),
+            desc='Step 19 - Export Marker STL',
+        )
+        if progress else enumerate(stain_complete_df.index)
+    )
+    for c, _marker in iter_:
+        if stain_complete_df.index[c] in ('NUCLEI', 'CYTOPLASM', 'PCM'):
+            continue
+        simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack[stain_df.index[c]] > 0))
+        floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
+        mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+        mr.saveMesh(mesh_stl, str(_Path(input_file).stem) + "_" + stain_complete_df['Marker'][c] + "_mesh.stl")
+
+
+def export_fea_mesh(
+    im_segmentation_stack,
+    input_file,
+    progress=None,
+):
+    """Build a FEA tetrahedral mesh from the nuclei segmentation and write an Abaqus .inp file.
+
+    This function combines three steps:
+    1. Tetrahedralize the nuclei surface mesh with TetGen.
+    2. Assign tetrahedral elements to individual nucleus labels.
+    3. Write a final ``_FEA.inp`` Abaqus file with per-nucleus element sets.
+
+    Parameters
+    ----------
+    im_segmentation_stack : dict
+        Must contain 'Nuclei'.
+    input_file : str or Path
+        Source image path (used to derive output filenames).
+    progress : callable or None
+        tqdm-compatible wrapper.
+    """
+    import meshlib.mrmeshpy as mr
+    import meshlib.mrmeshnumpy as mrn
+    import meshio
+    import tetgen
+    import statistics as st
+    from pathlib import Path as _Path
+
+    nuc_max = int(np.max(im_segmentation_stack['Nuclei']))
+
+    # --- Step 1: tetrahedralize ---
+    simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Nuclei']))
+    floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
+    mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+
+    outVerts = mrn.getNumpyVerts(mesh_stl)
+    outFaces = mrn.getNumpyFaces(mesh_stl.topology)
+
+    tet = tetgen.TetGen(outVerts, outFaces)
+    nodes, elems = tet.tetrahedralize(order=1, mindihedral=20, minratio=1.5)
+    tet.write('FE_segmentation_full.vtk', binary=False)
+
+    meshel = meshio.read('FE_segmentation_full.vtk')
+    meshel.write('FE_segmentation.inp')
+
+    # --- Step 2: assign elements to nucleus labels ---
+    cell_elements = {c: [] for c in range(1, nuc_max + 1)}
+
+    iter_ = (
+        progress(enumerate(elems), total=len(elems), desc='Step 21B - Assign Elements To Cells')
+        if progress else enumerate(elems)
+    )
+    for ce, x in iter_:
+        coord = np.int16(np.round(np.mean(nodes[x], 0), 0))
+        step = 0
+        taken = False
+        while not taken:
+            step += 1
+            coord[coord < step] = 1
+            for k in range(3):
+                if coord[k] >= np.shape(im_segmentation_stack['Nuclei'])[k] + 1 - step:
+                    coord[k] = np.shape(im_segmentation_stack['Nuclei'])[k] - 1
+            elemlist = im_segmentation_stack['Nuclei'][
+                coord[0] - step:coord[0] + 1 + step,
+                coord[1] - step:coord[1] + 1 + step,
+                coord[2] - step:coord[2] + 1 + step,
+            ].flatten()
+            if sum(elemlist) > 0:
+                c_el = st.mode(elemlist[elemlist != 0])
+                taken = True
+        if c_el != 0 and c_el in cell_elements:
+            cell_elements[c_el].append(ce + 1)
+
+    # --- Step 3: write element sets and finalise .inp ---
+    with open("FE_segmentation.inp", "a") as f:
+        for c in (
+            progress(range(1, nuc_max + 1), desc='Step 21C - Write Element Sets')
+            if progress else range(1, nuc_max + 1)
+        ):
+            f.write(f"*Elset, elset=cell{c}\n")
+            j = 1
+            for t in range(1, len(cell_elements[c])):
+                f.write(str(cell_elements[c][t]) + ",")
+                j += 1
+                if j > 16:
+                    f.write("\n")
+                    j = 1
+            f.write("\n")
+
+    with open("FE_segmentation.inp", "r") as f:
+        lines = f.readlines()
+
+    out_path = str(_Path(input_file).stem) + "_FEA.inp"
+    with open(out_path, "w") as f:
+        for line in (
+            progress(lines, desc='Step 21D - Write Final INP')
+            if progress else lines
+        ):
+            if line == "*NODE\n":
+                f.write("*PART, name=Part-1\n")
+            f.write(line)
+        f.write("*END PART\n")
+
