@@ -21,6 +21,8 @@ __all__ = [
     "apply_histogram_equalization_per_channel",
     "apply_median_denoise",
     "apply_per_channel_filter",
+    "apply_threshold_per_channel",
+    "assign_channel_labels",
     "assign_labels",
     "build_full_labels_dict",
     "build_labels_dict",
@@ -35,6 +37,7 @@ __all__ = [
     "detect_peaks_xy_with_best_z",
     "double_plateau_hist_equalization_nd",
     "export_channel_histograms",
+    "export_nucleus_vtk_crop",
     "export_quantification_to_excel",
     "extract_roi_from_metadata",
     "fix_image_axes_order",
@@ -59,6 +62,7 @@ __all__ = [
     "prepare_image_stack",
     "prepare_stain_settings",
     "view_original_channels",
+    "view_processing_results",
     "print_population_summary",
     "read_file_metadata",
     "remove_small_island_labels",
@@ -67,7 +71,10 @@ __all__ = [
     "save_merged_figure",
     "save_raw_png",
     "save_single_channel_png",
+    "segment_nuclei",
     "segment_nuclei_watershed",
+    "segment_cytoplasm",
+    "segment_pcm",
     "set_notebook_context",
     "shrink_to_markers",
     "shrink_to_markers_robust",
@@ -3086,3 +3093,637 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
     viewer.scale_bar.visible = True
     viewer.scale_bar.unit = 'um'
     return viewer
+
+
+def apply_threshold_per_channel(
+    image_stack,
+    stain_complete_df,
+    nuclei_diameter,
+    cell_diameter,
+    r_zxyz,
+    progress=None,
+):
+    """
+    Threshold each channel using a combined Otsu, Sauvola, and statistical
+    background approach with gain-based pixel rescue.
+
+    Parameters
+    ----------
+    image_stack : ndarray, shape (Z, Y, X, C)
+        Equalized image stack (uint8).
+    stain_complete_df : DataFrame
+        Staining metadata; index is used to distinguish 'NUCLEI' from other channels.
+    nuclei_diameter : float
+        Approximate nucleus diameter in micrometers.
+    cell_diameter : float
+        Approximate cell diameter in micrometers.
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
+        Isotropic voxel sizes in micrometers per pixel.
+    progress : callable, optional
+        Progress wrapper (e.g. step_progress).
+
+    Returns
+    -------
+    im_out : ndarray, shape (Z, Y, X, C)
+        Binary thresholded image stack (same dtype as input).
+    """
+    import SimpleITK as sitk
+    from skimage.filters import threshold_sauvola
+
+    if progress is None:
+        def progress(x, **kw): return x
+
+    r_zX, r_zY, _ = r_zxyz
+    im_out = image_stack.copy()
+    nuclei_size = int(nuclei_diameter / (np.mean([r_zX, r_zY])))
+    cell_size = int(cell_diameter / (np.mean([r_zX, r_zY])))
+
+    for c in progress(range(image_stack.shape[3]), desc='Step 09 - Threshold Channels'):
+        img = sitk.GetImageFromArray(image_stack[:, :, :, c])
+
+        # Stretch for Otsu
+        rescaler = sitk.RescaleIntensityImageFilter()
+        rescaler.SetOutputMinimum(0)
+        rescaler.SetOutputMaximum(255)
+        stretched = rescaler.Execute(img)
+
+        # Otsu thresholds (stretched and original)
+        th_filter = sitk.OtsuThresholdImageFilter()
+        th_filter.Execute(stretched)
+        th_filter.Execute(img)
+        otsu_value2 = th_filter.GetThreshold()
+
+        if stain_complete_df.index[c] == "NUCLEI":
+            window_size = 1 * nuclei_size
+        else:
+            window_size = 4 * cell_size + 1
+
+        if int(window_size) % 2 == 0:
+            window_size += 1
+
+        arr = sitk.GetArrayFromImage(img)
+
+        # Sauvola threshold map
+        sauvola_value = threshold_sauvola(arr, window_size=int(window_size))
+
+        # Global statistical background, excluding zeros
+        non_zero = arr[arr > 0]
+        if non_zero.size > 0:
+            hist, bins = np.histogram(non_zero, bins=256, range=(0, non_zero.max()))
+            mode_bin = bins[np.argmax(hist)]
+            print(mode_bin)
+            bg_mask = (arr >= mode_bin - 5) & (arr <= mode_bin + 5) & (arr > 0)
+            gain_tot = 6.0
+            gain_ass = gain_tot * (255.0 - 4.0 * mode_bin) / 255.0
+            bg_vals = arr[bg_mask]
+            if bg_vals.size < 50:
+                p10 = np.percentile(non_zero, 10)
+                bg_vals = non_zero[non_zero <= p10]
+        else:
+            bg_vals = arr
+            gain_ass = 6.0
+
+        bg_mean = bg_vals.mean()
+        bg_std = bg_vals.std() + 1e-6  # noqa: F841
+
+        bg_mean_z = arr.mean()
+        bg_std_z = arr.std() + 1e-6
+        statistical_thr = bg_mean_z + 3.0 * bg_std_z
+
+        # Clip Sauvola to avoid over-thresholding large/bright cells
+        max_sauvola = bg_mean_z + 2.0 * bg_std_z
+        sauvola_clipped = np.minimum(sauvola_value, max_sauvola)
+
+        # Combined threshold map
+        final_thr = (
+            0.60 * sauvola_clipped +
+            0.25 * statistical_thr +
+            0.15 * otsu_value2
+        )
+
+        # Gain-based primary mask and rescue
+        gain = arr / (bg_mean + 1e-6)
+        primary = (arr > final_thr) & (gain > gain_ass)
+        rescue = (gain > (gain_ass + 3.0)) & (arr > statistical_thr)
+        arrayseg = primary | rescue
+
+        if stain_complete_df.index[c] != 'NUCLEI':
+            min_size = np.ceil(0.8 * np.pi * ((nuclei_size / 2) ** 2))
+        else:
+            min_size = np.ceil(0.4 * np.pi * ((nuclei_size / 2) ** 2))
+
+        im_out[:, :, :, c] = remove_small_islands(arrayseg, min_size)
+
+    return im_out
+
+
+def segment_nuclei(
+    im_final_stack,
+    stain_df,
+    stain_complete_df,
+    nuclei_split_config,
+    r_zxyz,
+    nuclei_diameter,
+    trig_stardist=False,
+    progress=None,
+):
+    """
+    Segment nuclei from the thresholded image using watershed or StarDist.
+
+    Parameters
+    ----------
+    im_final_stack : dict
+        Must contain 'Threshold image' and 'Filtered image' arrays (Z, Y, X, C).
+    stain_df, stain_complete_df : DataFrame
+        Staining metadata.
+    nuclei_split_config : dict
+        Configuration dict returned by get_nuclei_split_config().
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
+        Isotropic voxel sizes in micrometers.
+    nuclei_diameter : float
+        Approximate nucleus diameter in micrometers.
+    trig_stardist : bool
+        If True, use StarDist; otherwise use watershed.
+    progress : callable, optional
+        Progress wrapper (e.g. step_progress).
+
+    Returns
+    -------
+    im_segmentation_stack : dict
+        Dict with key 'Nuclei' mapping to the integer label array (Z, Y, X).
+    """
+    from skimage.measure import label as skimage_label
+    from skimage import morphology
+
+    if progress is None:
+        def progress(x, **kw): return x
+
+    r_zX, r_zY, r_zZ = r_zxyz
+    im_segmentation_stack = {}
+
+    if 'NUCLEI' not in stain_df.index:
+        return im_segmentation_stack
+
+    im_in = im_final_stack['Threshold image'].copy()
+    split_cfg = dict(nuclei_split_config)
+
+    for c in progress(range(im_in.shape[3]), desc='Step 10 - Segment Nuclei'):
+        if stain_complete_df.index[c] != 'NUCLEI':
+            continue
+
+        if trig_stardist:
+            im_filt = im_final_stack['Filtered image'].copy()
+            transl = stardist3d_from_2d(
+                img_3d=im_filt[:, :, :, c],
+                nucleus_radius=nuclei_diameter / 2.0,
+                voxel_size=(r_zZ, r_zY, r_zX),
+            )
+            im_mask = transl > 0
+            im_mask = morphology.binary_erosion(
+                im_mask, footprint=np.ones((2, 2, 2))
+            ).astype(im_mask.dtype)
+            im_out, _ = skimage_label((transl * im_mask) > 0, return_num=True)
+
+        else:
+            binary_mask = im_in[:, :, :, c].astype(bool)
+            im_out, debug_info = segment_nuclei_watershed(
+                binary_mask=binary_mask,
+                r_zX=r_zX,
+                r_zY=r_zY,
+                r_zZ=r_zZ,
+                nuclei_diameter=nuclei_diameter,
+                **split_cfg,
+            )
+
+            erosion_triplets = debug_info['erosion_triplets']
+            er_z = [e[0] for e in erosion_triplets] if erosion_triplets else [1]
+            er_y = [e[1] for e in erosion_triplets] if erosion_triplets else [1]
+            er_x = [e[2] for e in erosion_triplets] if erosion_triplets else [1]
+
+            print(
+                f"Nuclei found: {int(im_out.max())} "
+                f"(shrink_factor={split_cfg['nuclei_bridge_shrink_factor']}, "
+                f"diameter_range=[{debug_info['dmin']:.2f},{debug_info['dmax']:.2f}]x, "
+                f"scales={debug_info['n_scales']}, "
+                f"scales_with_seeds={debug_info['scales_with_seeds']}, "
+                f"peak_seeds={debug_info['added_peak_seed_count']}, "
+                f"z_anisotropy={debug_info['z_anisotropy']:.2f}, "
+                f"z_weight={debug_info['z_split_weight']:.2f}, "
+                f"erosion Z={min(er_z)}-{max(er_z)} "
+                f"Y={min(er_y)}-{max(er_y)} "
+                f"X={min(er_x)}-{max(er_x)} vox, "
+                f"min_seed_vox={debug_info['min_seed_vox']} (boundary=3), "
+                f"boundary_components={len(debug_info['boundary_components'])}, "
+                f"added_component_seeds={debug_info['added_seed_count']}, "
+                f"restored_isolated_voxels={debug_info['restored_isolated_count']}, "
+                f"removed_by_roundness={debug_info['removed_by_roundness']})"
+            )
+
+        im_segmentation_stack['Nuclei'] = im_out
+
+    return im_segmentation_stack
+
+
+def segment_cytoplasm(
+    im_final_stack,
+    im_segmentation_stack,
+    stain_df,
+    stain_complete_df,
+    cyto_markers,
+    cyto_factor,
+    nuclei_diameter,
+    r_zxyz,
+    progress=None,
+):
+    """
+    Segment cytoplasm from the thresholded image.
+
+    If a CYTOPLASM channel is present it is segmented with watershed.
+    Otherwise cytoplasm is grown from nuclei labels using cyto_markers (if any)
+    or a simple label-grow.
+
+    Parameters
+    ----------
+    im_final_stack : dict
+        Must contain 'Threshold image'.
+    im_segmentation_stack : dict
+        Must contain 'Nuclei'.
+    stain_df, stain_complete_df : DataFrame
+        Staining metadata.
+    cyto_markers : list of str
+        Marker labels that contribute to cytoplasm expansion.
+    cyto_factor : float
+        Growth factor for label expansion when no explicit CYTOPLASM channel.
+    nuclei_diameter : float
+        Approximate nucleus diameter in micrometers.
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
+        Isotropic voxel sizes.
+    progress : callable, optional
+        Progress wrapper.
+
+    Returns
+    -------
+    im_segmentation_stack : dict
+        Updated dict with 'Cytoplasm' key added.
+    stain_complete_df : DataFrame
+        Updated dataframe (CYTOPLASM row added if it was absent).
+    """
+    from skimage.measure import label as skimage_label
+
+    if progress is None:
+        def progress(x, **kw): return x
+
+    r_zX, r_zY, r_zZ = r_zxyz
+
+    if 'Nuclei' not in im_segmentation_stack:
+        raise RuntimeError(
+            "Run nuclei segmentation first so im_segmentation_stack contains 'Nuclei'."
+        )
+
+    if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index) or len(cyto_markers) > 0):
+        return im_segmentation_stack, stain_complete_df
+
+    im_in = im_final_stack['Threshold image'].copy()
+    im_out = np.zeros_like(im_in[:, :, :, 0], dtype=np.int32)
+
+    for c in progress(range(im_in.shape[3]), desc='Step 11A - Segment Cytoplasm'):
+        if stain_df.index[c] == 'CYTOPLASM':
+            from scipy import ndimage as _ndi
+            distance = _ndi.distance_transform_edt(
+                im_in[:, :, :, c], sampling=[r_zZ, r_zY, r_zX]
+            )
+            radius_X = int((nuclei_diameter / 2.0) / r_zX)
+            radius_Y = int((nuclei_diameter / 2.0) / r_zY)
+            radius_Z = int((nuclei_diameter / 2.0) / r_zZ)
+            coords = peak_local_max(
+                distance,
+                footprint=make_anisotropic_footprint(radius_Z, radius_Y, radius_X),
+                labels=im_in[:, :, :, c].astype(np.int32),
+            )
+            mask = np.zeros(distance.shape, dtype=bool)
+            mask[tuple(coords.T)] = True
+            _, _ = skimage_label(mask, return_num=True)
+            im_out = watershed(-distance, im_segmentation_stack['Nuclei'], mask=im_in[:, :, :, c])
+
+    if 'CYTOPLASM' not in stain_df.index:
+        if len(cyto_markers) == 0:
+            im_out = grow_labels(im_segmentation_stack['Nuclei'], cyto_factor)
+        else:
+            im_out = im_segmentation_stack['Nuclei'] > 0
+            for c in progress(range(im_in.shape[3]), desc='Step 11B - Apply Cyto Markers'):
+                idx = stain_complete_df.index[c]
+                marker = stain_complete_df.loc[idx, 'Marker']
+                if marker in cyto_markers:
+                    im_out = im_out + im_in[:, :, :, c]
+            binary_mask = (im_out > 0).copy()
+            im_out = grow_markers_within_islands_limited(
+                im_segmentation_stack['Nuclei'], binary_mask, max_distance=10.0
+            )
+        stain_complete_df = stain_complete_df.copy()
+        stain_complete_df.loc['CYTOPLASM'] = ['', '', '', '', '', '']
+
+    im_segmentation_stack = dict(im_segmentation_stack)
+    im_segmentation_stack['Cytoplasm'] = im_out.copy()
+    return im_segmentation_stack, stain_complete_df
+
+
+def segment_pcm(
+    im_segmentation_stack,
+    stain_df,
+    cyto_markers,
+    cyto_factor,
+    PCM_factor,
+):
+    """
+    Build the pericellular matrix (PCM) label volume by expanding cytoplasm
+    or nuclei labels and subtracting the cytoplasm.
+
+    Parameters
+    ----------
+    im_segmentation_stack : dict
+        Must contain 'Nuclei' and 'Cytoplasm'.
+    stain_df : DataFrame
+        Staining metadata.
+    cyto_markers : list of str
+        Marker labels used for cytoplasm expansion.
+    cyto_factor : float
+        Growth factor used for cytoplasm.
+    PCM_factor : float
+        Total growth factor for PCM (relative to nuclei).
+
+    Returns
+    -------
+    im_segmentation_stack : dict
+        Updated dict with 'PCM' key added.
+    """
+    if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index)):
+        return im_segmentation_stack
+
+    if len(cyto_markers) == 0:
+        im_out = grow_labels(im_segmentation_stack['Nuclei'], PCM_factor)
+    else:
+        P_factor = int(PCM_factor - cyto_factor)
+        im_out = grow_labels(im_segmentation_stack['Cytoplasm'], P_factor)
+
+    im_out = im_out - im_segmentation_stack['Cytoplasm']
+
+    im_segmentation_stack = dict(im_segmentation_stack)
+    im_segmentation_stack['PCM'] = im_out.copy()
+    return im_segmentation_stack
+
+
+def assign_channel_labels(
+    im_final_stack,
+    im_segmentation_stack,
+    stain_df,
+    progress=None,
+):
+    """
+    Multiply each non-nuclear/non-cytoplasm threshold channel by the combined
+    cytoplasm+PCM mask to assign cell labels to marker channels.
+
+    Parameters
+    ----------
+    im_final_stack : dict
+        Must contain 'Threshold image'.
+    im_segmentation_stack : dict
+        Must contain 'Cytoplasm' and 'PCM'.
+    stain_df : DataFrame
+        Staining metadata (original, without CYTOPLASM row).
+    progress : callable, optional
+        Progress wrapper.
+
+    Returns
+    -------
+    im_segmentation_stack : dict
+        Updated dict with per-marker keys added.
+    """
+    if progress is None:
+        def progress(x, **kw): return x
+
+    if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index)):
+        return im_segmentation_stack
+
+    im_in = im_final_stack['Threshold image'].copy()
+    im_segmentation_stack = dict(im_segmentation_stack)
+
+    for c in progress(range(im_in.shape[3]), desc='Step 12 - Assign Labels To Channels'):
+        cond = stain_df.index[c]
+        if cond in ('NUCLEI', 'CYTOPLASM', 'PCM'):
+            continue
+        cyto_pcm = im_segmentation_stack['Cytoplasm'] + im_segmentation_stack['PCM']
+        im_segmentation_stack[cond] = im_in[:, :, :, c] * cyto_pcm
+        im_segmentation_stack[cond + '_cyto'] = im_in[:, :, :, c] * im_segmentation_stack['Cytoplasm']
+        im_segmentation_stack[cond + '_PCM'] = im_in[:, :, :, c] * im_segmentation_stack['PCM']
+
+    return im_segmentation_stack
+
+
+def view_processing_results(
+    im_final_stack,
+    im_segmentation_stack,
+    stain_df,
+    stain_complete_df,
+    r_xyz,
+    r_zxyz,
+    napari_module,
+    progress=None,
+):
+    """
+    Open two napari viewers showing processing pipeline layers and segmentation results.
+
+    Viewer 0 shows per-channel images at each pipeline stage (original, zoomed,
+    denoised, corrected, filtered, equalized).
+    Viewer 1 (only when NUCLEI or CYTOPLASM is present) shows label overlays for
+    nuclei, cytoplasm, PCM, and marker channels.
+
+    Parameters
+    ----------
+    im_final_stack : dict
+        Processing stage arrays (Z, Y, X, C).
+    im_segmentation_stack : dict
+        Segmentation label arrays.
+    stain_df : DataFrame
+        Original staining metadata.
+    stain_complete_df : DataFrame
+        Extended staining metadata (may include CYTOPLASM row).
+    r_xyz : tuple of float (r_X, r_Y, r_Z)
+        Original voxel sizes in micrometers.
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
+        Isotropic voxel sizes in micrometers.
+    napari_module : module
+        The napari module (pass `napari`).
+    progress : callable, optional
+        Progress wrapper.
+
+    Returns
+    -------
+    viewer_0 : napari.Viewer
+        Channel pipeline viewer.
+    viewer_1 : napari.Viewer or None
+        Segmentation viewer (None if no NUCLEI/CYTOPLASM channel).
+    """
+    if progress is None:
+        def progress(x, **kw): return x
+
+    r_X, r_Y, r_Z = r_xyz
+    r_zX, r_zY, r_zZ = r_zxyz
+    scale_zoom = (r_zZ, r_zY, r_zX)
+    im_thr = im_final_stack['Threshold image']
+
+    viewer_0 = napari_module.Viewer(title="Post-processing Channels")
+    for c in progress(range(im_thr.shape[3]), desc='Step 13A - Add Layers To Viewer 0'):
+        idx = stain_complete_df.index[c]
+        marker = stain_complete_df.loc[idx, 'Marker']
+        color = stain_complete_df['Color'].iloc[c]
+        viewer_0.add_image(
+            im_final_stack['Original image'][:, :, :, c],
+            name=f'ORIGINAL {idx} ({marker})', colormap=color,
+            blending='additive', scale=[r_Z, r_Y, r_X],
+        )
+        viewer_0.add_image(
+            im_final_stack['Zoomed image'][:, :, :, c],
+            name=f'ZOOMED {idx} ({marker})', colormap=color,
+            blending='additive', scale=scale_zoom,
+        )
+        viewer_0.add_image(
+            im_final_stack['Denoised image'][:, :, :, c],
+            name=f'DENOISED {idx} ({marker})', colormap=color,
+            blending='additive', scale=scale_zoom,
+        )
+        viewer_0.add_image(
+            im_final_stack['Adjusted image'][:, :, :, c],
+            name=f'CORRECTED {idx} ({marker})', colormap=color,
+            blending='additive', scale=scale_zoom,
+        )
+        viewer_0.add_image(
+            im_final_stack['Filtered image'][:, :, :, c],
+            name=f'FILTERED {idx} ({marker})', colormap=color,
+            blending='additive', scale=scale_zoom,
+        )
+        viewer_0.add_image(
+            im_final_stack['Equalized image'][:, :, :, c],
+            name=f'EQ {idx} ({marker})', colormap=color,
+            blending='additive', scale=scale_zoom,
+        )
+    viewer_0.scale_bar.visible = True
+    viewer_0.scale_bar.unit = 'um'
+
+    viewer_1 = None
+    if ('NUCLEI' in stain_complete_df.index) or ('CYTOPLASM' in stain_complete_df.index):
+        viewer_1 = napari_module.Viewer(title="Segmentation and labeling stacks")
+        for c in progress(range(len(stain_complete_df.index)), desc='Step 13B - Add Labels To Viewer 1'):
+            idx = stain_complete_df.index[c]
+            marker = stain_complete_df.loc[idx, 'Marker']
+            if idx == 'NUCLEI':
+                viewer_1.add_labels(
+                    im_segmentation_stack['Nuclei'].astype(np.int32),
+                    name=f'{idx} ({marker})', blending='additive', scale=scale_zoom,
+                )
+            elif idx == 'CYTOPLASM':
+                viewer_1.add_labels(
+                    im_segmentation_stack['Cytoplasm'].astype(np.int32),
+                    name=f'{idx} ({marker})', blending='additive', scale=scale_zoom,
+                )
+                viewer_1.add_labels(
+                    im_segmentation_stack['PCM'].astype(np.int32),
+                    name='PCM', blending='additive', scale=scale_zoom,
+                )
+            elif idx not in ('PCM',):
+                viewer_1.add_labels(
+                    im_segmentation_stack[stain_df.index[c]].astype(np.int32),
+                    name=f'{idx} ({marker})', blending='additive', scale=scale_zoom,
+                )
+        viewer_1.scale_bar.visible = True
+        viewer_1.scale_bar.unit = 'um'
+
+    return viewer_0, viewer_1
+
+
+def export_nucleus_vtk_crop(
+    nuc_label,
+    im_segmentation_stack,
+    im_final_stack,
+    stain_df,
+    input_file,
+    size=90,
+):
+    """
+    Save a cubic sub-volume centred on a single nucleus as a VTK file.
+
+    Each voxel stores the nuclei label, the cytoplasm label, and the equalized
+    intensity for every non-NUCLEI channel.
+
+    Parameters
+    ----------
+    nuc_label : int
+        Nucleus label ID to export.
+    im_segmentation_stack : dict
+        Must contain 'Nuclei' and 'Cytoplasm'.
+    im_final_stack : dict
+        Must contain 'Equalized image'.
+    stain_df : DataFrame
+        Original staining metadata.
+    input_file : str or Path
+        Path to the source image file (used to derive output filename).
+    size : int
+        Side length of the cubic export volume in voxels (default 90).
+    """
+    import pyvista as pv
+    from pathlib import Path as _Path
+
+    nuc_vol = im_segmentation_stack['Nuclei']
+    mask = nuc_vol == nuc_label
+    if not np.any(mask):
+        raise ValueError(f"Nucleus {nuc_label} not found in im_segmentation_stack['Nuclei'].")
+    if 'Cytoplasm' not in im_segmentation_stack:
+        raise ValueError("im_segmentation_stack['Cytoplasm'] is missing. Run cytoplasm segmentation first.")
+
+    cyto_vol = im_segmentation_stack['Cytoplasm']
+    coords = np.argwhere(mask)
+    cz, cy, cx = np.round(coords.mean(axis=0)).astype(int)
+    print(f"Nucleus {nuc_label} - centroid  Z={cz}  Y={cy}  X={cx}")
+
+    half = size // 2
+    Zmax, Ymax, Xmax = nuc_vol.shape
+    z0d, z1d = cz - half, cz + half
+    y0d, y1d = cy - half, cy + half
+    x0d, x1d = cx - half, cx + half
+
+    z0c, z1c = max(0, z0d), min(Zmax, z1d)
+    y0c, y1c = max(0, y0d), min(Ymax, y1d)
+    x0c, x1c = max(0, x0d), min(Xmax, x1d)
+
+    zp0, zp1 = z0c - z0d, z0c - z0d + (z1c - z0c)
+    yp0, yp1 = y0c - y0d, y0c - y0d + (y1c - y0c)
+    xp0, xp1 = x0c - x0d, x0c - x0d + (x1c - x0c)
+
+    def _crop3d(vol):
+        out = np.zeros((size, size, size), dtype=vol.dtype)
+        out[zp0:zp1, yp0:yp1, xp0:xp1] = vol[z0c:z1c, y0c:y1c, x0c:x1c]
+        return out
+
+    nuclei_crop = _crop3d(nuc_vol).astype(np.int32)
+    cytoplasm_crop = _crop3d(cyto_vol).astype(np.int32)
+
+    eq_img = im_final_stack['Equalized image']
+    marker_crops = {}
+    for c_idx in range(eq_img.shape[3]):
+        cond = stain_df.index[c_idx]
+        if cond != 'NUCLEI':
+            marker = stain_df['Marker'].iloc[c_idx]
+            ch_name = f"{cond}_{marker}".replace(" ", "_").replace("-", "_")
+            marker_crops[ch_name] = _crop3d(eq_img[:, :, :, c_idx]).astype(np.float32)
+
+    grid = pv.ImageData()
+    grid.dimensions = (size, size, size)
+    grid.origin = (float(x0d), float(y0d), float(z0d))
+    grid.spacing = (1.0, 1.0, 1.0)
+    grid.point_data['Nuclei_label'] = nuclei_crop.ravel()
+    grid.point_data['Cytoplasm_label'] = cytoplasm_crop.ravel()
+    for ch_name, crop in marker_crops.items():
+        grid.point_data[ch_name] = crop.ravel()
+
+    out_path = str(_Path(input_file).stem + f"_nuc{nuc_label}_3Dcrop.vtk")
+    grid.save(out_path)
+    print(f"Saved: {out_path}  ({size}^3 voxels, {2 + len(marker_crops)} channels)")
