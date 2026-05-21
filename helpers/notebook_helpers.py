@@ -3575,40 +3575,24 @@ def view_processing_results(
     im_thr = im_final_stack['Threshold image']
 
     viewer_0 = napari_module.Viewer(title="Post-processing Channels")
-    for c in progress(range(im_thr.shape[3]), desc='Step 13A - Add Layers To Viewer 0'):
-        idx = stain_complete_df.index[c]
-        marker = stain_complete_df.loc[idx, 'Marker']
-        color = stain_complete_df['Color'].iloc[c]
-        viewer_0.add_image(
-            im_final_stack['Original image'][:, :, :, c],
-            name=f'ORIGINAL {idx} ({marker})', colormap=color,
-            blending='additive', scale=[r_Z, r_Y, r_X],
-        )
-        viewer_0.add_image(
-            im_final_stack['Zoomed image'][:, :, :, c],
-            name=f'ZOOMED {idx} ({marker})', colormap=color,
-            blending='additive', scale=scale_zoom,
-        )
-        viewer_0.add_image(
-            im_final_stack['Denoised image'][:, :, :, c],
-            name=f'DENOISED {idx} ({marker})', colormap=color,
-            blending='additive', scale=scale_zoom,
-        )
-        viewer_0.add_image(
-            im_final_stack['Adjusted image'][:, :, :, c],
-            name=f'CORRECTED {idx} ({marker})', colormap=color,
-            blending='additive', scale=scale_zoom,
-        )
-        viewer_0.add_image(
-            im_final_stack['Filtered image'][:, :, :, c],
-            name=f'FILTERED {idx} ({marker})', colormap=color,
-            blending='additive', scale=scale_zoom,
-        )
-        viewer_0.add_image(
-            im_final_stack['Equalized image'][:, :, :, c],
-            name=f'EQ {idx} ({marker})', colormap=color,
-            blending='additive', scale=scale_zoom,
-        )
+    stages = [
+        ('Original image',  'ORIGINAL',  [r_Z, r_Y, r_X]),
+        ('Zoomed image',    'ZOOMED',    scale_zoom),
+        ('Denoised image',  'DENOISED',  scale_zoom),
+        ('Adjusted image',  'CORRECTED', scale_zoom),
+        ('Filtered image',  'FILTERED',  scale_zoom),
+        ('Equalized image', 'EQ',        scale_zoom),
+    ]
+    for stage_key, stage_prefix, scale in progress(stages, desc='Step 13A - Add Layers To Viewer 0'):
+        for c in range(im_thr.shape[3]):
+            idx = stain_complete_df.index[c]
+            marker = stain_complete_df.loc[idx, 'Marker']
+            color = stain_complete_df['Color'].iloc[c]
+            viewer_0.add_image(
+                im_final_stack[stage_key][:, :, :, c],
+                name=f'{stage_prefix} {idx} ({marker})', colormap=color,
+                blending='additive', scale=scale,
+            )
     viewer_0.scale_bar.visible = True
     viewer_0.scale_bar.unit = 'um'
 
