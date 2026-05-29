@@ -1476,11 +1476,13 @@ def export_channel_histograms(
     _sub_cols = ['Count', 'Percentage', 'Cum. Count', 'Cum. %']
     n_sub = len(_sub_cols)  # 4 columns per channel
 
-    # Keep only stages that contain 4-D image arrays
+    _skip_stages = {'Original image', 'Threshold image'}
+
+    # Keep only stages that contain 4-D image arrays, excluding non-informative stages
     stages = [
         (name, arr)
         for name, arr in im_final_stack.items()
-        if isinstance(arr, np.ndarray) and arr.ndim == 4
+        if isinstance(arr, np.ndarray) and arr.ndim == 4 and name not in _skip_stages
     ]
 
     n_channels = stain_complete_df.shape[0]
