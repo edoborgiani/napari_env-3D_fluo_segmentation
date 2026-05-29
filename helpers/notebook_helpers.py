@@ -1420,10 +1420,12 @@ def export_channel_histograms(
     Export per-channel intensity histograms for every processing stage in
     im_final_stack to a single Excel workbook.
 
-    One sheet is written per (stage, channel) combination, named
-    '{stage_abbrev} {marker}' (truncated to 31 characters).  A final
-    'Parameters' sheet records the stain settings and any supplied image
-    processing parameters for full reproducibility.
+    One sheet is written per stage (named by the stage abbreviation).  Each
+    sheet contains a 'Pixel_Value' column followed by four columns per channel
+    (Count, Percentage, Cumulative Count, Cumulative %) grouped under a merged,
+    colour-coded title cell matching the acquisition colour of that marker.
+    White channels are displayed as light grey.  A final 'Parameters' sheet
+    records the stain settings and any supplied image processing parameters.
 
     Parameters
     ----------
@@ -1431,7 +1433,8 @@ def export_channel_histograms(
         Ordered dict mapping stage names (e.g. 'Adjusted image') to
         (Z, Y, X, C) ndarray image stacks.
     stain_complete_df : DataFrame
-        Staining metadata; provides per-channel marker names and settings.
+        Staining metadata; provides per-channel marker names, colors, and
+        contrast/gamma settings.
     output_path : str or Path
         Destination Excel file path.
     processing_params : dict, optional
@@ -1455,6 +1458,24 @@ def export_channel_histograms(
         'Threshold image':  'Thresh',
     }
 
+    # Pastel background colours for channel title rows (napari colour names → hex)
+    _channel_bg = {
+        'BLUE':    '#BDD7EE',
+        'GREEN':   '#C6EFCE',
+        'RED':     '#FFC7CE',
+        'CYAN':    '#CCFFFF',
+        'MAGENTA': '#FFB3FF',
+        'YELLOW':  '#FFFF99',
+        'WHITE':   '#D9D9D9',
+        'GREY':    '#D9D9D9',
+        'GRAY':    '#D9D9D9',
+        'ORANGE':  '#FFD966',
+    }
+    _default_bg = '#F2F2F2'
+
+    _sub_cols = ['Count', 'Percentage', 'Cum. Count', 'Cum. %']
+    n_sub = len(_sub_cols)  # 4 columns per channel
+
     # Keep only stages that contain 4-D image arrays
     stages = [
         (name, arr)
@@ -1462,46 +1483,80 @@ def export_channel_histograms(
         if isinstance(arr, np.ndarray) and arr.ndim == 4
     ]
 
-    # Flat list of (stage_name, array, channel_index) for progress tracking
-    work_items = [
-        (stage_name, arr, c)
-        for stage_name, arr in stages
-        for c in range(arr.shape[3])
-    ]
+    n_channels = stain_complete_df.shape[0]
 
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        for stage_name, arr, channel_index in _progress_iter(
-            work_items, progress, desc="Export Histograms"
-        ):
-            im3d = arr[:, :, :, channel_index].copy()
-            values, counts = np.unique(im3d.astype(int), return_counts=True)
-            hist = np.zeros(256, dtype=int)
-            valid = (values >= 0) & (values <= 255)
-            hist[values[valid]] = counts[valid]
+        workbook = writer.book
 
-            total = hist.sum()
-            percentage = (hist / total) * 100 if total > 0 else np.zeros_like(hist, dtype=float)
-            cumulative = np.cumsum(hist)
-            cumulative_percentage = np.cumsum(percentage)
+        # Common formats (created once, shared across all sheets)
+        _hdr = {'bold': True, 'border': 1, 'align': 'center', 'valign': 'vcenter'}
+        pv_fmt  = workbook.add_format({**_hdr, 'bg_color': '#D9E1F2'})
+        sub_fmt = workbook.add_format({**_hdr, 'bg_color': '#EBF0F9', 'text_wrap': True, 'font_size': 9})
+        num_fmt = workbook.add_format({'num_format': '0.00'})
+        int_fmt = workbook.add_format({})
 
-            df = pd.DataFrame({
-                "Pixel_Value":           np.arange(256),
-                "Count":                 hist,
-                "Percentage":            percentage,
-                "Cumulative_Count":      cumulative,
-                "Cumulative_Percentage": cumulative_percentage,
-            })
-
-            condition = stain_complete_df.index[channel_index]
-            marker = stain_complete_df.loc[condition, "Marker"]
+        for stage_name, arr in _progress_iter(stages, progress, desc="Export Histograms"):
             abbrev = _stage_abbrev.get(stage_name, stage_name.split()[0][:8])
-            sheet_name = f"{abbrev} {marker}"[:31]
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            ws = workbook.add_worksheet(abbrev[:31])
+
+            TITLE_ROW = 0
+            HDR_ROW   = 1
+            DATA_ROW  = 2
+
+            # Pixel_Value header: merges across both header rows for a clean look
+            ws.merge_range(TITLE_ROW, 0, HDR_ROW, 0, 'Pixel_Value', pv_fmt)
+            ws.set_column(0, 0, 11)
+
+            for c in range(n_channels):
+                condition = stain_complete_df.index[c]
+                marker    = stain_complete_df.loc[condition, 'Marker']
+                color_key = str(stain_complete_df.loc[condition, 'Color']).upper()
+                bg = _channel_bg.get(color_key, _default_bg)
+
+                # Per-channel title format using the channel's pastel colour
+                ch_fmt = workbook.add_format({**_hdr, 'bg_color': bg, 'font_size': 11})
+
+                col_start = 1 + c * n_sub
+                col_end   = col_start + n_sub - 1
+
+                # Coloured merged title spanning the 4 sub-columns
+                ws.merge_range(TITLE_ROW, col_start, TITLE_ROW, col_end, marker, ch_fmt)
+
+                # Sub-column headers
+                for j, sub in enumerate(_sub_cols):
+                    ws.write(HDR_ROW, col_start + j, sub, sub_fmt)
+
+                # Histogram data for this channel
+                im3d = arr[:, :, :, c].copy()
+                values, counts = np.unique(im3d.astype(int), return_counts=True)
+                hist = np.zeros(256, dtype=int)
+                valid = (values >= 0) & (values <= 255)
+                hist[values[valid]] = counts[valid]
+
+                total = hist.sum()
+                pct   = (hist / total * 100) if total > 0 else np.zeros(256)
+                cum_c = np.cumsum(hist)
+                cum_p = np.cumsum(pct)
+
+                for pv in range(256):
+                    ws.write_number(DATA_ROW + pv, col_start,     int(hist[pv]),    int_fmt)
+                    ws.write_number(DATA_ROW + pv, col_start + 1, float(pct[pv]),   num_fmt)
+                    ws.write_number(DATA_ROW + pv, col_start + 2, int(cum_c[pv]),   int_fmt)
+                    ws.write_number(DATA_ROW + pv, col_start + 3, float(cum_p[pv]), num_fmt)
+
+                ws.set_column(col_start, col_end, 13)
+
+            # Pixel_Value data column (0–255)
+            for pv in range(256):
+                ws.write_number(DATA_ROW + pv, 0, pv, int_fmt)
+
+            ws.freeze_panes(DATA_ROW, 0)
+            ws.set_row(TITLE_ROW, 18)
+            ws.set_row(HDR_ROW, 30)
 
         # --- Parameters sheet ---
-        workbook = writer.book
-        params_ws = workbook.add_worksheet('Parameters')
-        bold = workbook.add_format({'bold': True})
+        params_ws  = workbook.add_worksheet('Parameters')
+        bold       = workbook.add_format({'bold': True})
         header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1})
 
         row = 0
