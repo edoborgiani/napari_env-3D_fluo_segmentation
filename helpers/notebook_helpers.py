@@ -1409,33 +1409,131 @@ def prepare_stain_settings(
     return stain_df, stain_complete_df, original_stain_complete_df
 
 
-def export_channel_histograms(im_in, stain_complete_df, output_path, progress=None):
-    """Export one histogram sheet per channel to Excel."""
+def export_channel_histograms(
+    im_final_stack,
+    stain_complete_df,
+    output_path,
+    processing_params=None,
+    progress=None,
+):
+    """
+    Export per-channel intensity histograms for every processing stage in
+    im_final_stack to a single Excel workbook.
+
+    One sheet is written per (stage, channel) combination, named
+    '{stage_abbrev} {marker}' (truncated to 31 characters).  A final
+    'Parameters' sheet records the stain settings and any supplied image
+    processing parameters for full reproducibility.
+
+    Parameters
+    ----------
+    im_final_stack : dict
+        Ordered dict mapping stage names (e.g. 'Adjusted image') to
+        (Z, Y, X, C) ndarray image stacks.
+    stain_complete_df : DataFrame
+        Staining metadata; provides per-channel marker names and settings.
+    output_path : str or Path
+        Destination Excel file path.
+    processing_params : dict, optional
+        Key-value pairs of image processing parameters to record on the
+        Parameters sheet (e.g. {'sigma': 0.5, 'threshold_method': 'otsu'}).
+    progress : callable, optional
+        Progress wrapper (e.g. step_progress).
+
+    Returns
+    -------
+    output_path : str or Path
+    """
+    _stage_abbrev = {
+        'Original image':   'Orig',
+        'Normalized image': 'Norm',
+        'Zoomed image':     'Zoom',
+        'Denoised image':   'Denoise',
+        'Adjusted image':   'Adj',
+        'Filtered image':   'Filt',
+        'Equalized image':  'Eq',
+        'Threshold image':  'Thresh',
+    }
+
+    # Keep only stages that contain 4-D image arrays
+    stages = [
+        (name, arr)
+        for name, arr in im_final_stack.items()
+        if isinstance(arr, np.ndarray) and arr.ndim == 4
+    ]
+
+    # Flat list of (stage_name, array, channel_index) for progress tracking
+    work_items = [
+        (stage_name, arr, c)
+        for stage_name, arr in stages
+        for c in range(arr.shape[3])
+    ]
+
     with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        for channel_index in _progress_iter(range(im_in.shape[3]), progress, desc="Step 08 - Export Histograms"):
-            im3d = im_in[:, :, :, channel_index].copy()
+        for stage_name, arr, channel_index in _progress_iter(
+            work_items, progress, desc="Export Histograms"
+        ):
+            im3d = arr[:, :, :, channel_index].copy()
             values, counts = np.unique(im3d.astype(int), return_counts=True)
             hist = np.zeros(256, dtype=int)
-            hist[values] = counts
+            valid = (values >= 0) & (values <= 255)
+            hist[values[valid]] = counts[valid]
 
             total = hist.sum()
             percentage = (hist / total) * 100 if total > 0 else np.zeros_like(hist, dtype=float)
             cumulative = np.cumsum(hist)
             cumulative_percentage = np.cumsum(percentage)
 
-            df = pd.DataFrame(
-                {
-                    "Pixel_Value": np.arange(256),
-                    "Count": hist,
-                    "Percentage": percentage,
-                    "Cumulative_Count": cumulative,
-                    "Cumulative_Percentage": cumulative_percentage,
-                }
-            )
+            df = pd.DataFrame({
+                "Pixel_Value":           np.arange(256),
+                "Count":                 hist,
+                "Percentage":            percentage,
+                "Cumulative_Count":      cumulative,
+                "Cumulative_Percentage": cumulative_percentage,
+            })
 
             condition = stain_complete_df.index[channel_index]
             marker = stain_complete_df.loc[condition, "Marker"]
-            df.to_excel(writer, sheet_name=str(marker)[:31], index=False)
+            abbrev = _stage_abbrev.get(stage_name, stage_name.split()[0][:8])
+            sheet_name = f"{abbrev} {marker}"[:31]
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # --- Parameters sheet ---
+        workbook = writer.book
+        params_ws = workbook.add_worksheet('Parameters')
+        bold = workbook.add_format({'bold': True})
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2', 'border': 1})
+
+        row = 0
+
+        # Section 1: Stain settings
+        params_ws.write(row, 0, 'STAIN SETTINGS', bold)
+        row += 1
+        stain_reset = stain_complete_df.reset_index()
+        for col_idx, col_name in enumerate(stain_reset.columns):
+            params_ws.write(row, col_idx, str(col_name), header_fmt)
+        row += 1
+        for _, df_row in stain_reset.iterrows():
+            for col_idx, val in enumerate(df_row):
+                params_ws.write(row, col_idx, str(val))
+            row += 1
+
+        row += 1  # blank separator
+
+        # Section 2: Image processing parameters
+        params_ws.write(row, 0, 'IMAGE PROCESSING PARAMETERS', bold)
+        row += 1
+        params_ws.write(row, 0, 'Parameter', header_fmt)
+        params_ws.write(row, 1, 'Value', header_fmt)
+        row += 1
+        if processing_params:
+            for k, v in processing_params.items():
+                params_ws.write(row, 0, str(k))
+                params_ws.write(row, 1, str(v))
+                row += 1
+
+        params_ws.set_column(0, 0, 35)
+        params_ws.set_column(1, 10, 20)
 
     return output_path
 
@@ -3104,10 +3202,11 @@ def apply_threshold_per_channel(
     nuclei_diameter,
     cell_diameter,
     r_zxyz,
+    threshold_method='otsu',
     progress=None,
 ):
     """
-    Threshold each channel using a combined Otsu, Sauvola, and statistical
+    Threshold each channel using a combined global, Sauvola, and statistical
     background approach with gain-based pixel rescue.
 
     Parameters
@@ -3122,6 +3221,10 @@ def apply_threshold_per_channel(
         Approximate cell diameter in micrometers.
     r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
         Isotropic voxel sizes in micrometers per pixel.
+    threshold_method : str, optional
+        Global threshold algorithm used as one component of the combined threshold.
+        One of 'otsu' (default), 'median', or 'huang'. The Sauvola local threshold
+        and statistical background component are always applied regardless of this choice.
     progress : callable, optional
         Progress wrapper (e.g. step_progress).
 
@@ -3132,6 +3235,10 @@ def apply_threshold_per_channel(
     """
     import SimpleITK as sitk
     from skimage.filters import threshold_sauvola
+
+    _valid_methods = ('otsu', 'median', 'huang')
+    if threshold_method not in _valid_methods:
+        raise ValueError(f"threshold_method must be one of {_valid_methods}, got '{threshold_method}'")
 
     if progress is None:
         def progress(x, **kw): return x
@@ -3144,17 +3251,26 @@ def apply_threshold_per_channel(
     for c in progress(range(image_stack.shape[3]), desc='Step 09 - Threshold Channels'):
         img = sitk.GetImageFromArray(image_stack[:, :, :, c])
 
-        # Stretch for Otsu
+        # Compute global threshold value based on chosen method
         rescaler = sitk.RescaleIntensityImageFilter()
         rescaler.SetOutputMinimum(0)
         rescaler.SetOutputMaximum(255)
         stretched = rescaler.Execute(img)
 
-        # Otsu thresholds (stretched and original)
-        th_filter = sitk.OtsuThresholdImageFilter()
-        th_filter.Execute(stretched)
-        th_filter.Execute(img)
-        otsu_value2 = th_filter.GetThreshold()
+        if threshold_method == 'otsu':
+            th_filter = sitk.OtsuThresholdImageFilter()
+            th_filter.Execute(stretched)
+            th_filter.Execute(img)
+            global_thr_value = th_filter.GetThreshold()
+        elif threshold_method == 'median':
+            arr_tmp = sitk.GetArrayFromImage(img)
+            non_zero_tmp = arr_tmp[arr_tmp > 0]
+            global_thr_value = float(np.median(non_zero_tmp)) if non_zero_tmp.size > 0 else 0.0
+        elif threshold_method == 'huang':
+            th_filter = sitk.HuangThresholdImageFilter()
+            th_filter.Execute(stretched)
+            th_filter.Execute(img)
+            global_thr_value = th_filter.GetThreshold()
 
         if stain_complete_df.index[c] == "NUCLEI":
             window_size = 1 * nuclei_size
@@ -3201,7 +3317,7 @@ def apply_threshold_per_channel(
         final_thr = (
             0.60 * sauvola_clipped +
             0.25 * statistical_thr +
-            0.15 * otsu_value2
+            0.15 * global_thr_value
         )
 
         # Gain-based primary mask and rescue
