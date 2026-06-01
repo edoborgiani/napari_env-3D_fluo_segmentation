@@ -2222,8 +2222,9 @@ def get_stain_name(stain_df, key):
 def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
     """Create the nuclei report PDF using notebook context previously registered."""
     from matplotlib.lines import Line2D
+    from reportlab.lib import colors as rl_colors
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
     from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     from scipy.stats import gaussian_kde
@@ -2236,8 +2237,15 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
     x_grid = _context("x_grid")
     styles = globals().get("styles") or getSampleStyleSheet()
 
-    if thumb_size is None:
-        thumb_size = (2.2 * inch, 2.2 * inch)
+    # Compute column geometry from the page so images never overflow their cells.
+    # SimpleDocTemplate default left/right margins are 1 inch each.
+    _cell_pad = 4  # points of left/right padding per cell
+    _left_margin = _right_margin = inch
+    _page_w, _ = A4
+    _usable_w = _page_w - _left_margin - _right_margin  # points
+    _n_cols = 4
+    _col_w = _usable_w / _n_cols          # column width in points
+    _img_w = _col_w - 2 * _cell_pad       # image width (leaves gap between images)
 
     doc = SimpleDocTemplate(output_pdf, pagesize=A4)
     story = []
@@ -2363,15 +2371,42 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
         fig.savefig(density_png, dpi=150, bbox_inches="tight")
         plt.close(fig)
 
+        # Compute thumbnail height that preserves the actual crop aspect ratio.
+        _aspect = (min_w / min_h) if min_h > 0 else 1.0
+        _img_h = _img_w / _aspect
+
+        label_style = ParagraphStyle(
+            "ch_label",
+            parent=styles["Normal"],
+            fontSize=7,
+            alignment=1,
+            textColor=rl_colors.black,
+            spaceAfter=0,
+            spaceBefore=0,
+        )
+        label_row = [Paragraph(cond, label_style) for cond in marker_conditions] + [Paragraph("Merged", label_style)]
+        label_height = 0.18 * inch
+
         data = [
-            [Image(density_png, width=6.0 * inch, height=2.0 * inch)],
-            [Image(path, width=thumb_size[0], height=thumb_size[1]) for path in channel_pngs] + [Image(merged_png, width=thumb_size[0], height=thumb_size[1])],
+            [Image(density_png, width=_usable_w, height=2.0 * inch)],
+            label_row,
+            [Image(path, width=_img_w, height=_img_h) for path in channel_pngs] + [Image(merged_png, width=_img_w, height=_img_h)],
         ]
-        table = Table(data, colWidths=[1.5 * inch] * 4, rowHeights=[2.0 * inch, thumb_size[1]])
+        table = Table(
+            data,
+            colWidths=[_col_w] * _n_cols,
+            rowHeights=[2.0 * inch, label_height, _img_h],
+        )
         table.setStyle(TableStyle([
             ("SPAN", (0, 0), (3, 0)),
             ("ALIGN", (0, 0), (-1, -1), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("VALIGN", (0, 1), (3, 1), "BOTTOM"),
+            # padding around image cells to create visible gaps
+            ("LEFTPADDING",  (0, 1), (-1, 2), _cell_pad),
+            ("RIGHTPADDING", (0, 1), (-1, 2), _cell_pad),
+            ("TOPPADDING",    (0, 2), (-1, 2), 2),
+            ("BOTTOMPADDING", (0, 2), (-1, 2), 2),
         ]))
 
         story.append(Paragraph(f"<b>Nucleus {nucleus_id} (Z {best_z})</b>", styles["Heading2"]))
