@@ -3794,6 +3794,11 @@ def view_processing_results(
                     im_segmentation_stack[stain_df.index[c]].astype(np.int32),
                     name=f'{idx} ({marker})', blending='additive', scale=scale_zoom,
                 )
+        if 'Aggregates' in im_segmentation_stack:
+            viewer_1.add_labels(
+                im_segmentation_stack['Aggregates'].astype(np.int32),
+                name='Aggregates', blending='additive', scale=scale_zoom,
+            )
         viewer_1.scale_bar.visible = True
         viewer_1.scale_bar.unit = 'um'
 
