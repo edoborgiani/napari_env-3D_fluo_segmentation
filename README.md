@@ -5,18 +5,20 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 > **Disclaimer:** This repository is freely available for use. The associated pipeline is currently being prepared for publication — please contact [Edoardo Borgiani](https://github.com/edoborgiani) for more information on how to use the pipeline or for collaboration enquiries.
 
 ## Features
-- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.4.2`) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.0`).
+- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.5`) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.1`).
 - **Shared helper library** (`helpers/`): processing, quantification, visualization, and report-export functions shared across notebooks.
 - **Profile-aware imports** (`helpers/notebook_setup_helpers.py`): the `nuclei` and `ld` profiles load only the dependencies each workflow needs, avoiding unnecessary overhead.
 - **3D Image Processing**: normalization, resampling to isotropic voxel size, denoising, thresholding, watershed and StarDist-based segmentation.
+- **LD union labeling**: when no dedicated NUCLEI channel is present, `segment_nuclei()` automatically falls back to merging all threshold channels via bitwise OR and running connected-component labeling to identify individual cells.
 - **Napari Integration**: interactive visualization and manual correction at each processing step.
-- **Quantification & Export**: per-cell marker statistics, spatial distributions, Excel reports, per-nucleus PDF rows, and 3D mesh export (VTK/STL/INP).
+- **Quantification & Export**: per-cell marker statistics, spatial distributions, Excel reports, per-nucleus PDF rows (with channel name labels and correct aspect-ratio images), and 3D mesh export (VTK/STL/INP).
 
 ## Repository Structure
 ```
 .
-├── Fluo_3D_nuc_seg_v1.4.2.ipynb   # Nuclei segmentation — latest recommended version
-├── Fluo_3D_LD_seg_v1.0.ipynb      # Live/Dead segmentation — v1.0
+├── Fluo_3D_nuc_seg_v1.5.ipynb     # Nuclei segmentation — latest recommended version
+├── Fluo_3D_nuc_seg_v1.4.2.ipynb   # Nuclei segmentation — previous stable version
+├── Fluo_3D_LD_seg_v1.1.ipynb      # Live/Dead segmentation — latest version
 ├── requirements.txt               # Python dependencies
 ├── README.md                      # This file
 └── helpers/
@@ -50,7 +52,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```powershell
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.4.2.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.0.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.5.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.1.ipynb` for Live/Dead segmentation.
 
 ## Usage
 
@@ -59,7 +61,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 - Use Napari for interactive visualization and manual corrections at any step.
 - All shared processing logic lives in `helpers/notebook_helpers.py` — customize functions there rather than duplicating code across notebooks.
 
-## Detailed Workflow: `Fluo_3D_nuc_seg_v1.4.2.ipynb`
+## Detailed Workflow: `Fluo_3D_nuc_seg_v1.5.ipynb`
 
 ### 1. Environment Setup
 The notebook installs optional packages automatically via `notebook_setup_helpers` and loads all imports using `load_common_imports(profile='nuclei')`.
@@ -105,9 +107,45 @@ The notebook installs optional packages automatically via `notebook_setup_helper
 
 ### 11. Export
 - **Excel**: full quantification tables via `export_quantification_to_excel()`.
-- **PDF**: per-nucleus image rows via `create_row_pdf()`.
+- **PDF**: per-nucleus image rows via `create_row_pdf()`, with channel name labels at the top of each image column and images rendered at their correct aspect ratio with inter-image spacing.
 - **3D meshes**: VTK / STL files for nuclei, cytoplasm, PCM, and markers for visualization in ParaView or similar.
 - **FEA**: optional `.inp` file generated via tetrahedralization (`tetgen`).
+
+---
+
+## Detailed Workflow: `Fluo_3D_LD_seg_v1.1.ipynb`
+
+The Live/Dead notebook follows the same helper-based structure as the nuclei notebook, adapted for two-channel viability assays (e.g. Calcein-AM / EthD).
+
+### Key differences from the nuclei workflow
+
+| Aspect | Nuclei notebook | LD notebook |
+|---|---|---|
+| Profile | `"nuclei"` | `"ld"` (lighter imports) |
+| Segmentation | Watershed / StarDist on NUCLEI channel | Union of all threshold channels → connected components |
+| Cytoplasm / PCM | Dedicated channels + grow steps | Not applicable |
+| NUCLEI row in `stain_complete_df` | Populated by `segment_nuclei()` | Added as empty placeholder after segmentation |
+| Export | Same Excel / PDF / VTK / STL / FEA pipeline | Same pipeline |
+
+### Cell-by-cell structure
+
+1. **Cells 1–4**: title, package install, imports with `profile="ld"`, reload helpers.
+2. **Cell 5**: set `input_file`, `ROI`, `big_image`.
+3. **Cells 6–7**: load image via `AICSImage`, extract pixel sizes and metadata.
+4. **Cell 8**: define `stain_dict` with `LIVE` / `DEAD` entries, `nuclei_diameter`, `cell_diameter`, `multilabel`, `nuclei_split_config`.
+5. **Cells 9–10**: zoom factors, experiment name, StarDist flag.
+6. **Cells 11–13**: `prepare_image_stack`, `build_stain_dataframe`, `view_original_channels`.
+7. **Cells 14–15**: `prepare_stain_settings`, display `stain_complete_df`.
+8. **Cells 16–22**: normalize → resample to isotropic → median denoise → contrast/gamma → Gaussian smooth → histogram equalization → threshold.
+9. **Cell 23**: export per-channel histograms and processing parameters to Excel.
+10. **Cell 24**: `segment_nuclei()` (LD fallback: union-label LIVE+DEAD) + add NUCLEI placeholder.
+11. **Cell 25**: `assign_channel_labels` — map LIVE/DEAD intensity into segmented objects.
+12. **Cell 26**: `view_processing_results` in Napari.
+13. **Cells 27–32**: `build_labels_dict` → `labels_dict_to_dataframe` → preview → population summary → `build_full_labels_dict` → full DataFrame.
+14. **Cells 34, 36**: spatial and size distributions.
+15. **Cells 37–38**: VTK volume and STL marker export.
+16. **Cell 40**: Excel quantification export.
+17. **Cell 42**: FEA mesh export.
 
 ### Tips
 - For large datasets, use `ROI` cropping and a reduced `scale_factor` during development.

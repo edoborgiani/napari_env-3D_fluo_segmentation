@@ -4,6 +4,7 @@ scipy
 scikit-image
 matplotlib
 jupyter
+opencv-python
 aicsimageio[nd2]
 nd2reader
 xlsxwriter
