@@ -3473,6 +3473,16 @@ def segment_nuclei(
     im_segmentation_stack = {}
 
     if 'NUCLEI' not in stain_df.index:
+        # LD-style fallback: union all threshold channels, label connected components.
+        im_in = im_final_stack['Threshold image'].copy()
+        im_thresh = np.zeros(im_in.shape[:3], dtype=np.int32)
+        for c in range(im_in.shape[3]):
+            im_thresh = im_thresh | (im_in[:, :, :, c] > 0).astype(np.int32)
+        im_out = skimage_label(im_thresh)
+        im_segmentation_stack['Nuclei'] = im_out
+        im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
+        im_segmentation_stack['PCM'] = np.zeros_like(im_out)
+        print(f"LD mode: {int(im_out.max())} cells segmented from combined binary mask.")
         return im_segmentation_stack
 
     im_in = im_final_stack['Threshold image'].copy()
