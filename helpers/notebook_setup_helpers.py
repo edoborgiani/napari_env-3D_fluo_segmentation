@@ -12,6 +12,8 @@ DEFAULT_PIP_PACKAGES = [
     "aicsimageio[nd2]",
     "aicspylibczi",
     "nd2reader",
+    "opencv-python",
+    "tensorflow",
     "xlsxwriter",
     "reportlab",
 ]
@@ -80,6 +82,7 @@ def load_common_imports(
     imported["combinations"] = importlib.import_module("itertools").combinations if profile == "nuclei" else None
     imported["defaultdict"] = importlib.import_module("collections").defaultdict if profile == "nuclei" else None
     imported["AICSImage"] = importlib.import_module("aicsimageio").AICSImage
+    imported["open_image_file"] = importlib.import_module("helpers.notebook_helpers").open_image_file
     try:
         imported["ND2Reader"] = importlib.import_module("nd2reader").ND2Reader
     except ImportError:
