@@ -117,8 +117,6 @@ The notebook installs optional packages automatically via `notebook_setup_helper
 
 The Live/Dead notebook follows the same helper-based structure as the nuclei notebook, adapted for two-channel viability assays (e.g. Calcein-AM / EthD).
 
-### Key differences from the nuclei workflow
-
 | Aspect | Nuclei notebook | LD notebook |
 |---|---|---|
 | Profile | `"nuclei"` | `"ld"` (lighter imports) |
@@ -127,30 +125,52 @@ The Live/Dead notebook follows the same helper-based structure as the nuclei not
 | NUCLEI row in `stain_complete_df` | Populated by `segment_nuclei()` | Added as empty placeholder after segmentation |
 | Export | Same Excel / PDF / VTK / STL / FEA pipeline | Same pipeline |
 
-### Cell-by-cell structure
+### 1. Environment Setup
+The notebook installs optional packages automatically via `notebook_setup_helpers` and loads all imports using `load_common_imports(profile='ld')`, which applies a lighter import profile compared to the nuclei workflow.
 
-1. **Cells 1–4**: title, package install, imports with `profile="ld"`, reload helpers.
-2. **Cell 5**: set `input_file`, `ROI`, `big_image`.
-3. **Cells 6–7**: load image via `AICSImage`, extract pixel sizes and metadata.
-4. **Cell 8**: define `stain_dict` with `LIVE` / `DEAD` entries, `nuclei_diameter`, `cell_diameter`, `multilabel`, `nuclei_split_config`.
-5. **Cells 9–10**: zoom factors, experiment name, StarDist flag.
-6. **Cells 11–13**: `prepare_image_stack`, `build_stain_dataframe`, `view_original_channels`.
-7. **Cells 14–15**: `prepare_stain_settings`, display `stain_complete_df`.
-8. **Cells 16–22**: normalize → resample to isotropic → median denoise → contrast/gamma → Gaussian smooth → histogram equalization → threshold.
-9. **Cell 23**: export per-channel histograms and processing parameters to Excel.
-10. **Cell 24**: `segment_nuclei()` (LD fallback: union-label LIVE+DEAD) + add NUCLEI placeholder.
-11. **Cell 25**: `assign_channel_labels` — map LIVE/DEAD intensity into segmented objects.
-12. **Cell 26**: `view_processing_results` in Napari.
-13. **Cells 27–32**: `build_labels_dict` → `labels_dict_to_dataframe` → preview → population summary → `build_full_labels_dict` → full DataFrame.
-14. **Cells 34, 36**: spatial and size distributions.
-15. **Cells 37–38**: VTK volume and STL marker export.
-16. **Cell 40**: Excel quantification export.
-17. **Cell 42**: FEA mesh export.
+### 2. Load Image Data
+- Set `input_file` to your `.nd2` or `.tif` file path.
+- Physical pixel sizes are extracted from metadata for correct spatial scaling.
 
-### Tips
-- For large datasets, use `ROI` cropping and a reduced `scale_factor` during development.
-- Use Napari's layer controls to inspect intermediate results before committing to full-resolution runs.
-- Review exported Excel files for quantitative QC before downstream analysis.
+### 3. Define Sample & Staining Information
+- Configure `stain_dict` with `LIVE` / `DEAD` channel entries, `nuclei_diameter`, `cell_diameter`, `multilabel`, and `nuclei_split_config`.
+- `prepare_stain_settings()` and `build_labels_dict()` from `notebook_helpers` build the working data structures.
+
+### 4. ROI & Scaling
+- Adjust `ROI` and `scale_factor` to crop or downsample for faster iteration.
+
+### 5. Setup & Per-Channel Contrast/Gamma
+- Load or save a CSV setup file for per-channel contrast and gamma settings.
+- Napari is used for interactive inspection and adjustment.
+
+### 6. Image Preprocessing
+- **Normalization**: channels normalized to [0, 255] via `normalize_image_channels()`.
+- **Resampling**: isotropic voxel resampling via `resample_to_isotropic()`.
+- **Denoising**: median and Gaussian filters via `apply_median_denoise()` / `apply_gaussian_smoothing()`.
+- **Histogram export**: per-channel histograms saved to Excel via `export_channel_histograms()`.
+
+### 7. Thresholding
+- Combined thresholding (Otsu, Sauvola, statistical background, intensity gain) for robust binary masks.
+- Small artefact islands removed via `remove_small_islands()`.
+
+### 8. Segmentation
+- **Cells**: `segment_nuclei()` uses the LD fallback — all threshold channels are merged via bitwise OR and connected-component labeling identifies individual cells.
+- A NUCLEI placeholder row is added to `stain_complete_df` after segmentation.
+- `assign_channel_labels()` maps LIVE / DEAD intensity into the segmented objects.
+
+### 9. Visualization
+- Napari overlays for raw, denoised, thresholded, and labelled images at each stage.
+
+### 10. Quantification
+- `compute_nuclei_cytoplasm_stats()` and `compute_marker_stats_for_marker()` compute per-cell volumes, intensities, and spatial distributions (X, Y, Z).
+- `collect_histogram_data()` collects per-channel statistics.
+- `print_population_summary()` prints a summary to the notebook.
+
+### 11. Export
+- **Excel**: full quantification tables via `export_quantification_to_excel()`.
+- **PDF**: per-nucleus image rows via `create_row_pdf()`, with channel name labels at the top of each image column and images rendered at their correct aspect ratio with inter-image spacing.
+- **3D meshes**: VTK / STL files for segmented cells and markers for visualization in ParaView or similar.
+- **FEA**: optional `.inp` file generated via tetrahedralization (`tetgen`).
 
 ---
 
