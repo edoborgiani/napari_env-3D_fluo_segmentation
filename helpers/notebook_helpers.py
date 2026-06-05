@@ -2330,7 +2330,7 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
     _left_margin = _right_margin = inch
     _page_w, _ = A4
     _usable_w = _page_w - _left_margin - _right_margin  # points
-    _n_cols = 4
+    _n_cols = len(marker_conditions) + 1  # one column per channel + merged
     _col_w = _usable_w / _n_cols          # column width in points
     _img_w = _col_w - 2 * _cell_pad       # image width (leaves gap between images)
 
@@ -2342,7 +2342,6 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
 
     all_conditions = sorted({condition for nucleus_data in hist_data.values() for condition in nucleus_data.keys()})
     marker_conditions = [condition for condition in all_conditions if condition.lower() != "nuclei"]
-    marker_conditions = (marker_conditions + marker_conditions)[:3]
     condition_colors = {
         condition: (
             stain_complete_df.loc[condition, "Color"]
@@ -2485,10 +2484,10 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
             rowHeights=[2.0 * inch, label_height, _img_h],
         )
         table.setStyle(TableStyle([
-            ("SPAN", (0, 0), (3, 0)),
+            ("SPAN", (0, 0), (_n_cols - 1, 0)),
             ("ALIGN", (0, 0), (-1, -1), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("VALIGN", (0, 1), (3, 1), "BOTTOM"),
+            ("VALIGN", (0, 1), (_n_cols - 1, 1), "BOTTOM"),
             # padding around image cells to create visible gaps
             ("LEFTPADDING",  (0, 1), (-1, 2), _cell_pad),
             ("RIGHTPADDING", (0, 1), (-1, 2), _cell_pad),
@@ -4102,7 +4101,10 @@ def build_vtk_volumes(
         # --- nuclei ---
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Nuclei'] == j))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
-        mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+        _g2m_settings = mr.GridToMeshSettings()
+        _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+        _g2m_settings.isoValue = 0.5
+        mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
         mr.saveMesh(mesh_stl, "part_nuclei_mesh.stl")
 
         mesh_nuclei = pv.read("part_nuclei_mesh.stl")
@@ -4124,14 +4126,20 @@ def build_vtk_volumes(
         # --- cytoplasm ---
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Cytoplasm'] == j))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
-        mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+        _g2m_settings = mr.GridToMeshSettings()
+        _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+        _g2m_settings.isoValue = 0.5
+        mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
         mr.saveMesh(mesh_stl, "part_cyto_mesh.stl")
         mesh_cyto = pv.read("part_cyto_mesh.stl")
 
         # --- PCM ---
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['PCM'] == j))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
-        mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+        _g2m_settings = mr.GridToMeshSettings()
+        _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+        _g2m_settings.isoValue = 0.5
+        mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
         mr.saveMesh(mesh_stl, "part_PCM_mesh.stl")
         mesh_PCM = pv.read("part_PCM_mesh.stl")
 
@@ -4230,7 +4238,10 @@ def export_marker_stl(
             continue
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack[stain_df.index[c]] > 0))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
-        mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+        _g2m_settings = mr.GridToMeshSettings()
+        _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+        _g2m_settings.isoValue = 0.5
+        mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
         mr.saveMesh(mesh_stl, str(_Path(input_file).stem) + "_" + stain_complete_df['Marker'][c] + "_mesh.stl")
 
 
@@ -4267,7 +4278,10 @@ def export_fea_mesh(
     # --- Step 1: tetrahedralize ---
     simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Nuclei']))
     floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
-    mesh_stl = mr.gridToMesh(floatGrid, mr.Vector3f(1.0, 1.0, 1.0), 0.5)
+    _g2m_settings = mr.GridToMeshSettings()
+    _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+    _g2m_settings.isoValue = 0.5
+    mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
 
     outVerts = mrn.getNumpyVerts(mesh_stl)
     outFaces = mrn.getNumpyFaces(mesh_stl.topology)
