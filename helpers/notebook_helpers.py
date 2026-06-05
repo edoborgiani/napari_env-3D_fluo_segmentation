@@ -1433,7 +1433,13 @@ def prepare_stain_settings(
             import napari as napari_module
 
         stain_complete_df = stain_initial_df.copy()
-        napari_module.Viewer.close_all()
+        try:
+            napari_module.Viewer.close_all()
+        except RuntimeError:
+            # Stale viewer instances whose Qt C++ object was already destroyed
+            # (e.g. closed via the window X button) raise RuntimeError here.
+            # Clear the internal registry manually so napari starts clean.
+            napari_module.Viewer._instances.clear()
         settings.application.ipy_interactive = False
         viewer = napari_module.Viewer(title="Channels setup - adjust contrast and gamma, then close viewer to continue", ndisplay=3)
 
