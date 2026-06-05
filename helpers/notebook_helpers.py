@@ -3810,6 +3810,13 @@ def assign_channel_labels(
         def progress(x, **kw): return x
 
     if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index)):
+        # LD mode: label each channel by masking the Nuclei label array with
+        # the per-channel threshold so LIVE and DEAD cells are separately identified.
+        im_in = im_final_stack['Threshold image'].copy()
+        im_segmentation_stack = dict(im_segmentation_stack)
+        for c in progress(range(im_in.shape[3]), desc='Step 12 - Assign Labels To Channels'):
+            cond = stain_df.index[c]
+            im_segmentation_stack[cond] = (im_in[:, :, :, c] > 0) * im_segmentation_stack['Nuclei']
         return im_segmentation_stack
 
     im_in = im_final_stack['Threshold image'].copy()
@@ -3907,7 +3914,10 @@ def view_processing_results(
         for c in progress(range(len(stain_complete_df.index)), desc='Step 13B - Add Labels To Viewer 1'):
             idx = stain_complete_df.index[c]
             marker = stain_complete_df.loc[idx, 'Marker']
-            if idx == 'NUCLEI':
+            if idx == 'NUCLEI' and 'NUCLEI' not in stain_df.index:
+                # Virtual NUCLEI entry added for LD mode — skip it in the viewer.
+                continue
+            elif idx == 'NUCLEI':
                 viewer_1.add_labels(
                     im_segmentation_stack['Nuclei'].astype(np.int32),
                     name=f'{idx} ({marker})', blending='additive', scale=scale_zoom,
@@ -3923,7 +3933,7 @@ def view_processing_results(
                 )
             elif idx not in ('PCM',):
                 viewer_1.add_labels(
-                    im_segmentation_stack[stain_df.index[c]].astype(np.int32),
+                    im_segmentation_stack[idx].astype(np.int32),
                     name=f'{idx} ({marker})', blending='additive', scale=scale_zoom,
                 )
         if 'Aggregates' in im_segmentation_stack:
