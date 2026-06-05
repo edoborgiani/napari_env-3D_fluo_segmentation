@@ -58,6 +58,7 @@ __all__ = [
     "napari_gamma",
     "napari_contrast_gamma_uint8",
     "normalize_image_channels",
+    "open_image_file",
     "plot_nucleus_kdes",
     "plot_size_distributions",
     "plot_spatial_distributions",
@@ -86,6 +87,92 @@ __all__ = [
     "voxel_volume",
     "watershed_nuclei",
 ]
+
+
+class _ND2ReaderFallback:
+    """Minimal AICSImage-compatible wrapper for legacy ND2 files that fail with
+    'Invalid ChunkMap signature'.  Uses nd2reader (PIMS-based) under the hood,
+    which handles older/non-standard Nikon file formats.
+    """
+
+    class _PixelSizes:
+        def __init__(self, x, y, z):
+            self.X = x
+            self.Y = y
+            self.Z = z
+
+    def __init__(self, path: str):
+        from nd2reader import ND2Reader
+
+        self._path = path
+        with ND2Reader(path) as f:
+            sizes = f.sizes
+            c = sizes.get('c', 1)
+            z = sizes.get('z', 1)
+            y = sizes.get('y', f.height)
+            x = sizes.get('x', f.width)
+            self.shape = (1, c, z, y, x)
+
+            # Physical pixel sizes
+            px_um = f.metadata.get('pixel_microns', 1.0) or 1.0
+            z_step = f.metadata.get('z_step', 1.0) or 1.0
+            self._pixel_sizes = self._PixelSizes(px_um, px_um, z_step)
+
+            # Load full data into memory as ZYXC
+            f.bundle_axes = 'zyx'
+            f.iter_axes = 'c'
+            data_czyx = np.stack([np.array(f[i]) for i in range(c)], axis=0)
+        # CZYX -> ZYXC
+        self._data_zyxc = np.moveaxis(data_czyx, 0, -1)
+
+    @property
+    def physical_pixel_sizes(self):
+        return self._pixel_sizes
+
+    def get_image_data(self, dim_order="ZYXC", T=0):
+        if dim_order == "ZYXC":
+            return self._data_zyxc
+        raise NotImplementedError(
+            f"_ND2ReaderFallback: dim_order '{dim_order}' is not supported"
+        )
+
+    def get_image_dask_data(self, dim_order="ZYXC"):
+        import dask.array as da
+        if dim_order == "ZYXC":
+            return da.from_array(self._data_zyxc, chunks=self._data_zyxc.shape)
+        raise NotImplementedError(
+            f"_ND2ReaderFallback: dim_order '{dim_order}' is not supported"
+        )
+
+
+def open_image_file(input_file: str):
+    """Open a microscopy file with AICSImage, falling back to a nd2reader-based
+    wrapper for legacy ND2 files that raise ``ValueError: Invalid ChunkMap signature``.
+
+    Parameters
+    ----------
+    input_file : str
+        Path to the microscopy file (.nd2, .czi, .tif, …).
+
+    Returns
+    -------
+    meta : AICSImage or _ND2ReaderFallback
+        Object with the same interface used by the notebook cells
+        (``shape``, ``physical_pixel_sizes``, ``get_image_data``,
+        ``get_image_dask_data``).
+    """
+    from aicsimageio import AICSImage
+    try:
+        return AICSImage(input_file)
+    except ValueError as exc:
+        if 'ChunkMap' not in str(exc) or not input_file.lower().endswith('.nd2'):
+            raise
+        print(
+            f"[open_image_file] AICSImage raised '{exc}'.\n"
+            "Falling back to nd2reader for legacy ND2 file — note: the full "
+            "image will be loaded into memory even when big_image=True."
+        )
+        return _ND2ReaderFallback(input_file)
 
 
 def read_file_metadata(input_file: str, meta) -> dict:
