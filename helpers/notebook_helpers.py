@@ -26,6 +26,8 @@ __all__ = [
     "assign_labels",
     "build_full_labels_df",
     "build_full_labels_dict",
+    "build_histogram_report",
+    "build_labels_df",
     "build_labels_dict",
     "collect_histogram_data",
     "compute_full_marker_stats_for_marker",
@@ -1902,6 +1904,30 @@ def build_full_labels_dict(
     return labels_full_dict
 
 
+def build_labels_df(
+    im_segmentation_stack,
+    filtered_img,
+    stain_complete_df,
+    stain_df,
+    r_xyz,
+    zooms,
+    multilabel=False,
+    progress=None,
+):
+    """Build the compact quantification dictionary, convert it to DataFrames, and return both."""
+    labels_dict = build_labels_dict(
+        im_segmentation_stack,
+        filtered_img,
+        stain_complete_df=stain_complete_df,
+        stain_df=stain_df,
+        r_xyz=r_xyz,
+        zooms=zooms,
+        multilabel=multilabel,
+        progress=progress,
+    )
+    return labels_dict_to_dataframe(labels_dict, truncate=True, progress=progress)
+
+
 def build_full_labels_df(
     im_segmentation_stack,
     im_final_stack,
@@ -2055,6 +2081,47 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
             print(marker_line)
 
     print("_" * 80)
+
+
+def build_histogram_report(
+    im_segmentation_stack,
+    im_final_stack,
+    filtered_img,
+    stain_df,
+    stain_complete_df,
+    input_file,
+    pad=20,
+    thumb_size=None,
+    progress=None,
+):
+    """Collect histogram data, plot KDEs, and generate the per-nucleus PDF report."""
+    from reportlab.lib.units import inch
+
+    if thumb_size is None:
+        thumb_size = (2.0 * inch, 2.0 * inch)
+
+    hist_data, intensity_ranges = collect_histogram_data(
+        im_segmentation_stack,
+        filtered_img,
+        stain_df=stain_df,
+        stain_complete_df=stain_complete_df,
+        progress=progress,
+    )
+
+    fig, axes, x_grid = plot_nucleus_kdes(
+        hist_data,
+        stain_complete_df=stain_complete_df,
+        progress=progress,
+    )
+
+    output_pdf = str(Path(input_file).stem) + "_nuclei_marker.pdf"
+    create_row_pdf(
+        output_pdf=output_pdf,
+        pad=pad,
+        thumb_size=thumb_size,
+    )
+
+    return hist_data, intensity_ranges, fig, axes, x_grid
 
 
 def collect_histogram_data(im_segmentation_stack, filtered_img, stain_df, stain_complete_df, progress=None):
