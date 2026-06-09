@@ -24,6 +24,7 @@ __all__ = [
     "apply_threshold_per_channel",
     "assign_channel_labels",
     "assign_labels",
+    "build_full_labels_df",
     "build_full_labels_dict",
     "build_labels_dict",
     "collect_histogram_data",
@@ -1899,6 +1900,28 @@ def build_full_labels_dict(
         )
 
     return labels_full_dict
+
+
+def build_full_labels_df(
+    im_segmentation_stack,
+    im_final_stack,
+    filtered_img,
+    stain_complete_df,
+    r_xyz,
+    zooms,
+    progress=None,
+):
+    """Build the full quantification dictionary and convert it to a DataFrame."""
+    labels_full_dict = build_full_labels_dict(
+        im_segmentation_stack,
+        im_final_stack,
+        filtered_img,
+        stain_complete_df=stain_complete_df,
+        r_xyz=r_xyz,
+        zooms=zooms,
+        progress=progress,
+    )
+    return labels_dict_to_dataframe(labels_full_dict)
 
 
 def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None):
