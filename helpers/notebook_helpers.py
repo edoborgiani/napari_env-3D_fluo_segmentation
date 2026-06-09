@@ -233,6 +233,24 @@ def set_notebook_context(**kwargs):
     globals().update(kwargs)
 
 
+def _close_all_napari_viewers(napari_module=None):
+    """Close every open Napari viewer, tolerating stale Qt C++ objects."""
+    if napari_module is None:
+        try:
+            import napari as napari_module
+        except ImportError:
+            return
+    stale = []
+    for viewer in list(napari_module.Viewer._instances):
+        try:
+            viewer.close()
+        except RuntimeError:
+            # Qt C++ object already destroyed (window closed via X button)
+            stale.append(viewer)
+    for viewer in stale:
+        napari_module.Viewer._instances.discard(viewer)
+
+
 def _context(name, default=None):
     value = globals().get(name, default)
     if value is not None:
@@ -1433,13 +1451,7 @@ def prepare_stain_settings(
             import napari as napari_module
 
         stain_complete_df = stain_initial_df.copy()
-        try:
-            napari_module.Viewer.close_all()
-        except RuntimeError:
-            # Stale viewer instances whose Qt C++ object was already destroyed
-            # (e.g. closed via the window X button) raise RuntimeError here.
-            # Clear the internal registry manually so napari starts clean.
-            napari_module.Viewer._instances.clear()
+        _close_all_napari_viewers(napari_module)
         settings.application.ipy_interactive = False
         viewer = napari_module.Viewer(title="Channels setup - adjust contrast and gamma, then close viewer to continue", ndisplay=3)
 
@@ -1925,6 +1937,13 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
     nuclei_rows = labels_df[labels_df["Condition"] == "NUCLEI"]
     total_cells = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_df.iloc[0]["Number"])
 
+    # --- Channel overview ---
+    print("CHANNELS:")
+    for i, cond in enumerate(stain_complete_df.index):
+        row = stain_complete_df.loc[cond]
+        print(f"  [{i}] {cond:<20} {row['Marker']:<16} ({row['Laser']})")
+
+    print("_" * 80)
     print("TOT CELLS =", int(total_cells))
     print(" ")
     for _, marker in _progress_iter(
@@ -1935,37 +1954,90 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
     ):
         condition = labels_df.iloc[_]["Condition"]
         if condition not in ["NUCLEI", "CYTOPLASM", "NUCLEI + CYTOPLASM"]:
-            print(f" PERC {condition} ({marker}) = {100.0 * labels_df.iloc[_]['Number'] / total_cells} %")
+            count = int(labels_df.iloc[_]["Number"])
+            perc = 100.0 * count / total_cells
+            print(f"  PERC {condition} ({marker}) = {perc:.1f} %  ({count} cells)")
 
     print("_" * 80)
+
+    # --- Nuclei and cytoplasm population size statistics ---
+    def _size_stats_line(sizes_tuple, label, unit="um\u00b3"):
+        arr = np.array(sizes_tuple, dtype=float)
+        if arr.size == 0:
+            return
+        print(
+            f"{label}:  mean = {np.mean(arr):.2f} {unit}"
+            f"  |  std = {np.std(arr):.2f} {unit}"
+            f"  |  median = {np.median(arr):.2f} {unit}"
+            f"  |  [min = {np.min(arr):.2f},  max = {np.max(arr):.2f}]"
+        )
+
     if not nuclei_rows.empty:
-        print("MEAN SIZE NUCLEI =", np.mean(nuclei_rows.iloc[0]["Nuclei size [um3]"]), "um3")
+        _size_stats_line(nuclei_rows.iloc[0]["Nuclei size [um3]"], "NUCLEI SIZE")
     cyto_rows = labels_df[labels_df["Condition"] == "CYTOPLASM"]
     if "CYTOPLASM" in stain_df.index and not cyto_rows.empty:
-        print("MEAN SIZE CYTOPLASM =", np.mean(cyto_rows.iloc[0]["Cytoplasm size [um3]"]), "um3")
+        _size_stats_line(cyto_rows.iloc[0]["Cytoplasm size [um3]"], "CYTOPLASM SIZE")
 
+    print("_" * 80)
+
+    # --- Per-condition detailed stats ---
     for _, marker in _progress_iter(
         enumerate(labels_df.index),
         progress,
-        desc="Step 14F - Summary Sizes",
+        desc="Step 14F - Summary Per-Condition",
         total=len(labels_df.index),
     ):
         condition = labels_df.iloc[_]["Condition"]
-        if condition not in ["NUCLEI", "CYTOPLASM", "NUCLEI + CYTOPLASM"]:
-            print(" ")
-            print(f" MEAN SIZE NUCLEI {condition} ({marker}) = {np.mean(labels_df.iloc[_]['Nuclei size [um3]'])} um3")
-            if "CYTOPLASM" in stain_df.index:
-                print(f" MEAN SIZE CYTOPLASM {condition} ({marker}) = {np.mean(labels_df.iloc[_]['Cytoplasm size [um3]'])} um3")
+        if condition in ["NUCLEI", "CYTOPLASM", "NUCLEI + CYTOPLASM"]:
+            continue
+
+        row = labels_df.iloc[_]
+        count = int(row["Number"])
+        perc = 100.0 * count / total_cells
+        print(f"\n {condition} ({marker})  —  {count} cells  ({perc:.1f} %)")
+
+        # Nucleus compartment
+        nuc_s = np.array(row["Nuclei size [um3]"], dtype=float)
+        avg_i = np.array(row["Avg. marker intensity"], dtype=float)
+        std_i = np.array(row["STD marker intensity"], dtype=float)
+        if nuc_s.size > 0:
+            nuc_line = f"   Nucleus size:        {np.mean(nuc_s):.2f} ± {np.std(nuc_s):.2f} um\u00b3"
+            if avg_i.size > 0:
+                nuc_line += f"   |  intensity: {np.mean(avg_i):.2f} ± {np.mean(std_i):.2f} a.u."
+            print(nuc_line)
+        elif avg_i.size > 0:
+            print(f"   Nucleus intensity:    {np.mean(avg_i):.2f} ± {np.mean(std_i):.2f} a.u.")
+
+        # Cytoplasm compartment
+        if "CYTOPLASM" in stain_df.index:
+            cyto_s = np.array(row["Cytoplasm size [um3]"], dtype=float)
+            cyto_avg = np.array(row["Avg. marker intensity cytoplasm"], dtype=float)
+            cyto_std = np.array(row["STD marker intensity cytoplasm"], dtype=float)
+            if cyto_s.size > 0:
+                cyto_line = f"   Cytoplasm size:      {np.mean(cyto_s):.2f} ± {np.std(cyto_s):.2f} um\u00b3"
+                if cyto_avg.size > 0:
+                    cyto_line += f"   |  intensity: {np.mean(cyto_avg):.2f} ± {np.mean(cyto_std):.2f} a.u."
+                print(cyto_line)
+            elif cyto_avg.size > 0:
+                print(f"   Cytoplasm intensity:  {np.mean(cyto_avg):.2f} ± {np.mean(cyto_std):.2f} a.u.")
+
+        # Marker/aggregate size
+        msize = np.array(row["Marker size [um3]"], dtype=float)
+        if msize.size > 0:
+            print(f"   Marker size:          {np.mean(msize):.2f} ± {np.std(msize):.2f} um\u00b3"
+                  f"  |  median = {np.median(msize):.2f} um\u00b3")
+
+        # PCM compartment (if present)
+        pcm_s = np.array(row["Marker size PCM [um3]"], dtype=float)
+        pcm_avg = np.array(row["Avg. marker intensity PCM"], dtype=float)
+        pcm_std = np.array(row["STD marker intensity PCM"], dtype=float)
+        if pcm_s.size > 0:
+            pcm_line = f"   PCM size:            {np.mean(pcm_s):.2f} ± {np.std(pcm_s):.2f} um\u00b3"
+            if pcm_avg.size > 0:
+                pcm_line += f"   |  intensity: {np.mean(pcm_avg):.2f} ± {np.mean(pcm_std):.2f} a.u."
+            print(pcm_line)
 
     print("_" * 80)
-    for _, marker in _progress_iter(
-        enumerate(labels_df.index),
-        progress,
-        desc="Step 14G - Summary Marker Size",
-        total=len(labels_df.index),
-    ):
-        if labels_df.iloc[_]["Marker size [um3]"] != ():
-            print(f"MEAN SIZE {labels_df.iloc[_]['Condition']} ({marker}) = {np.mean(labels_df.iloc[_]['Marker size [um3]'])} um3")
 
 
 def collect_histogram_data(im_segmentation_stack, filtered_img, stain_df, stain_complete_df, progress=None):
@@ -3357,6 +3429,7 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
         def progress(x, **kw): return x
 
     im_in = im_final_stack['Original image'].copy()
+    _close_all_napari_viewers(napari_module)
     viewer = napari_module.Viewer(title="Original Image Channels")
 
     for c, c_name in progress(
@@ -3891,6 +3964,7 @@ def view_processing_results(
     scale_zoom = (r_zZ, r_zY, r_zX)
     im_thr = im_final_stack['Threshold image']
 
+    _close_all_napari_viewers(napari_module)
     viewer_0 = napari_module.Viewer(title="Post-processing Channels")
     stages = [
         ('Original image',  'ORIGINAL',  [r_Z, r_Y, r_X]),
@@ -3915,7 +3989,7 @@ def view_processing_results(
 
     viewer_1 = None
     if ('NUCLEI' in stain_complete_df.index) or ('CYTOPLASM' in stain_complete_df.index):
-        viewer_1 = napari_module.Viewer(title="Segmentation and labeling stacks")
+        viewer_1 = napari_module.Viewer(title="Segmentation and labeling stacks")  # viewer_0 already opened above — no extra close needed
         for c in progress(range(len(stain_complete_df.index)), desc='Step 13B - Add Labels To Viewer 1'):
             idx = stain_complete_df.index[c]
             marker = stain_complete_df.loc[idx, 'Marker']
