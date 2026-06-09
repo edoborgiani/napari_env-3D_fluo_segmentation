@@ -2044,21 +2044,15 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
             elif cyto_avg.size > 0:
                 print(f"   Cytoplasm intensity:  {np.mean(cyto_avg):.2f} ± {np.mean(cyto_std):.2f} a.u.")
 
-        # Marker/aggregate size
+        # Marker/aggregate size and intensity
         msize = np.array(row["Marker size [um3]"], dtype=float)
+        avg_mi = np.array(row["Avg. marker intensity"], dtype=float)
+        std_mi = np.array(row["STD marker intensity"], dtype=float)
         if msize.size > 0:
-            print(f"   Marker size:          {np.mean(msize):.2f} ± {np.std(msize):.2f} um\u00b3"
-                  f"  |  median = {np.median(msize):.2f} um\u00b3")
-
-        # PCM compartment (if present)
-        pcm_s = np.array(row["Marker size PCM [um3]"], dtype=float)
-        pcm_avg = np.array(row["Avg. marker intensity PCM"], dtype=float)
-        pcm_std = np.array(row["STD marker intensity PCM"], dtype=float)
-        if pcm_s.size > 0:
-            pcm_line = f"   PCM size:            {np.mean(pcm_s):.2f} ± {np.std(pcm_s):.2f} um\u00b3"
-            if pcm_avg.size > 0:
-                pcm_line += f"   |  intensity: {np.mean(pcm_avg):.2f} ± {np.mean(pcm_std):.2f} a.u."
-            print(pcm_line)
+            marker_line = f"   Marker size:          {np.mean(msize):.2f} ± {np.std(msize):.2f} um\u00b3"
+            if avg_mi.size > 0:
+                marker_line += f"   |  intensity: {np.mean(avg_mi):.2f} ± {np.mean(std_mi):.2f} a.u."
+            print(marker_line)
 
     print("_" * 80)
 
