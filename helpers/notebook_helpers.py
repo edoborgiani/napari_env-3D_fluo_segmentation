@@ -4330,26 +4330,27 @@ def build_vtk_volumes(
             mesh_PCM.cell_data['X PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][2] * r_X / zoom_factors[2]
 
             for i, marker in enumerate(labels_full_df.index):
-                cond = labels_full_df['Condition'][i]
+                row = labels_full_df.iloc[i]
+                cond = row['Condition']
                 if cond in ('NUCLEI', 'CYTOPLASM') or np.size(marker) != 1:
                     continue
-                shared = list(labels_full_df['Shared labels'][i])
+                shared = list(row['Shared labels'])
                 if j in shared:
                     idx = shared.index(j)
-                    vol_um3 = labels_full_df['Marker size [um3]'][i][idx]
+                    vol_um3 = row['Marker size [um3]'][idx]
                     cyto_combined = (cyto_vol[k] + PCM_vol[k]) * voxel_scale
                     mesh_cyto.cell_data[marker + ' volume (um3)'] = np.ones(mesh_cyto.n_cells) * vol_um3
                     mesh_PCM.cell_data[marker + ' volume (um3)'] = np.ones(mesh_PCM.n_cells) * vol_um3
-                    mesh_cyto.cell_data[marker + ' volume cytoplasm (um3)'] = np.ones(mesh_cyto.n_cells) * labels_full_df['Marker size cytoplasm [um3]'][i][idx]
-                    mesh_PCM.cell_data[marker + ' volume PCM (um3)'] = np.ones(mesh_PCM.n_cells) * labels_full_df['Marker size PCM [um3]'][i][idx]
+                    mesh_cyto.cell_data[marker + ' volume cytoplasm (um3)'] = np.ones(mesh_cyto.n_cells) * row['Marker size cytoplasm [um3]'][idx]
+                    mesh_PCM.cell_data[marker + ' volume PCM (um3)'] = np.ones(mesh_PCM.n_cells) * row['Marker size PCM [um3]'][idx]
                     mesh_cyto.cell_data[marker + ' rel. vol. (-)'] = np.ones(mesh_cyto.n_cells) * (vol_um3 / cyto_combined)
                     mesh_PCM.cell_data[marker + ' rel. vol. (-)'] = np.ones(mesh_PCM.n_cells) * (vol_um3 / cyto_combined)
-                    mesh_cyto.cell_data[marker + ' rel. vol. cytoplasm (-)'] = np.ones(mesh_cyto.n_cells) * (labels_full_df['Marker size cytoplasm [um3]'][i][idx] / (cyto_vol[k] * voxel_scale))
-                    mesh_PCM.cell_data[marker + ' rel. vol. PCM (-)'] = np.ones(mesh_PCM.n_cells) * (labels_full_df['Marker size PCM [um3]'][i][idx] / (PCM_vol[k] * voxel_scale))
-                    mesh_cyto.cell_data[marker + ' avg. intensity (-)'] = np.ones(mesh_cyto.n_cells) * labels_full_df['Avg. marker intensity'][i][idx]
-                    mesh_PCM.cell_data[marker + ' avg. intensity (-)'] = np.ones(mesh_PCM.n_cells) * labels_full_df['Avg. marker intensity'][i][idx]
-                    mesh_cyto.cell_data[marker + ' avg. cytoplasm int. (-)'] = np.ones(mesh_cyto.n_cells) * labels_full_df['Avg. marker intensity cytoplasm'][i][idx]
-                    mesh_PCM.cell_data[marker + ' avg. PCM int. (-)'] = np.ones(mesh_PCM.n_cells) * labels_full_df['Avg. marker intensity PCM'][i][idx]
+                    mesh_cyto.cell_data[marker + ' rel. vol. cytoplasm (-)'] = np.ones(mesh_cyto.n_cells) * (row['Marker size cytoplasm [um3]'][idx] / (cyto_vol[k] * voxel_scale))
+                    mesh_PCM.cell_data[marker + ' rel. vol. PCM (-)'] = np.ones(mesh_PCM.n_cells) * (row['Marker size PCM [um3]'][idx] / (PCM_vol[k] * voxel_scale))
+                    mesh_cyto.cell_data[marker + ' avg. intensity (-)'] = np.ones(mesh_cyto.n_cells) * row['Avg. marker intensity'][idx]
+                    mesh_PCM.cell_data[marker + ' avg. intensity (-)'] = np.ones(mesh_PCM.n_cells) * row['Avg. marker intensity'][idx]
+                    mesh_cyto.cell_data[marker + ' avg. cytoplasm int. (-)'] = np.ones(mesh_cyto.n_cells) * row['Avg. marker intensity cytoplasm'][idx]
+                    mesh_PCM.cell_data[marker + ' avg. PCM int. (-)'] = np.ones(mesh_PCM.n_cells) * row['Avg. marker intensity PCM'][idx]
                 else:
                     mesh_cyto.cell_data[marker + ' expression (um3)'] = np.zeros(mesh_cyto.n_cells)
                     mesh_cyto.cell_data[marker + ' rel. expr. (-)'] = np.zeros(mesh_cyto.n_cells)
