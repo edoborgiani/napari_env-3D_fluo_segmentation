@@ -4401,13 +4401,14 @@ def export_marker_stl(
     for c, _marker in iter_:
         if stain_complete_df.index[c] in ('NUCLEI', 'CYTOPLASM', 'PCM'):
             continue
+        row = stain_complete_df.iloc[c]
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack[stain_df.index[c]] > 0))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
         _g2m_settings = mr.GridToMeshSettings()
         _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
-        mr.saveMesh(mesh_stl, str(_Path(input_file).stem) + "_" + stain_complete_df['Marker'][c] + "_mesh.stl")
+        mr.saveMesh(mesh_stl, str(_Path(input_file).stem) + "_" + row['Marker'] + "_mesh.stl")
 
 
 def export_fea_mesh(
