@@ -61,6 +61,7 @@ __all__ = [
     "napari_gamma",
     "napari_contrast_gamma_uint8",
     "normalize_image_channels",
+    "load_image_with_roi",
     "open_image_file",
     "plot_nucleus_kdes",
     "plot_size_distributions",
@@ -176,6 +177,14 @@ def open_image_file(input_file: str):
             "image will be loaded into memory even when big_image=True."
         )
         return _ND2ReaderFallback(input_file)
+
+
+def load_image_with_roi(input_file: str, roi_coords, big_image=True):
+    """Open a microscopy file and load the requested ROI in ZYXC order."""
+    meta = open_image_file(input_file)
+    image, _ = extract_roi_from_metadata(meta, roi_coords, big_image=big_image)
+    print(image.shape)
+    return meta, image
 
 
 def read_file_metadata(input_file: str, meta) -> dict:
