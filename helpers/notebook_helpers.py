@@ -4462,7 +4462,14 @@ def export_fea_mesh(
     outFaces = mrn.getNumpyFaces(mesh_stl.topology)
 
     tet = tetgen.TetGen(outVerts, outFaces)
-    nodes, elems = tet.tetrahedralize(order=1, mindihedral=20, minratio=1.5)
+    tet_result = tet.tetrahedralize(order=1, mindihedral=20, minratio=1.5)
+    if isinstance(tet_result, tuple):
+        if len(tet_result) >= 2:
+            nodes, elems = tet_result[0], tet_result[1]
+        else:
+            nodes, elems = tet.node, tet.elem
+    else:
+        nodes, elems = tet.node, tet.elem
     tet.write('FE_segmentation_full.vtk', binary=False)
 
     meshel = meshio.read('FE_segmentation_full.vtk')
