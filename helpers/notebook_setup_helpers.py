@@ -184,5 +184,4 @@ def load_nuclei_notebook_setup(enable_napari_interactive: bool = True) -> dict[s
     )
     imported["cv2"] = cv2
     imported["tqdm"] = importlib.import_module("tqdm.auto").tqdm
-    imported["step_progress"] = imported["tqdm"]
     return imported
