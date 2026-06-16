@@ -1558,7 +1558,7 @@ def export_channel_histograms(
         Key-value pairs of image processing parameters to record on the
         Parameters sheet (e.g. {'sigma': 0.5, 'threshold_method': 'otsu'}).
     progress : callable, optional
-        Progress wrapper (e.g. step_progress).
+        Progress wrapper (e.g. tqdm).
 
     Returns
     -------
@@ -3512,7 +3512,7 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
     napari_module : module
         The imported ``napari`` module.
     progress : callable, optional
-        A ``tqdm``-compatible progress wrapper (e.g. ``step_progress``).
+        A ``tqdm``-compatible progress wrapper (e.g. ``tqdm``).
 
     Returns
     -------
@@ -3576,7 +3576,7 @@ def apply_threshold_per_channel(
         One of 'otsu' (default), 'median', or 'huang'. The Sauvola local threshold
         and statistical background component are always applied regardless of this choice.
     progress : callable, optional
-        Progress wrapper (e.g. step_progress).
+        Progress wrapper (e.g. tqdm).
 
     Returns
     -------
@@ -3714,7 +3714,7 @@ def segment_nuclei(
     trig_stardist : bool
         If True, use StarDist; otherwise use watershed.
     progress : callable, optional
-        Progress wrapper (e.g. step_progress).
+        Progress wrapper (e.g. tqdm).
 
     Returns
     -------
