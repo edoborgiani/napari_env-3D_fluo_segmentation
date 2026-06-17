@@ -13,7 +13,8 @@ simpleitk
 csbdeep
 stardist
 meshio
-tetgen
+tetgen<0.7; python_version < "3.10"
+tetgen>=0.7; python_version >= "3.10"
 meshlib
 pandas
 vispy

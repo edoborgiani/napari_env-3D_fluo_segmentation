@@ -19,9 +19,17 @@ DEFAULT_PIP_PACKAGES = [
 ]
 
 
+def get_tetgen_requirement() -> str:
+    """Return a tetgen requirement compatible with the current Python version."""
+    if sys.version_info < (3, 10):
+        return "tetgen<0.7"
+    return "tetgen>=0.7"
+
+
 def install_required_packages(extra_packages: list[str] | None = None) -> None:
     """Install required notebook packages with the active Python executable."""
     packages = list(DEFAULT_PIP_PACKAGES)
+    packages.append(get_tetgen_requirement())
     if extra_packages:
         packages.extend(extra_packages)
 
