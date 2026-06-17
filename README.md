@@ -1,4 +1,4 @@
-﻿# 3D Fluorescence Segmentation with Napari
+# 3D Fluorescence Segmentation with Napari
 
 This repository provides Jupyter notebooks and shared Python helpers for 3D segmentation and quantification of nuclei and fluorescence structures in microscopy images, using the Napari ecosystem. It targets researchers in bioimage analysis who need robust, reproducible workflows for volumetric fluorescence data.
 
@@ -31,6 +31,8 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 
 ## Getting Started
 
+### Windows
+
 1. **Clone the repository**
    ```powershell
    git clone https://github.com/edoborgiani/napari_env-3D_fluo_segmentation.git
@@ -53,6 +55,76 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    jupyter notebook
    ```
    Open `Fluo_3D_nuc_seg_v1.5.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.1.ipynb` for Live/Dead segmentation.
+
+---
+
+### macOS
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/edoborgiani/napari_env-3D_fluo_segmentation.git
+   cd napari_env-3D_fluo_segmentation
+   ```
+
+2. **Create a virtual environment** (recommended)
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Launch Jupyter**
+   ```bash
+   jupyter notebook
+   ```
+   Open `Fluo_3D_nuc_seg_v1.5.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.1.ipynb` for Live/Dead segmentation.
+
+> **Note (Apple Silicon — M1/M2/M3):** If step 3 fails with build errors for packages like `tetgen` or `meshlib`, your Mac's ARM architecture is likely the cause. In that case, skip steps 2–3 above and use [Miniforge](https://github.com/conda-forge/miniforge) to create a conda environment instead:
+> ```bash
+> conda create -n napari-fluo python=3.10
+> conda activate napari-fluo
+> pip install -r requirements.txt
+> ```
+> Then proceed directly to step 4.
+
+---
+
+### Linux
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/edoborgiani/napari_env-3D_fluo_segmentation.git
+   cd napari_env-3D_fluo_segmentation
+   ```
+
+2. **Create a virtual environment** (recommended)
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Launch Jupyter**
+   ```bash
+   jupyter notebook
+   ```
+   Open `Fluo_3D_nuc_seg_v1.5.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.1.ipynb` for Live/Dead segmentation.
+
+> **Note (Headless servers only):** If you are running on a remote Linux server without a physical display (e.g. an HPC cluster accessed via SSH), Napari's Qt backend will fail to open. Run the following commands **before step 4** to start a virtual framebuffer:
+> ```bash
+> sudo apt-get install libxcb-xinerama0 xvfb
+> export DISPLAY=:99
+> Xvfb :99 -screen 0 1024x768x24 &
+> ```
+> This is not needed on a standard desktop Linux installation.
 
 ## Usage
 
