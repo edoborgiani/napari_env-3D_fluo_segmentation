@@ -1,4 +1,4 @@
-napari[all]
+﻿napari[all]
 numpy
 scipy
 scikit-image
@@ -10,6 +10,7 @@ nd2reader
 xlsxwriter
 pyvista
 simpleitk
+tensorflow>=2.16,<2.17
 csbdeep
 stardist
 meshio
