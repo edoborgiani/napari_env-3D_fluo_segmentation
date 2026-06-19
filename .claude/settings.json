@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"c:\\\\Usersķ011\\\\Documents\\\\Github\\\\napari_env-3D_fluo_segmentation\\\\\")",
+      "Read(//c/Usersķ011/Documents/Github/**)"
+    ]
+  }
+}
