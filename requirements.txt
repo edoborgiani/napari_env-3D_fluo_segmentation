@@ -8,7 +8,7 @@ opencv-python
 aicsimageio[nd2]
 nd2reader
 xlsxwriter
-pyvista
+pyvista>=0.43
 simpleitk
 tensorflow>=2.16,<2.17
 csbdeep
