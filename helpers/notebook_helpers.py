@@ -2505,16 +2505,6 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
     x_grid = _context("x_grid")
     styles = globals().get("styles") or getSampleStyleSheet()
 
-    # Compute column geometry from the page so images never overflow their cells.
-    # SimpleDocTemplate default left/right margins are 1 inch each.
-    _cell_pad = 4  # points of left/right padding per cell
-    _left_margin = _right_margin = inch
-    _page_w, _ = A4
-    _usable_w = _page_w - _left_margin - _right_margin  # points
-    _n_cols = len(marker_conditions) + 1  # one column per channel + merged
-    _col_w = _usable_w / _n_cols          # column width in points
-    _img_w = _col_w - 2 * _cell_pad       # image width (leaves gap between images)
-
     doc = SimpleDocTemplate(output_pdf, pagesize=A4)
     story = []
     nuclei = sorted(hist_data.keys())
@@ -2523,6 +2513,15 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
 
     all_conditions = sorted({condition for nucleus_data in hist_data.values() for condition in nucleus_data.keys()})
     marker_conditions = [condition for condition in all_conditions if condition.lower() != "nuclei"]
+
+    # Compute column geometry from the page so images never overflow their cells.
+    _cell_pad = 4
+    _left_margin = _right_margin = inch
+    _page_w, _ = A4
+    _usable_w = _page_w - _left_margin - _right_margin
+    _n_cols = len(marker_conditions) + 1
+    _col_w = _usable_w / _n_cols
+    _img_w = _col_w - 2 * _cell_pad
     condition_colors = {
         condition: (
             stain_complete_df.loc[condition, "Color"]
