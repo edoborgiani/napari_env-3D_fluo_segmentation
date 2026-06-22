@@ -2124,6 +2124,15 @@ def build_histogram_report(
         progress=progress,
     )
 
+    set_notebook_context(
+        seg_stack=im_segmentation_stack,
+        filtered_img=filtered_img,
+        hist_data=hist_data,
+        x_grid=x_grid,
+        stain_complete_df=stain_complete_df,
+        stain_df=stain_df,
+    )
+
     output_pdf = str(_Path(input_file).stem) + "_nuclei_marker.pdf"
     create_row_pdf(
         output_pdf=output_pdf,
