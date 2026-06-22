@@ -1,4 +1,4 @@
-from collections import defaultdict
+﻿from collections import defaultdict
 import os
 
 import cv2
@@ -2105,6 +2105,7 @@ def build_histogram_report(
 ):
     """Collect histogram data, plot KDEs, and generate the per-nucleus PDF report."""
     from reportlab.lib.units import inch
+    from pathlib import Path as _Path
 
     if thumb_size is None:
         thumb_size = (2.0 * inch, 2.0 * inch)
@@ -2123,7 +2124,7 @@ def build_histogram_report(
         progress=progress,
     )
 
-    output_pdf = str(Path(input_file).stem) + "_nuclei_marker.pdf"
+    output_pdf = str(_Path(input_file).stem) + "_nuclei_marker.pdf"
     create_row_pdf(
         output_pdf=output_pdf,
         pad=pad,
