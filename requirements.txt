@@ -5,7 +5,7 @@ scikit-image
 matplotlib
 jupyter
 opencv-python
-aicsimageio[nd2]
+aicsimageio[nd2]>=4.0
 nd2reader
 xlsxwriter
 pyvista>=0.43
