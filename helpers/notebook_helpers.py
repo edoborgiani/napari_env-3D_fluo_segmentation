@@ -2990,7 +2990,7 @@ def segment_nuclei_watershed(
         er_y_i = max(1, int(shrink_um / r_zY))
         er_x_i = max(1, int(shrink_um / r_zX))
         erosion_fp_i = make_anisotropic_footprint(er_z_i, er_y_i, er_x_i)
-        eroded_i = morphology.binary_erosion(binary_mask, footprint=erosion_fp_i)
+        eroded_i = morphology.erosion(binary_mask, footprint=erosion_fp_i)
         erosion_triplets.append((er_z_i, er_y_i, er_x_i))
 
         if not np.any(eroded_i):
@@ -3038,7 +3038,7 @@ def segment_nuclei_watershed(
             er_y_r = max(1, er_y_i // 2)
             er_x_r = max(1, er_x_i // 2)
             erosion_fp_r = make_anisotropic_footprint(er_z_r, er_y_r, er_x_r)
-            eroded_r = morphology.binary_erosion(binary_mask, footprint=erosion_fp_r)
+            eroded_r = morphology.erosion(binary_mask, footprint=erosion_fp_r)
             if not np.any(eroded_r):
                 continue
             mk_r, num_r = ndi.label(eroded_r)
@@ -3740,16 +3740,50 @@ def segment_nuclei(
     im_segmentation_stack = {}
 
     if 'NUCLEI' not in stain_df.index:
-        # LD-style fallback: union all threshold channels, label connected components.
+        # LD-style: union all threshold channels, then apply watershed splitting
+        # to separate touching/overlapping cells.
         im_in = im_final_stack['Threshold image'].copy()
-        im_thresh = np.zeros(im_in.shape[:3], dtype=np.int32)
+        im_thresh = np.zeros(im_in.shape[:3], dtype=bool)
         for c in range(im_in.shape[3]):
-            im_thresh = im_thresh | (im_in[:, :, :, c] > 0).astype(np.int32)
-        im_out = skimage_label(im_thresh)
+            im_thresh = im_thresh | (im_in[:, :, :, c] > 0)
+
+        split_cfg = dict(nuclei_split_config)
+        im_out, debug_info = segment_nuclei_watershed(
+            binary_mask=im_thresh,
+            r_zX=r_zX,
+            r_zY=r_zY,
+            r_zZ=r_zZ,
+            nuclei_diameter=nuclei_diameter,
+            **split_cfg,
+        )
+
+        erosion_triplets = debug_info['erosion_triplets']
+        er_z = [e[0] for e in erosion_triplets] if erosion_triplets else [1]
+        er_y = [e[1] for e in erosion_triplets] if erosion_triplets else [1]
+        er_x = [e[2] for e in erosion_triplets] if erosion_triplets else [1]
+
+        print(
+            f"LD mode: {int(im_out.max())} cells segmented "
+            f"(shrink_factor={split_cfg['nuclei_bridge_shrink_factor']}, "
+            f"diameter_range=[{debug_info['dmin']:.2f},{debug_info['dmax']:.2f}]x, "
+            f"scales={debug_info['n_scales']}, "
+            f"scales_with_seeds={debug_info['scales_with_seeds']}, "
+            f"peak_seeds={debug_info['added_peak_seed_count']}, "
+            f"z_anisotropy={debug_info['z_anisotropy']:.2f}, "
+            f"z_weight={debug_info['z_split_weight']:.2f}, "
+            f"erosion Z={min(er_z)}-{max(er_z)} "
+            f"Y={min(er_y)}-{max(er_y)} "
+            f"X={min(er_x)}-{max(er_x)} vox, "
+            f"min_seed_vox={debug_info['min_seed_vox']} (boundary=3), "
+            f"boundary_components={len(debug_info['boundary_components'])}, "
+            f"added_component_seeds={debug_info['added_seed_count']}, "
+            f"restored_isolated_voxels={debug_info['restored_isolated_count']}, "
+            f"removed_by_roundness={debug_info['removed_by_roundness']})"
+        )
+
         im_segmentation_stack['Nuclei'] = im_out
         im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
         im_segmentation_stack['PCM'] = np.zeros_like(im_out)
-        print(f"LD mode: {int(im_out.max())} cells segmented from combined binary mask.")
         return im_segmentation_stack
 
     im_in = im_final_stack['Threshold image'].copy()
@@ -3767,7 +3801,7 @@ def segment_nuclei(
                 voxel_size=(r_zZ, r_zY, r_zX),
             )
             im_mask = transl > 0
-            im_mask = morphology.binary_erosion(
+            im_mask = morphology.erosion(
                 im_mask, footprint=np.ones((2, 2, 2))
             ).astype(im_mask.dtype)
             im_out, _ = skimage_label((transl * im_mask) > 0, return_num=True)
