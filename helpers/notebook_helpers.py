@@ -4092,6 +4092,16 @@ def view_processing_results(
     viewer_1 = None
     if ('NUCLEI' in stain_complete_df.index) or ('CYTOPLASM' in stain_complete_df.index):
         viewer_1 = napari_module.Viewer(title="Segmentation and labeling stacks")  # viewer_0 already opened above — no extra close needed
+        eq_img = im_final_stack['Equalized image']
+        for c in range(eq_img.shape[3]):
+            idx = stain_df.index[c]
+            marker = stain_df.loc[idx, 'Marker']
+            color = stain_df['Color'].iloc[c]
+            viewer_1.add_image(
+                eq_img[:, :, :, c],
+                name=f'EQ {idx} ({marker})', colormap=color,
+                blending='additive', scale=scale_zoom,
+            )
         for c in progress(range(len(stain_complete_df.index)), desc='Step 13B - Add Labels To Viewer 1'):
             idx = stain_complete_df.index[c]
             marker = stain_complete_df.loc[idx, 'Marker']
