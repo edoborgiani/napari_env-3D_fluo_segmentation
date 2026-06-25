@@ -3132,9 +3132,13 @@ def segment_nuclei_watershed(
             for val in cc_vals:
                 preserve_labels.add(int(val))
 
+    full_nucleus_vol_um3 = (4.0 * np.pi * ((nuclei_diameter / 2.0) ** 3)) / 3.0
+    min_cell_vox = max(8, int(0.3 * full_nucleus_vol_um3 / voxel_um3))
+
     im_out_before_cleanup = im_out.copy()
     _, im_out = remove_small_island_labels(
-        im_out, connectivity=1, size_ratio_thresh=0.5
+        im_out, connectivity=1, size_ratio_thresh=0.5,
+        min_cell_size=min_cell_vox,
     )
 
     restored_isolated_count = 0
@@ -3164,6 +3168,7 @@ def segment_nuclei_watershed(
         'dmax': dmax,
         'n_scales': n_scales,
         'min_seed_vox': min_seed_vox,
+        'min_cell_vox': min_cell_vox,
         'nuclei_min_roundness': float(max(0.0, nuclei_min_roundness)),
         'removed_by_roundness': removed_by_roundness,
     }
@@ -3679,6 +3684,25 @@ def apply_threshold_per_channel(
             0.15 * global_thr_value
         )
 
+        # Oversaturation correction: when many voxels are near the max
+        # intensity, the halo around bright objects is also bright and passes
+        # normal thresholds.  Detect this and raise the threshold floor so
+        # only genuinely bright tissue is kept.
+        if non_zero.size > 0:
+            max_val = float(arr.max())
+            saturation_level = max_val * 0.97
+            saturated_count = int(np.sum(non_zero >= saturation_level))
+            saturated_fraction = saturated_count / non_zero.size
+            if saturated_fraction > 0.01:
+                sat_pct = min(95.0, 75.0 + saturated_fraction * 500.0)
+                saturation_floor = float(np.percentile(non_zero, sat_pct))
+                final_thr = np.maximum(final_thr, saturation_floor)
+                print(
+                    f"  ch {c}: oversaturation detected "
+                    f"({saturated_fraction * 100:.1f}% near-max), "
+                    f"threshold floor raised to P{sat_pct:.0f}={saturation_floor:.1f}"
+                )
+
         # Gain-based primary mask and rescue
         gain = arr / (bg_mean + 1e-6)
         primary = (arr > final_thr) & (gain > gain_ass)
@@ -3774,7 +3798,8 @@ def segment_nuclei(
             f"erosion Z={min(er_z)}-{max(er_z)} "
             f"Y={min(er_y)}-{max(er_y)} "
             f"X={min(er_x)}-{max(er_x)} vox, "
-            f"min_seed_vox={debug_info['min_seed_vox']} (boundary=3), "
+            f"min_seed_vox={debug_info['min_seed_vox']}, "
+            f"min_cell_vox={debug_info['min_cell_vox']}, "
             f"boundary_components={len(debug_info['boundary_components'])}, "
             f"added_component_seeds={debug_info['added_seed_count']}, "
             f"restored_isolated_voxels={debug_info['restored_isolated_count']}, "
@@ -3834,7 +3859,8 @@ def segment_nuclei(
                 f"erosion Z={min(er_z)}-{max(er_z)} "
                 f"Y={min(er_y)}-{max(er_y)} "
                 f"X={min(er_x)}-{max(er_x)} vox, "
-                f"min_seed_vox={debug_info['min_seed_vox']} (boundary=3), "
+                f"min_seed_vox={debug_info['min_seed_vox']}, "
+                f"min_cell_vox={debug_info['min_cell_vox']}, "
                 f"boundary_components={len(debug_info['boundary_components'])}, "
                 f"added_component_seeds={debug_info['added_seed_count']}, "
                 f"restored_isolated_voxels={debug_info['restored_isolated_count']}, "
