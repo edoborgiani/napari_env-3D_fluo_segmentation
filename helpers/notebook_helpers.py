@@ -61,12 +61,15 @@ __all__ = [
     "napari_gamma",
     "napari_contrast_gamma_uint8",
     "normalize_image_channels",
+    "initialize_dataset",
+    "load_image_and_metadata",
     "load_image_with_roi",
     "open_image_file",
     "plot_nucleus_kdes",
     "plot_size_distributions",
     "plot_spatial_distributions",
     "build_stain_dataframe",
+    "prepare_and_preview",
     "prepare_image_stack",
     "prepare_stain_settings",
     "view_original_channels",
@@ -90,7 +93,20 @@ __all__ = [
     "truncate_cell",
     "voxel_volume",
     "watershed_nuclei",
+    "reload_helpers",
 ]
+
+
+def reload_helpers():
+    """Reload this module and re-import all public names into the caller's globals."""
+    import importlib
+    import helpers.notebook_helpers as _mod
+    importlib.reload(_mod)
+    import sys
+    caller_globals = sys._getframe(1).f_globals
+    for name in _mod.__all__:
+        caller_globals[name] = getattr(_mod, name)
+    print("Helper functions loaded from helpers/notebook_helpers.py")
 
 
 class _ND2ReaderFallback:
@@ -185,6 +201,106 @@ def load_image_with_roi(input_file: str, roi_coords, big_image=True):
     image, _ = extract_roi_from_metadata(meta, roi_coords, big_image=big_image)
     print(image.shape)
     return meta, image
+
+
+def load_image_and_metadata(input_file, roi_coords, big_image=True):
+    """Load image with ROI, read voxel sizes and file metadata.
+
+    Combines ``load_image_with_roi`` and ``read_file_metadata`` into a
+    single call so the notebook cell stays clean.
+
+    Returns
+    -------
+    meta : AICSImage
+    img : ndarray (Z, Y, X, C)
+    r_X, r_Y, r_Z : float
+        Physical voxel sizes in micrometers.
+    file_meta : dict
+        Keys ``'date'`` and ``'channels'``.
+    ROI_print : list
+        Copy of the ROI coordinates for display in reports.
+    """
+    ROI_print = list(roi_coords)
+    meta, img = load_image_with_roi(input_file, roi_coords, big_image=big_image)
+    r_X = meta.physical_pixel_sizes.X
+    r_Y = meta.physical_pixel_sizes.Y
+    r_Z = meta.physical_pixel_sizes.Z
+    file_meta = read_file_metadata(input_file, meta)
+    print(f"Voxel size: [{r_X}, {r_Y}, {r_Z}] um")
+    print(f"Date: {file_meta['date']}")
+    print(f"Channels: {file_meta['channels']}")
+    return meta, img, r_X, r_Y, r_Z, file_meta, ROI_print
+
+
+def initialize_dataset(input_file, roi_coords, big_image=True,
+                       nuclei_diameter=10.0, cell_diameter=30.0,
+                       scale_factor=1.0, zoom_factors=None):
+    """Load image, read metadata, and compute derived parameters.
+
+    Wraps ``load_image_and_metadata`` and adds expansion-factor and
+    zoom-factor computation so the notebook cell is a single call.
+
+    Parameters
+    ----------
+    input_file : str
+        Path to the microscopy file.
+    roi_coords : list of 6 ints
+        [x0, x1, y0, y1, z0, z1].
+    big_image : bool
+        If True, use lazy/dask loading with ROI.
+    nuclei_diameter, cell_diameter : float
+        Approximate diameters in micrometers.
+    scale_factor : float
+        Extra manual resolution scaling (default 1.0).
+    zoom_factors : list of 3 floats or None
+        Base [Z, Y, X] zoom factors (default [1, 1, 1]).
+
+    Returns
+    -------
+    meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
+    cyto_factor, PCM_factor, zoom_factors
+    """
+    if zoom_factors is None:
+        zoom_factors = [1.0, 1.0, 1.0]
+
+    meta, img, r_X, r_Y, r_Z, file_meta, ROI_print = load_image_and_metadata(
+        input_file, roi_coords, big_image=big_image,
+    )
+
+    cyto_factor = int(np.round(cell_diameter / nuclei_diameter))
+    PCM_factor = int(cyto_factor * 1.1)
+    if PCM_factor == cyto_factor:
+        PCM_factor += 1
+
+    zoom_factors = [x * scale_factor for x in zoom_factors]
+
+    return (meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
+            cyto_factor, PCM_factor, zoom_factors)
+
+
+def prepare_and_preview(img, meta, ROI, big_image,
+                        nuclei_diameter, cell_diameter,
+                        stain_dict, file_meta,
+                        napari_module, progress=None):
+    """Prepare image stack, build stain table, and open napari preview.
+
+    Combines ``prepare_image_stack``, ``build_stain_dataframe``, and
+    ``view_original_channels`` into a single call.
+
+    Returns
+    -------
+    im_final_stack : dict
+    nuclei_radius, cell_radius, nuclei_volume, cell_volume : float
+    stain_df : DataFrame
+    viewer : napari.Viewer
+    """
+    im_final_stack, nuclei_radius, cell_radius, nuclei_volume, cell_volume = (
+        prepare_image_stack(img, meta, ROI, big_image, nuclei_diameter, cell_diameter)
+    )
+    stain_df = build_stain_dataframe(stain_dict, file_meta)
+    viewer = view_original_channels(im_final_stack, stain_df, napari_module, progress=progress)
+    return (im_final_stack, nuclei_radius, cell_radius, nuclei_volume, cell_volume,
+            stain_df, viewer)
 
 
 def read_file_metadata(input_file: str, meta) -> dict:
@@ -380,6 +496,7 @@ def get_nuclei_split_config(profile="aggressive", **overrides):
         "nuclei_split_diameter_scales": 3,
         "nuclei_seed_min_fraction": 0.03,
         "nuclei_min_roundness": 0.45,
+        "z_split_aggressive": False,
     }
     config.update(overrides)
     return config
@@ -2801,6 +2918,333 @@ def detect_peaks_xy_with_best_z(
     return peak_coords_3d
 
 
+def _split_labels_by_z_consistency(label_img, min_fragment_vox=8,
+                                   aggressive=False):
+    """Split labels whose voxels form multiple disconnected 3D regions.
+
+    Two modes are available, selected by *aggressive*:
+
+    **topology** (``aggressive=False``, default) — only true spatial
+    disconnections in the z-stack cause a split.  Slice-by-slice 2D
+    connected-component tracking links overlapping components across
+    adjacent z-slices; each independently connected group becomes its
+    own label.  Fast and conservative.
+
+    **watershed** (``aggressive=True``) — if a label has multiple
+    significant 2D components at ANY z-slice, a local 3D watershed
+    splits it along the natural constriction, even when the components
+    reconnect at other z-levels.  Slower and more aggressive.
+
+    Parameters
+    ----------
+    label_img : ndarray (Z, Y, X), int
+        Integer label volume (0 = background).
+    min_fragment_vox : int
+        Groups / fragments smaller than this are absorbed back into the
+        largest piece rather than becoming a new label.
+    aggressive : bool
+        If False use topology-only splitting; if True use watershed
+        reinforced splitting.
+
+    Returns
+    -------
+    out : ndarray (Z, Y, X), int
+        Updated label volume with split labels.
+    total_splits : int
+        Number of new labels created.
+    """
+    if aggressive:
+        return _split_z_watershed(label_img, min_fragment_vox)
+    return _split_z_topology(label_img, min_fragment_vox)
+
+
+def _split_z_topology(label_img, min_fragment_vox, min_z_overlap=2):
+    """Topology-only z-split: union-find across adjacent z-slices.
+
+    Uses 4-connectivity within each XY slice so that even a 1-pixel
+    diagonal gap counts as a disconnection.  Two components in adjacent
+    z-slices are linked only when they share at least *min_z_overlap*
+    pixels, so a thin 1-pixel bridge across z is not enough to keep
+    two nuclei merged.
+
+    Parameters
+    ----------
+    label_img : ndarray (Z, Y, X), int
+    min_fragment_vox : int
+    min_z_overlap : int
+        Minimum number of overlapping pixels between components in
+        adjacent z-slices to consider them connected (default 2).
+    """
+    from scipy import ndimage as ndi
+
+    out = np.asarray(label_img).copy()
+    current_labels = np.unique(out)
+    current_labels = current_labels[current_labels > 0]
+    next_label = int(out.max()) + 1
+    total_splits = 0
+
+    for label_id in current_labels:
+        label_mask = out == label_id
+        z_slices = np.where(np.any(label_mask, axis=(1, 2)))[0]
+        if len(z_slices) <= 1:
+            continue
+
+        slice_components = {}
+        nodes = []
+        node_index = {}
+        for z in z_slices:
+            labeled_2d, num = ndi.label(label_mask[z])
+            slice_components[z] = labeled_2d
+            for c in range(1, num + 1):
+                idx = len(nodes)
+                nodes.append((z, c))
+                node_index[(z, c)] = idx
+
+        if len(nodes) <= 1:
+            continue
+
+        parent = list(range(len(nodes)))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            a, b = find(a), find(b)
+            if a != b:
+                parent[b] = a
+
+        for i in range(len(z_slices) - 1):
+            z_curr = z_slices[i]
+            z_next = z_slices[i + 1]
+            if z_next != z_curr + 1:
+                continue
+            lab_curr = slice_components[z_curr]
+            lab_next = slice_components[z_next]
+            num_curr = int(lab_curr.max())
+            num_next = int(lab_next.max())
+            for c1 in range(1, num_curr + 1):
+                mask_c1 = lab_curr == c1
+                for c2 in range(1, num_next + 1):
+                    overlap = int(np.count_nonzero(mask_c1 & (lab_next == c2)))
+                    if overlap >= min_z_overlap:
+                        union(node_index[(z_curr, c1)],
+                              node_index[(z_next, c2)])
+
+        groups = {}
+        for idx_n, (z, c) in enumerate(nodes):
+            groups.setdefault(find(idx_n), []).append((z, c))
+
+        if len(groups) <= 1:
+            continue
+
+        group_sizes = {}
+        for root, members in groups.items():
+            size = 0
+            for z, c in members:
+                size += int(np.count_nonzero(slice_components[z] == c))
+            group_sizes[root] = size
+
+        largest_root = max(group_sizes, key=group_sizes.get)
+
+        for root, members in groups.items():
+            if root == largest_root:
+                continue
+            if group_sizes[root] < min_fragment_vox:
+                continue
+            new_label = next_label
+            next_label += 1
+            total_splits += 1
+            for z, c in members:
+                out[z][slice_components[z] == c] = new_label
+
+    return out, total_splits
+
+
+def _split_z_watershed(label_img, min_fragment_vox):
+    """Watershed-reinforced z-split: any z with multiple significant 2D
+    components seeds a local watershed that carves the full 3D label."""
+    from scipy import ndimage as ndi
+    from skimage.segmentation import watershed
+
+    out = np.asarray(label_img).copy()
+    next_label = int(out.max()) + 1
+    total_splits = 0
+    min_component_area_2d = max(4, min_fragment_vox // 2)
+
+    for _pass in range(3):
+        current_labels = np.unique(out)
+        current_labels = current_labels[current_labels > 0]
+        pass_splits = 0
+
+        for label_id in current_labels:
+            label_mask = out == label_id
+            z_slices = np.where(np.any(label_mask, axis=(1, 2)))[0]
+            if len(z_slices) <= 1:
+                continue
+
+            best_z = None
+            best_num_significant = 1
+            for z in z_slices:
+                labeled_2d_z, num_z = ndi.label(label_mask[z])
+                if num_z <= best_num_significant:
+                    continue
+                sizes_z = np.bincount(labeled_2d_z.ravel())[1:]
+                n_significant = int(np.sum(sizes_z >= min_component_area_2d))
+                if n_significant > best_num_significant:
+                    best_num_significant = n_significant
+                    best_z = z
+
+            if best_z is None:
+                continue
+
+            labeled_2d, num_components = ndi.label(label_mask[best_z])
+            comp_sizes = np.bincount(labeled_2d.ravel())
+            valid_components = [
+                c for c in range(1, num_components + 1)
+                if comp_sizes[c] >= min_component_area_2d
+            ]
+
+            if len(valid_components) <= 1:
+                continue
+
+            markers = np.zeros_like(label_mask, dtype=np.int32)
+            for i, c in enumerate(valid_components, start=1):
+                markers[best_z][labeled_2d == c] = i
+
+            distance = ndi.distance_transform_edt(label_mask)
+            sub_labels = watershed(-distance, markers, mask=label_mask)
+
+            ws_sizes = np.bincount(sub_labels.ravel(),
+                                   minlength=len(valid_components) + 1)
+            largest_sid = int(np.argmax(ws_sizes[1:]) + 1)
+
+            for sid in range(1, len(valid_components) + 1):
+                if sid == largest_sid:
+                    continue
+                if ws_sizes[sid] < min_fragment_vox:
+                    continue
+                out[sub_labels == sid] = next_label
+                next_label += 1
+                pass_splits += 1
+
+        total_splits += pass_splits
+        if pass_splits == 0:
+            break
+
+    return out, total_splits
+
+
+def _merge_labels_by_z_consistency(label_img):
+    """Merge adjacent labels that together form a z-consistent object.
+
+    If two neighbouring labels, when combined, produce exactly one
+    connected 2D component (8-connectivity) at every z-slice, they were
+    over-split and should be a single nucleus.
+
+    Uses union-find to batch all valid merges in one pass, then repeats
+    (at most twice) in case merges reveal new adjacencies.
+
+    Parameters
+    ----------
+    label_img : ndarray (Z, Y, X), int
+        Integer label volume (0 = background).
+
+    Returns
+    -------
+    out : ndarray (Z, Y, X), int
+        Updated label volume with merged labels.
+    total_merges : int
+        Number of merges performed.
+    """
+    from scipy import ndimage as ndi
+
+    out = np.asarray(label_img).copy()
+    struct_2d = np.ones((3, 3), dtype=int)
+
+    def _adjacent_pairs_fast(labels):
+        pairs = set()
+        max_l = int(labels.max()) + 1
+        for axis in range(3):
+            slc_a = [slice(None)] * 3
+            slc_b = [slice(None)] * 3
+            slc_a[axis] = slice(1, None)
+            slc_b[axis] = slice(None, -1)
+            l1 = labels[tuple(slc_a)]
+            l2 = labels[tuple(slc_b)]
+            mask = (l1 > 0) & (l2 > 0) & (l1 != l2)
+            if not np.any(mask):
+                continue
+            a_vals = l1[mask].ravel().astype(np.int64)
+            b_vals = l2[mask].ravel().astype(np.int64)
+            lo = np.minimum(a_vals, b_vals)
+            hi = np.maximum(a_vals, b_vals)
+            for code in np.unique(lo * max_l + hi):
+                pairs.add((int(code // max_l), int(code % max_l)))
+        return pairs
+
+    def _is_z_consistent_pair(labels, a, b):
+        mask_a = labels == a
+        mask_b = labels == b
+        zs_a = set(np.where(np.any(mask_a, axis=(1, 2)))[0])
+        zs_b = set(np.where(np.any(mask_b, axis=(1, 2)))[0])
+        for z in zs_a | zs_b:
+            combined_z = mask_a[z] | mask_b[z]
+            _, num = ndi.label(combined_z, structure=struct_2d)
+            if num > 1:
+                return False
+        return True
+
+    total_merges = 0
+
+    for _pass in range(3):
+        pairs = _adjacent_pairs_fast(out)
+        if not pairs:
+            break
+
+        uf_parent = {}
+        def _find(x):
+            while uf_parent.setdefault(x, x) != x:
+                uf_parent[x] = uf_parent[uf_parent[x]]
+                x = uf_parent[x]
+            return x
+        def _union(x, y):
+            rx, ry = _find(x), _find(y)
+            if rx != ry:
+                uf_parent[ry] = rx
+
+        pass_merges = 0
+        for a, b in pairs:
+            if _find(a) == _find(b):
+                continue
+            if _is_z_consistent_pair(out, a, b):
+                _union(a, b)
+                pass_merges += 1
+
+        if pass_merges == 0:
+            break
+
+        remap = {}
+        for lbl in np.unique(out):
+            if lbl <= 0:
+                continue
+            root = _find(int(lbl))
+            if root != int(lbl):
+                remap[int(lbl)] = root
+
+        if remap:
+            lut = np.arange(int(out.max()) + 1, dtype=out.dtype)
+            for old, new in remap.items():
+                lut[old] = new
+            out = lut[out]
+
+        total_merges += pass_merges
+
+    return out, total_merges
+
+
 def _filter_labels_by_roundness_xy(label_img, min_roundness):
     """Remove 3D labels whose largest XY slice is less circular than threshold."""
     threshold = max(0.0, float(min_roundness))
@@ -2853,6 +3297,7 @@ def segment_nuclei_watershed(
     nuclei_split_diameter_scales=3,
     nuclei_seed_min_fraction=0.03,
     nuclei_min_roundness=0.45,
+    z_split_aggressive=False,
 ):
     """
     Segment nuclei using watershed with multi-scale erosion and EDT peak fallback.
@@ -3153,6 +3598,13 @@ def segment_nuclei_watershed(
         nuclei_min_roundness,
     )
 
+    im_out, z_consistency_splits = _split_labels_by_z_consistency(
+        im_out, min_fragment_vox=min_seed_vox,
+        aggressive=z_split_aggressive,
+    )
+
+    im_out, z_consistency_merges = _merge_labels_by_z_consistency(im_out)
+
     im_out, _, _ = relabel_sequential(im_out)
 
     debug_info = {
@@ -3171,6 +3623,8 @@ def segment_nuclei_watershed(
         'min_cell_vox': min_cell_vox,
         'nuclei_min_roundness': float(max(0.0, nuclei_min_roundness)),
         'removed_by_roundness': removed_by_roundness,
+        'z_consistency_splits': z_consistency_splits,
+        'z_consistency_merges': z_consistency_merges,
     }
 
     return im_out, debug_info
@@ -3556,7 +4010,8 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
         )
 
     viewer.scale_bar.visible = True
-    viewer.scale_bar.unit = 'um'
+    for layer in viewer.layers:
+        layer.units = ('um', 'um', 'um')
     return viewer
 
 
@@ -3803,7 +4258,9 @@ def segment_nuclei(
             f"boundary_components={len(debug_info['boundary_components'])}, "
             f"added_component_seeds={debug_info['added_seed_count']}, "
             f"restored_isolated_voxels={debug_info['restored_isolated_count']}, "
-            f"removed_by_roundness={debug_info['removed_by_roundness']})"
+            f"removed_by_roundness={debug_info['removed_by_roundness']}, "
+            f"z_consistency_splits={debug_info['z_consistency_splits']}, "
+            f"z_consistency_merges={debug_info['z_consistency_merges']})"
         )
 
         im_segmentation_stack['Nuclei'] = im_out
@@ -3864,7 +4321,9 @@ def segment_nuclei(
                 f"boundary_components={len(debug_info['boundary_components'])}, "
                 f"added_component_seeds={debug_info['added_seed_count']}, "
                 f"restored_isolated_voxels={debug_info['restored_isolated_count']}, "
-                f"removed_by_roundness={debug_info['removed_by_roundness']})"
+                f"removed_by_roundness={debug_info['removed_by_roundness']}, "
+                f"z_consistency_splits={debug_info['z_consistency_splits']}, "
+                f"z_consistency_merges={debug_info['z_consistency_merges']})"
             )
 
         im_segmentation_stack['Nuclei'] = im_out
@@ -4147,7 +4606,8 @@ def view_processing_results(
                 blending='additive', scale=scale,
             )
     viewer_0.scale_bar.visible = True
-    viewer_0.scale_bar.unit = 'um'
+    for layer in viewer_0.layers:
+        layer.units = ('um', 'um', 'um')
 
     viewer_1 = None
     if ('NUCLEI' in stain_complete_df.index) or ('CYTOPLASM' in stain_complete_df.index):
@@ -4193,7 +4653,8 @@ def view_processing_results(
                 name='Aggregates', blending='additive', scale=scale_zoom,
             )
         viewer_1.scale_bar.visible = True
-        viewer_1.scale_bar.unit = 'um'
+        for layer in viewer_1.layers:
+            layer.units = ('um', 'um', 'um')
 
     return viewer_0, viewer_1
 
