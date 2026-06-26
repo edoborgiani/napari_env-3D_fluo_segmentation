@@ -149,7 +149,7 @@ def load_common_imports(
 
 
 def load_ld_notebook_setup(enable_napari_interactive: bool = True) -> dict[str, Any]:
-    """Load the LD notebook imports and the OpenCV version check in one step."""
+    """Load the LD notebook imports in one step."""
     try:
         from IPython import get_ipython
 
@@ -160,7 +160,6 @@ def load_ld_notebook_setup(enable_napari_interactive: bool = True) -> dict[str, 
         pass
 
     cv2 = importlib.import_module("cv2")
-    print(cv2.__version__)
 
     imported = load_common_imports(
         profile="ld",
@@ -169,11 +168,12 @@ def load_ld_notebook_setup(enable_napari_interactive: bool = True) -> dict[str, 
     imported["cv2"] = cv2
     imported["tqdm"] = importlib.import_module("tqdm.auto").tqdm
     imported["clear_output"] = importlib.import_module("IPython.display").clear_output
+    print("Libraries loaded successfully.")
     return imported
 
 
 def load_nuclei_notebook_setup(enable_napari_interactive: bool = True) -> dict[str, Any]:
-    """Load the nuclei notebook imports and the OpenCV version check in one step."""
+    """Load the nuclei notebook imports in one step."""
     try:
         from IPython import get_ipython
 
@@ -184,7 +184,6 @@ def load_nuclei_notebook_setup(enable_napari_interactive: bool = True) -> dict[s
         pass
 
     cv2 = importlib.import_module("cv2")
-    print(cv2.__version__)
 
     imported = load_common_imports(
         profile="nuclei",
@@ -192,4 +191,5 @@ def load_nuclei_notebook_setup(enable_napari_interactive: bool = True) -> dict[s
     )
     imported["cv2"] = cv2
     imported["tqdm"] = importlib.import_module("tqdm.auto").tqdm
+    print("Libraries loaded successfully.")
     return imported
