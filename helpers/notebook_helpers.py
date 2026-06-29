@@ -1564,7 +1564,7 @@ def prepare_stain_settings(
     if use_setup and setup_exists:
         stain_setup_df = pd.read_csv(setup_path)
         stain_setup_df.set_index(["Condition", "Marker", "Laser"], inplace=True)
-        for idx in _progress_iter(stain_complete_df.index, progress, desc="Step 05A - Load Setup Rows"):
+        for idx in _progress_iter(stain_complete_df.index, progress, desc="Step 07A - Load Setup Rows"):
             if idx in stain_setup_df.index:
                 stain_complete_df.loc[idx] = stain_setup_df.loc[idx]
                 stain_complete_df["Color"] = stain_initial_df["Color"]
@@ -1587,7 +1587,7 @@ def prepare_stain_settings(
         for _, idx in _progress_iter(
             enumerate(stain_complete_df.index),
             progress,
-            desc="Step 05B - Prepare Setup Viewer",
+            desc="Step 07B - Prepare Setup Viewer",
             total=len(stain_complete_df.index),
             leave=False,
         ):
@@ -1614,7 +1614,7 @@ def prepare_stain_settings(
         for _, idx in _progress_iter(
             enumerate(stain_complete_df.index),
             progress,
-            desc="Step 05C - Collect Setup Values",
+            desc="Step 07C - Collect Setup Values",
             total=len(stain_complete_df.index),
             leave=False,
         ):
@@ -1626,7 +1626,7 @@ def prepare_stain_settings(
         if setup_exists:
             stain_setup_df = pd.read_csv(setup_path)
             stain_setup_df.set_index(["Condition", "Marker", "Laser"], inplace=True)
-            for idx in _progress_iter(stain_complete_df.index, progress, desc="Step 05D - Write Setup Rows"):
+            for idx in _progress_iter(stain_complete_df.index, progress, desc="Step 07D - Write Setup Rows"):
                 stain_setup_df.loc[idx] = stain_complete_df.loc[idx]
         else:
             stain_setup_df = stain_complete_df.copy()
@@ -1870,7 +1870,7 @@ def build_labels_dict(
         )
 
     num_channels = filtered_img.shape[3]
-    for c in _progress_iter(range(num_channels), progress, desc="Step 14A - Quantify Marker Stats"):
+    for c in _progress_iter(range(num_channels), progress, desc="Step 23A - Quantify Marker Stats"):
         condition = stain_complete_df.index[c]
         if condition in ["NUCLEI", "CYTOPLASM", "PCM"]:
             continue
@@ -1916,13 +1916,13 @@ def build_labels_dict(
         ]
         max_combo_size = min(3, max(2, len(non_nuc_channels)))
         marker_index_to_shared = {}
-        for c in _progress_iter(non_nuc_channels, progress, desc="Step 14B - Prepare Multilabel Sets"):
+        for c in _progress_iter(non_nuc_channels, progress, desc="Step 23B - Prepare Multilabel Sets"):
             marker_name = stain_complete_df.iloc[c]["Marker"]
             marker_index_to_shared[c] = set(labels_dict.get(marker_name, [(), (), (), (), ()])[4])
 
         from itertools import combinations
 
-        for combo_size in _progress_iter(range(2, max_combo_size + 1), progress, desc="Step 14C - Build Multilabel Combos"):
+        for combo_size in _progress_iter(range(2, max_combo_size + 1), progress, desc="Step 23C - Build Multilabel Combos"):
             for comb in combinations(non_nuc_channels, combo_size):
                 combo_markers = tuple(stain_complete_df.iloc[i]["Marker"] for i in comb)
                 combo_sets = [marker_index_to_shared.get(i, set()) for i in comb]
@@ -1987,7 +1987,7 @@ def build_full_labels_dict(
         )
 
     num_channels = filtered_img.shape[3]
-    for c in _progress_iter(range(num_channels), progress, desc="Step 14H - Quantify Full Marker Stats"):
+    for c in _progress_iter(range(num_channels), progress, desc="Step 25 - Quantify Full Marker Stats"):
         condition = stain_complete_df.index[c]
         if condition in ["NUCLEI", "CYTOPLASM", "PCM"]:
             continue
@@ -2101,7 +2101,7 @@ def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None):
         "Avg. marker intensity PCM",
         "STD marker intensity PCM",
     ]
-    for column in _progress_iter(truncate_columns, progress, desc="Step 14D - Truncate Display Columns"):
+    for column in _progress_iter(truncate_columns, progress, desc="Step 23D - Truncate Display Columns"):
         truncated_df[column] = truncated_df[column].apply(lambda value: truncate_cell(value))
 
     return labels_df, truncated_df
@@ -2124,7 +2124,7 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
     for _, marker in _progress_iter(
         enumerate(labels_df.index),
         progress,
-        desc="Step 14E - Summary Percentages",
+        desc="Step 24A - Summary Percentages",
         total=len(labels_df.index),
     ):
         condition = labels_df.iloc[_]["Condition"]
@@ -2159,7 +2159,7 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
     for _, marker in _progress_iter(
         enumerate(labels_df.index),
         progress,
-        desc="Step 14F - Summary Per-Condition",
+        desc="Step 24B - Summary Per-Condition",
         total=len(labels_df.index),
     ):
         condition = labels_df.iloc[_]["Condition"]
@@ -2265,7 +2265,7 @@ def collect_histogram_data(im_segmentation_stack, filtered_img, stain_df, stain_
     hist_data = {}
     intensity_ranges = {}
 
-    for c in _progress_iter(range(filtered_img.shape[3]), progress, desc="Step 15A - Collect Histogram Data"):
+    for c in _progress_iter(range(filtered_img.shape[3]), progress, desc="Step 26A - Collect Histogram Data"):
         if stain_df.index[c] == "NUCLEI":
             continue
 
@@ -2274,7 +2274,7 @@ def collect_histogram_data(im_segmentation_stack, filtered_img, stain_df, stain_
         intensity_ranges[condition] = (float(marker_img.min()), float(marker_img.max()))
         max_n = int(np.max(im_segmentation_stack["Nuclei"]))
 
-        for nucleus_id in _progress_iter(range(1, max_n + 1), progress, desc=f"Step 15B - {condition} Nuclei"):
+        for nucleus_id in _progress_iter(range(1, max_n + 1), progress, desc=f"Step 26B - {condition} Nuclei"):
             hist_data.setdefault(nucleus_id, {})
             hist_data[nucleus_id].setdefault(condition, [])
 
@@ -2314,7 +2314,7 @@ def plot_nucleus_kdes(hist_data, stain_complete_df, progress=None, max_subplots=
     for idx, nucleus_id in _progress_iter(
         enumerate(nuclei_to_plot),
         progress,
-        desc="Step 15C - Plot Nucleus KDEs",
+        desc="Step 26C - Plot Nucleus KDEs",
         total=len(nuclei_to_plot),
     ):
         ax = axes[idx]
@@ -2368,7 +2368,7 @@ def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_in, r_
     for idx, marker in _progress_iter(
         enumerate(labels_df.index),
         progress,
-        desc="Step 16 - Plot Spatial Distributions",
+        desc="Step 28 - Plot Spatial Distributions",
         total=len(labels_df.index),
     ):
         xcoor = [t[0] for t in labels_df.iloc[idx]["Mean cytoplasm positions [um]"]]
@@ -2418,7 +2418,7 @@ def plot_size_distributions(labels_df, stain_complete_df, stain_df, progress=Non
     for idx, marker in _progress_iter(
         enumerate(labels_df.index),
         progress,
-        desc="Step 17 - Plot Size Distributions",
+        desc="Step 29 - Plot Size Distributions",
         total=len(labels_df.index),
     ):
         nuclei_sizes = list(labels_df.iloc[idx]["Nuclei size [um3]"])
@@ -2463,7 +2463,7 @@ def export_quantification_to_excel(output_path, original_stain_complete_df, labe
         if not nuclei_rows.empty:
             nuclei_row = nuclei_rows.iloc[0]
             nuclei_dict = {}
-            for k in _progress_iter(range(1, int(nuclei_row["Number"])), progress, desc="Step 20A - Write Nuclei Sheet"):
+            for k in _progress_iter(range(1, int(nuclei_row["Number"])), progress, desc="Step 32A - Write Nuclei Sheet"):
                 position = nuclei_row["Mean nuclei positions [um]"][k - 1]
                 nuclei_dict[k] = [position[0], position[1], position[2], nuclei_row["Nuclei size [um3]"][k - 1]]
             cell_df = pd.DataFrame.from_dict(
@@ -2483,7 +2483,7 @@ def export_quantification_to_excel(output_path, original_stain_complete_df, labe
             for idx, marker in _progress_iter(
                 enumerate(labels_full_df.index),
                 progress,
-                desc="Step 20B - Prepare Cytoplasm Columns",
+                desc="Step 32B - Prepare Cytoplasm Columns",
                 total=len(labels_full_df.index),
             ):
                 condition = labels_full_df.iloc[idx]["Condition"]
@@ -2503,7 +2503,7 @@ def export_quantification_to_excel(output_path, original_stain_complete_df, labe
                         ]
                     )
 
-            for k in _progress_iter(range(1, int(cytoplasm_row["Number"])), progress, desc="Step 20C - Write Cytoplasm Sheet"):
+            for k in _progress_iter(range(1, int(cytoplasm_row["Number"])), progress, desc="Step 32C - Write Cytoplasm Sheet"):
                 position = cytoplasm_row["Mean cytoplasm positions [um]"][k - 1]
                 row = [position[0], position[1], position[2], cytoplasm_row["Cytoplasm size [um3]"][k - 1]]
                 for idx, marker in single_marker_rows:
@@ -3996,7 +3996,7 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
     for c, c_name in progress(
         enumerate(stain_df['Marker']),
         total=len(stain_df['Marker']),
-        desc='Step 04 - Visualize Channels',
+        desc='Step 06 - Visualize Channels',
         leave=False,
     ):
         im_channel = im_in[:, :, :, c]
@@ -4067,7 +4067,7 @@ def apply_threshold_per_channel(
     nuclei_size = int(nuclei_diameter / (np.mean([r_zX, r_zY])))
     cell_size = int(cell_diameter / (np.mean([r_zX, r_zY])))
 
-    for c in progress(range(image_stack.shape[3]), desc='Step 09 - Threshold Channels'):
+    for c in progress(range(image_stack.shape[3]), desc='Step 15 - Threshold Channels'):
         img = sitk.GetImageFromArray(image_stack[:, :, :, c])
 
         # Compute global threshold value based on chosen method
@@ -4271,7 +4271,7 @@ def segment_nuclei(
     im_in = im_final_stack['Threshold image'].copy()
     split_cfg = dict(nuclei_split_config)
 
-    for c in progress(range(im_in.shape[3]), desc='Step 10 - Segment Nuclei'):
+    for c in progress(range(im_in.shape[3]), desc='Step 17 - Segment Nuclei'):
         if stain_complete_df.index[c] != 'NUCLEI':
             continue
 
@@ -4393,7 +4393,7 @@ def segment_cytoplasm(
     im_in = im_final_stack['Threshold image'].copy()
     im_out = np.zeros_like(im_in[:, :, :, 0], dtype=np.int32)
 
-    for c in progress(range(im_in.shape[3]), desc='Step 11A - Segment Cytoplasm'):
+    for c in progress(range(im_in.shape[3]), desc='Step 18A - Segment Cytoplasm'):
         if stain_df.index[c] == 'CYTOPLASM':
             from scipy import ndimage as _ndi
             distance = _ndi.distance_transform_edt(
@@ -4417,7 +4417,7 @@ def segment_cytoplasm(
             im_out = grow_labels(im_segmentation_stack['Nuclei'], cyto_factor)
         else:
             im_out = im_segmentation_stack['Nuclei'] > 0
-            for c in progress(range(im_in.shape[3]), desc='Step 11B - Apply Cyto Markers'):
+            for c in progress(range(im_in.shape[3]), desc='Step 18B - Apply Cyto Markers'):
                 idx = stain_complete_df.index[c]
                 marker = stain_complete_df.loc[idx, 'Marker']
                 if marker in cyto_markers:
@@ -4513,7 +4513,7 @@ def assign_channel_labels(
         # the per-channel threshold so LIVE and DEAD cells are separately identified.
         im_in = im_final_stack['Threshold image'].copy()
         im_segmentation_stack = dict(im_segmentation_stack)
-        for c in progress(range(im_in.shape[3]), desc='Step 12 - Assign Labels To Channels'):
+        for c in progress(range(im_in.shape[3]), desc='Step 20 - Assign Labels To Channels'):
             cond = stain_df.index[c]
             im_segmentation_stack[cond] = (im_in[:, :, :, c] > 0) * im_segmentation_stack['Nuclei']
         return im_segmentation_stack
@@ -4521,7 +4521,7 @@ def assign_channel_labels(
     im_in = im_final_stack['Threshold image'].copy()
     im_segmentation_stack = dict(im_segmentation_stack)
 
-    for c in progress(range(im_in.shape[3]), desc='Step 12 - Assign Labels To Channels'):
+    for c in progress(range(im_in.shape[3]), desc='Step 20 - Assign Labels To Channels'):
         cond = stain_df.index[c]
         if cond in ('NUCLEI', 'CYTOPLASM', 'PCM'):
             continue
@@ -4595,7 +4595,7 @@ def view_processing_results(
         ('Filtered image',  'FILTERED',  scale_zoom),
         ('Equalized image', 'EQ',        scale_zoom),
     ]
-    for stage_key, stage_prefix, scale in progress(stages, desc='Step 13A - Add Layers To Viewer 0'):
+    for stage_key, stage_prefix, scale in progress(stages, desc='Step 22A - Add Layers To Viewer 0'):
         for c in range(im_thr.shape[3]):
             idx = stain_complete_df.index[c]
             marker = stain_complete_df.loc[idx, 'Marker']
@@ -4622,7 +4622,7 @@ def view_processing_results(
                 name=f'EQ {idx} ({marker})', colormap=color,
                 blending='additive', scale=scale_zoom,
             )
-        for c in progress(range(len(stain_complete_df.index)), desc='Step 13B - Add Labels To Viewer 1'):
+        for c in progress(range(len(stain_complete_df.index)), desc='Step 22B - Add Labels To Viewer 1'):
             idx = stain_complete_df.index[c]
             marker = stain_complete_df.loc[idx, 'Marker']
             if idx == 'NUCLEI' and 'NUCLEI' not in stain_df.index:
@@ -4803,7 +4803,7 @@ def build_vtk_volumes(
     PCM_coord = np.zeros((pcm_max + 1, 3))
 
     iter_ = (
-        progress(range(1, nuc_max + 1), desc='Step 18 - Build VTK Volumes')
+        progress(range(1, nuc_max + 1), desc='Step 30 - Build VTK Volumes')
         if progress else range(1, nuc_max + 1)
     )
     k = 0
@@ -4943,7 +4943,7 @@ def export_marker_stl(
         progress(
             enumerate(stain_complete_df.index),
             total=len(stain_complete_df.index),
-            desc='Step 19 - Export Marker STL',
+            desc='Step 31 - Export Marker STL',
         )
         if progress else enumerate(stain_complete_df.index)
     )
@@ -5019,7 +5019,7 @@ def export_fea_mesh(
     cell_elements = {c: [] for c in range(1, nuc_max + 1)}
 
     iter_ = (
-        progress(enumerate(elems), total=len(elems), desc='Step 21B - Assign Elements To Cells')
+        progress(enumerate(elems), total=len(elems), desc='Step 33B - Assign Elements To Cells')
         if progress else enumerate(elems)
     )
     for ce, x in iter_:
@@ -5046,7 +5046,7 @@ def export_fea_mesh(
     # --- Step 3: write element sets and finalise .inp ---
     with open("FE_segmentation.inp", "a") as f:
         for c in (
-            progress(range(1, nuc_max + 1), desc='Step 21C - Write Element Sets')
+            progress(range(1, nuc_max + 1), desc='Step 33C - Write Element Sets')
             if progress else range(1, nuc_max + 1)
         ):
             f.write(f"*Elset, elset=cell{c}\n")
@@ -5065,7 +5065,7 @@ def export_fea_mesh(
     out_path = str(_Path(input_file).stem) + "_FEA.inp"
     with open(out_path, "w") as f:
         for line in (
-            progress(lines, desc='Step 21D - Write Final INP')
+            progress(lines, desc='Step 33D - Write Final INP')
             if progress else lines
         ):
             if line == "*NODE\n":
