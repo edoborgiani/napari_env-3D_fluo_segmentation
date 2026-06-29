@@ -83,6 +83,7 @@ __all__ = [
     "save_raw_png",
     "save_single_channel_png",
     "segment_nuclei",
+    "segment_nuclei_cellpose",
     "segment_nuclei_watershed",
     "segment_cytoplasm",
     "segment_pcm",
@@ -371,9 +372,12 @@ def _close_all_napari_viewers(napari_module=None):
     stale = []
     for viewer in list(napari_module.Viewer._instances):
         try:
+            try:
+                viewer.layers.clear()
+            except Exception:
+                pass
             viewer.close()
-        except RuntimeError:
-            # Qt C++ object already destroyed (window closed via X button)
+        except (RuntimeError, AttributeError, Exception):
             stale.append(viewer)
     for viewer in stale:
         napari_module.Viewer._instances.discard(viewer)
@@ -4174,6 +4178,49 @@ def apply_threshold_per_channel(
     return im_out
 
 
+def segment_nuclei_cellpose(image_3d, nuclei_diameter, voxel_size, model_type='nuclei'):
+    """Segment nuclei using Cellpose 3D.
+
+    Parameters
+    ----------
+    image_3d : ndarray (Z, Y, X)
+        Single-channel intensity image (e.g. filtered NUCLEI channel).
+    nuclei_diameter : float
+        Approximate nucleus diameter in micrometers.
+    voxel_size : tuple (Z, Y, X)
+        Physical voxel spacing in micrometers, used for anisotropy.
+    model_type : str
+        Cellpose model name (default ``'nuclei'``).
+
+    Returns
+    -------
+    labels : ndarray (Z, Y, X), int32
+        Integer label volume (0 = background).
+    """
+    from cellpose import models
+
+    model = models.Cellpose(model_type=model_type, gpu=True)
+
+    xy_spacing = float(np.mean([voxel_size[1], voxel_size[2]]))
+    diameter_px = nuclei_diameter / xy_spacing
+    anisotropy = float(voxel_size[0] / xy_spacing)
+
+    labels, _, _, _ = model.eval(
+        image_3d,
+        diameter=diameter_px,
+        anisotropy=anisotropy,
+        do_3D=True,
+        channels=[0, 0],
+    )
+
+    print(
+        f"Cellpose: {int(labels.max())} nuclei segmented "
+        f"(model={model_type}, diameter_px={diameter_px:.1f}, "
+        f"anisotropy={anisotropy:.2f})"
+    )
+    return labels.astype(np.int32)
+
+
 def segment_nuclei(
     im_final_stack,
     stain_df,
@@ -4182,10 +4229,11 @@ def segment_nuclei(
     r_zxyz,
     nuclei_diameter,
     trig_stardist=False,
+    trig_cellpose=False,
     progress=None,
 ):
     """
-    Segment nuclei from the thresholded image using watershed or StarDist.
+    Segment nuclei from the image using watershed, StarDist, or Cellpose.
 
     Parameters
     ----------
@@ -4200,7 +4248,9 @@ def segment_nuclei(
     nuclei_diameter : float
         Approximate nucleus diameter in micrometers.
     trig_stardist : bool
-        If True, use StarDist; otherwise use watershed.
+        If True, use StarDist.
+    trig_cellpose : bool
+        If True, use Cellpose 3D (takes priority over StarDist and watershed).
     progress : callable, optional
         Progress wrapper (e.g. tqdm).
 
@@ -4219,8 +4269,20 @@ def segment_nuclei(
     im_segmentation_stack = {}
 
     if 'NUCLEI' not in stain_df.index:
-        # LD-style: union all threshold channels, then apply watershed splitting
-        # to separate touching/overlapping cells.
+        # LD-style: union all channels.
+        if trig_cellpose:
+            im_filt = im_final_stack['Filtered image'].copy()
+            combined = np.max(im_filt, axis=-1)
+            im_out = segment_nuclei_cellpose(
+                combined,
+                nuclei_diameter=nuclei_diameter,
+                voxel_size=(r_zZ, r_zY, r_zX),
+            )
+            im_segmentation_stack['Nuclei'] = im_out
+            im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
+            im_segmentation_stack['PCM'] = np.zeros_like(im_out)
+            return im_segmentation_stack
+
         im_in = im_final_stack['Threshold image'].copy()
         im_thresh = np.zeros(im_in.shape[:3], dtype=bool)
         for c in range(im_in.shape[3]):
@@ -4275,7 +4337,15 @@ def segment_nuclei(
         if stain_complete_df.index[c] != 'NUCLEI':
             continue
 
-        if trig_stardist:
+        if trig_cellpose:
+            im_filt = im_final_stack['Filtered image'].copy()
+            im_out = segment_nuclei_cellpose(
+                im_filt[:, :, :, c],
+                nuclei_diameter=nuclei_diameter,
+                voxel_size=(r_zZ, r_zY, r_zX),
+            )
+
+        elif trig_stardist:
             im_filt = im_final_stack['Filtered image'].copy()
             transl = stardist3d_from_2d(
                 img_3d=im_filt[:, :, :, c],

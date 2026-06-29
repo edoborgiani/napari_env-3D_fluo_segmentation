@@ -14,6 +14,7 @@ DEFAULT_PIP_PACKAGES = [
     "nd2reader",
     "opencv-python",
     "tensorflow",
+    "cellpose>=3.0",
     "xlsxwriter",
     "reportlab",
 ]
