@@ -369,18 +369,14 @@ def _close_all_napari_viewers(napari_module=None):
             import napari as napari_module
         except ImportError:
             return
-    stale = []
     for viewer in list(napari_module.Viewer._instances):
         try:
-            try:
-                viewer.layers.clear()
-            except Exception:
-                pass
-            viewer.close()
-        except (RuntimeError, AttributeError, Exception):
-            stale.append(viewer)
-    for viewer in stale:
-        napari_module.Viewer._instances.discard(viewer)
+            qt_win = viewer.window._qt_window
+            if qt_win.isVisible():
+                viewer.close()
+        except (RuntimeError, AttributeError):
+            pass
+    napari_module.Viewer._instances.clear()
 
 
 def _context(name, default=None):
@@ -1244,12 +1240,12 @@ def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms):
         else:
             nucleus_positions.append(
                 (
-                    np.mean(x_nuc * r_xyz[0] / zooms[2]),
-                    np.mean(y_nuc * r_xyz[1] / zooms[1]),
-                    np.mean(z_nuc * r_xyz[2] / zooms[0]),
+                    np.mean(x_nuc) * r_xyz[0],
+                    np.mean(y_nuc) * r_xyz[1],
+                    np.mean(z_nuc) * r_xyz[2],
                 )
             )
-            nucleus_sizes.append(x_nuc.size * r_xyz[0] * r_xyz[1] * r_xyz[2] / np.prod(zooms))
+            nucleus_sizes.append(x_nuc.size * r_xyz[0] * r_xyz[1] * r_xyz[2])
 
         z_cyto, y_cyto, x_cyto = np.where(seg_stack["Cytoplasm"] == label_id)
         if x_cyto.size == 0:
@@ -1258,12 +1254,12 @@ def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms):
         else:
             cytoplasm_positions.append(
                 (
-                    np.mean(x_cyto * r_xyz[0] / zooms[2]),
-                    np.mean(y_cyto * r_xyz[1] / zooms[1]),
-                    np.mean(z_cyto * r_xyz[2] / zooms[0]),
+                    np.mean(x_cyto) * r_xyz[0],
+                    np.mean(y_cyto) * r_xyz[1],
+                    np.mean(z_cyto) * r_xyz[2],
                 )
             )
-            cytoplasm_sizes.append(x_cyto.size * r_xyz[0] * r_xyz[1] * r_xyz[2] / np.prod(zooms))
+            cytoplasm_sizes.append(x_cyto.size * r_xyz[0] * r_xyz[1] * r_xyz[2])
 
     return nucleus_positions, nucleus_sizes, cytoplasm_positions, cytoplasm_sizes
 
@@ -1309,7 +1305,7 @@ def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, 
 
         shared_labels.append(label_id)
         voxels = np.where(marker_mask)
-        marker_sizes.append(voxels[0].size * voxel_volume(r_xyz[0], r_xyz[1], r_xyz[2], zooms))
+        marker_sizes.append(voxels[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
         if channel_idx is not None:
             values = filtered_img[voxels[0], voxels[1], voxels[2], channel_idx]
             avg_marker.append(float(np.mean(values)) if values.size > 0 else 0.0)
@@ -1321,7 +1317,7 @@ def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, 
         if marker_img_cyto is not None:
             cytoplasm_marker_mask = (marker_img_cyto > 0) & cytoplasm_mask
             voxels_cyto = np.where(cytoplasm_marker_mask)
-            marker_cyto_sizes.append(voxels_cyto[0].size * voxel_volume(r_xyz[0], r_xyz[1], r_xyz[2], zooms))
+            marker_cyto_sizes.append(voxels_cyto[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
             if channel_idx is not None and voxels_cyto[0].size > 0:
                 values_cyto = filtered_img[voxels_cyto[0], voxels_cyto[1], voxels_cyto[2], channel_idx]
                 avg_cyto_marker.append(float(np.mean(values_cyto)))
@@ -1337,7 +1333,7 @@ def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, 
         if marker_img_pcm is not None:
             pcm_marker_mask = (marker_img_pcm > 0) & pcm_mask
             voxels_pcm = np.where(pcm_marker_mask)
-            marker_pcm_sizes.append(voxels_pcm[0].size * voxel_volume(r_xyz[0], r_xyz[1], r_xyz[2], zooms))
+            marker_pcm_sizes.append(voxels_pcm[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
             if channel_idx is not None and voxels_pcm[0].size > 0:
                 values_pcm = filtered_img[voxels_pcm[0], voxels_pcm[1], voxels_pcm[2], channel_idx]
                 avg_pcm_marker.append(float(np.mean(values_pcm)))
@@ -1398,7 +1394,7 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
 
         shared_labels.append(label_id)
         voxels = np.where(marker_mask)
-        marker_sizes.append(voxels[0].size * voxel_volume(r_xyz[0], r_xyz[1], r_xyz[2], zooms))
+        marker_sizes.append(voxels[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
         if channel_idx is not None:
             values = filtered_img[voxels[0], voxels[1], voxels[2], channel_idx]
             avg_marker.append(float(np.mean(values)) if values.size > 0 else 0.0)
@@ -1409,7 +1405,7 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
 
         cytoplasm_marker_mask = (marker_img > 0) & cytoplasm_mask
         voxels_cyto = np.where(cytoplasm_marker_mask)
-        marker_cyto_sizes.append(voxels_cyto[0].size * voxel_volume(r_xyz[0], r_xyz[1], r_xyz[2], zooms))
+        marker_cyto_sizes.append(voxels_cyto[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
         if channel_idx is not None and voxels_cyto[0].size > 0:
             values_cyto = filtered_img[voxels_cyto[0], voxels_cyto[1], voxels_cyto[2], channel_idx]
             avg_cyto_marker.append(float(np.mean(values_cyto)))
@@ -1420,7 +1416,7 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
 
         pcm_marker_mask = (marker_img > 0) & pcm_mask
         voxels_pcm = np.where(pcm_marker_mask)
-        marker_pcm_sizes.append(voxels_pcm[0].size * voxel_volume(r_xyz[0], r_xyz[1], r_xyz[2], zooms))
+        marker_pcm_sizes.append(voxels_pcm[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
         if channel_idx is not None and voxels_pcm[0].size > 0:
             values_pcm = filtered_img[voxels_pcm[0], voxels_pcm[1], voxels_pcm[2], channel_idx]
             avg_pcm_marker.append(float(np.mean(values_pcm)))
