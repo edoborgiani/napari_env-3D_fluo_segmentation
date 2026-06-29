@@ -13,6 +13,7 @@ simpleitk
 tensorflow>=2.16,<2.17
 csbdeep
 stardist
+cellpose>=3.0
 meshio
 tetgen<0.7; python_version < "3.10"
 tetgen>=0.7; python_version >= "3.10"
