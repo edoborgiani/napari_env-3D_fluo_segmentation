@@ -2456,113 +2456,317 @@ def plot_size_distributions(labels_df, stain_complete_df, stain_df, progress=Non
     return fig, axs
 
 
-def export_quantification_to_excel(output_path, original_stain_complete_df, labels_full_df, progress=None):
-    """Write the main Excel report with staining, nuclei, cytoplasm, and recap sheets."""
-    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        original_stain_complete_df.to_excel(writer, sheet_name="Staining", index=True)
+def export_quantification_to_excel(input_file, original_stain_complete_df, labels_full_df, progress=None):
+    """Write the main quantification report to Excel.
 
+    Generates ``<stem>_segmentation.xlsx`` next to *input_file* with four
+    sheets styled to match the histogram workbook:
+
+    * **Setup** — channel stain table with colour-coded header per marker.
+    * **Nuclei** — per-nucleus position and size.
+    * **Cytoplasm** — per-cell position, size, and per-marker intensity stats.
+    * **Summary** — population-level averages and percentages.
+
+    Returns
+    -------
+    output_path : Path
+    """
+    from pathlib import Path as _Path
+
+    output_path = _Path(input_file).with_suffix('').as_posix() + '_segmentation.xlsx'
+
+    # ── Colour palette (matches histogram workbook) ──────────────────────
+    _channel_bg = {
+        'BLUE':    '#BDD7EE', 'GREEN':   '#C6EFCE', 'RED':     '#FFC7CE',
+        'CYAN':    '#CCFFFF', 'MAGENTA': '#FFB3FF', 'YELLOW':  '#FFFF99',
+        'WHITE':   '#D9D9D9', 'GREY':    '#D9D9D9', 'GRAY':    '#D9D9D9',
+        'ORANGE':  '#FFD966',
+    }
+    _default_bg = '#F2F2F2'
+
+    _COL_HDR   = '#D9E1F2'  # blue-grey header
+    _COL_SUBHD = '#EBF0F9'  # light blue sub-header
+    _COL_ALT   = '#F5F5F5'  # alternating row tint
+    _COL_NUC   = '#C6EFCE'  # green — nuclei
+    _COL_CYTO  = '#BDD7EE'  # blue — cytoplasm
+    _COL_SUM   = '#FFD966'  # amber — summary
+
+    def _marker_bg(condition, stain_df):
+        try:
+            color_key = str(stain_df.loc[condition, 'Color']).upper()
+            return _channel_bg.get(color_key, _default_bg)
+        except Exception:
+            return _default_bg
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        wb = writer.book
+
+        # ── Shared formats ────────────────────────────────────────────────
+        def _fmt(**kw):
+            return wb.add_format(kw)
+
+        f_title = _fmt(bold=True, font_size=13, border=1, align='center',
+                       valign='vcenter', bg_color=_COL_HDR)
+        f_hdr   = _fmt(bold=True, border=1, align='center', valign='vcenter',
+                       bg_color=_COL_HDR, text_wrap=True)
+        f_subhd = _fmt(bold=True, border=1, align='center', valign='vcenter',
+                       bg_color=_COL_SUBHD, text_wrap=True, font_size=9)
+        f_num   = _fmt(num_format='0.00')
+        f_int   = _fmt()
+        f_pct   = _fmt(num_format='0.0"%"')
+        f_alt   = _fmt(bg_color=_COL_ALT)
+        f_bold  = _fmt(bold=True)
+        f_sec   = _fmt(bold=True, font_size=11, bg_color=_COL_HDR,
+                       border=1, align='left', valign='vcenter')
+
+        def _write_sheet_title(ws, row, col, text, width_cols, bg):
+            fmt = _fmt(bold=True, font_size=12, border=1, align='center',
+                       valign='vcenter', bg_color=bg)
+            ws.merge_range(row, col, row, col + width_cols - 1, text, fmt)
+            ws.set_row(row, 22)
+            return row + 1
+
+        def _write_row(ws, row, values, fmts=None, alt=False):
+            base = f_alt if alt else None
+            for c, v in enumerate(values):
+                fmt = (fmts[c] if fmts else None) or base
+                if isinstance(v, float):
+                    ws.write_number(row, c, v, fmt or f_num)
+                elif isinstance(v, int):
+                    ws.write_number(row, c, v, fmt or f_int)
+                else:
+                    ws.write(row, c, v if v is not None else '', fmt)
+
+        # ══════════════════════════════════════════════════════════════════
+        # SHEET 1 — SETUP
+        # ══════════════════════════════════════════════════════════════════
+        ws_setup = wb.add_worksheet('Setup')
+        r = 0
+        r = _write_sheet_title(ws_setup, r, 0, 'EXPERIMENT SETUP', 7, _COL_HDR)
+
+        # Stain table header
+        stain_cols = ['Channel', 'Marker', 'Laser', 'Color',
+                      'Cont_min', 'Cont_max', 'Gamma']
+        for c, col in enumerate(stain_cols):
+            ws_setup.write(r, c, col, f_hdr)
+        r += 1
+
+        for i, (idx, srow) in enumerate(original_stain_complete_df.iterrows()):
+            color_key = str(srow.get('Color', '')).upper()
+            bg = _channel_bg.get(color_key, _default_bg)
+            ch_fmt = _fmt(bg_color=bg, border=1)
+            vals = [str(idx)] + [str(srow.get(c, '')) for c in ['Marker', 'Laser', 'Color', 'Cont_min', 'Cont_max', 'Gamma']]
+            for c, v in enumerate(vals):
+                ws_setup.write(r, c, v, ch_fmt)
+            r += 1
+
+        ws_setup.set_column(0, 0, 14)
+        ws_setup.set_column(1, 1, 18)
+        ws_setup.set_column(2, 6, 12)
+        ws_setup.freeze_panes(2, 0)
+
+        # ══════════════════════════════════════════════════════════════════
+        # SHEET 2 — NUCLEI
+        # ══════════════════════════════════════════════════════════════════
+        ws_nuc = wb.add_worksheet('Nuclei')
         nuclei_rows = labels_full_df[labels_full_df["Condition"] == "NUCLEI"]
+
+        r = 0
+        r = _write_sheet_title(ws_nuc, r, 0, 'NUCLEI — Position and Size', 5, _COL_NUC)
+
+        nuc_cols = ['Nucleus ID', 'X position [μm]', 'Y position [μm]',
+                    'Z position [μm]', 'Volume [μm³]']
+        for c, col in enumerate(nuc_cols):
+            ws_nuc.write(r, c, col, f_hdr)
+        r += 1
+
         if not nuclei_rows.empty:
             nuclei_row = nuclei_rows.iloc[0]
-            nuclei_dict = {}
-            for k in _progress_iter(range(1, int(nuclei_row["Number"])), progress, desc="Step 32A - Write Nuclei Sheet"):
-                position = nuclei_row["Mean nuclei positions [um]"][k - 1]
-                nuclei_dict[k] = [position[0], position[1], position[2], nuclei_row["Nuclei size [um3]"][k - 1]]
-            cell_df = pd.DataFrame.from_dict(
-                nuclei_dict,
-                orient="index",
-                columns=["X position [um]", "Y position [um]", "Z position [um]", "Nuclei size [um3]"],
-            )
-            cell_df.to_excel(writer, sheet_name="NUCLEI", index=True)
+            n_nuc = int(nuclei_row["Number"])
+            for k in _progress_iter(range(1, n_nuc + 1), progress, desc="Step 32A - Write Nuclei Sheet"):
+                pos  = nuclei_row["Mean nuclei positions [um]"][k - 1]
+                size = nuclei_row["Nuclei size [um3]"][k - 1]
+                alt  = (k % 2 == 0)
+                _write_row(ws_nuc, r, [k, pos[0], pos[1], pos[2], size],
+                           fmts=[f_int, f_num, f_num, f_num, f_num], alt=alt)
+                r += 1
 
+        for c, w in enumerate([12, 18, 18, 18, 16]):
+            ws_nuc.set_column(c, c, w)
+        ws_nuc.freeze_panes(2, 0)
+
+        # ══════════════════════════════════════════════════════════════════
+        # SHEET 3 — CYTOPLASM
+        # ══════════════════════════════════════════════════════════════════
+        ws_cyto = wb.add_worksheet('Cytoplasm')
         cyto_rows = labels_full_df[labels_full_df["Condition"] == "CYTOPLASM"]
+
+        r = 0
+
+        # Collect single-condition marker rows
+        single_markers = []
+        for idx2, marker_name in enumerate(labels_full_df.index):
+            cond = labels_full_df.iloc[idx2]["Condition"]
+            if cond not in ["NUCLEI", "CYTOPLASM"] and np.size(cond) == 1:
+                single_markers.append((idx2, marker_name, cond))
+
+        # Build column groups: base + one group per marker
+        # Title row: merged spanning each group
+        base_cols  = ['Cell ID',
+                      'X pos [μm]', 'Y pos [μm]', 'Z pos [μm]',
+                      'Nuc. vol. [μm³]', 'Cyto vol. [μm³]']
+        marker_sub = ['Vol. total [μm³]', 'Vol. cyto [μm³]', 'Vol. PCM [μm³]',
+                      'Avg int. total', 'STD total',
+                      'Avg int. cyto', 'STD cyto',
+                      'Avg int. PCM', 'STD PCM']
+        n_base = len(base_cols)
+        n_msub = len(marker_sub)
+
+        total_cols = n_base + len(single_markers) * n_msub
+
+        r = _write_sheet_title(ws_cyto, r, 0,
+                               'CYTOPLASM — Per-cell Position, Size and Marker Intensities',
+                               total_cols, _COL_CYTO)
+
+        # Title row: base header + per-marker colour blocks
+        base_fmt = _fmt(bold=True, border=1, align='center', valign='vcenter',
+                        bg_color=_COL_CYTO, text_wrap=True)
+        for c, col in enumerate(base_cols):
+            ws_cyto.merge_range(r, c, r + 1, c, col, base_fmt)
+
+        for m_i, (m_idx, m_name, m_cond) in enumerate(single_markers):
+            bg = _marker_bg(m_cond, original_stain_complete_df)
+            mfmt = _fmt(bold=True, border=1, align='center', valign='vcenter',
+                        bg_color=bg, font_size=11)
+            col_start = n_base + m_i * n_msub
+            ws_cyto.merge_range(r, col_start, r, col_start + n_msub - 1, m_name, mfmt)
+        r += 1
+
+        # Sub-header row for marker columns
+        for c, col in enumerate(base_cols):
+            pass  # already merged above
+        for m_i, _ in enumerate(single_markers):
+            col_start = n_base + m_i * n_msub
+            for j, sub in enumerate(marker_sub):
+                ws_cyto.write(r, col_start + j, sub, f_subhd)
+        r += 1
+
         if not cyto_rows.empty:
             cytoplasm_row = cyto_rows.iloc[0]
-            xlsx_dict = {}
-            columns = ["X position [um]", "Y position [um]", "Z position [um]", "Cytoplasm size [um3]"]
+            n_cyto = int(cytoplasm_row["Number"])
+            for k in _progress_iter(range(1, n_cyto + 1), progress, desc="Step 32B - Write Cytoplasm Sheet"):
+                cyto_pos  = cytoplasm_row["Mean cytoplasm positions [um]"][k - 1]
+                cyto_size = cytoplasm_row["Cytoplasm size [um3]"][k - 1]
+                nuc_size  = (nuclei_rows.iloc[0]["Nuclei size [um3]"][k - 1]
+                             if not nuclei_rows.empty else 0.0)
+                row_vals  = [k,
+                             cyto_pos[0], cyto_pos[1], cyto_pos[2],
+                             nuc_size, cyto_size]
+                alt = (k % 2 == 0)
 
-            single_marker_rows = []
-            for idx, marker in _progress_iter(
-                enumerate(labels_full_df.index),
-                progress,
-                desc="Step 32B - Prepare Cytoplasm Columns",
-                total=len(labels_full_df.index),
-            ):
-                condition = labels_full_df.iloc[idx]["Condition"]
-                if condition not in ["NUCLEI", "CYTOPLASM"] and np.size(condition) == 1:
-                    single_marker_rows.append((idx, marker))
-                    columns.extend(
-                        [
-                            f"{marker} marker size [um3]",
-                            f"{marker} marker size cytoplasm [um3]",
-                            f"{marker} marker size PCM [um3]",
-                            f"{marker} intensity [-]",
-                            f"{marker} STD",
-                            f"{marker} intensity cytoplasm [-]",
-                            f"{marker} STD",
-                            f"{marker} intensity PCM [-]",
-                            f"{marker} STD",
-                        ]
-                    )
-
-            for k in _progress_iter(range(1, int(cytoplasm_row["Number"])), progress, desc="Step 32C - Write Cytoplasm Sheet"):
-                position = cytoplasm_row["Mean cytoplasm positions [um]"][k - 1]
-                row = [position[0], position[1], position[2], cytoplasm_row["Cytoplasm size [um3]"][k - 1]]
-                for idx, marker in single_marker_rows:
-                    shared = labels_full_df.iloc[idx]["Shared labels"]
+                for m_i, (m_idx, m_name, m_cond) in enumerate(single_markers):
+                    shared = labels_full_df.iloc[m_idx]["Shared labels"]
                     if k in shared:
-                        shared_idx = list(shared).index(k)
-                        row.extend(
-                            [
-                                labels_full_df.iloc[idx]["Marker size [um3]"][shared_idx],
-                                labels_full_df.iloc[idx]["Marker size cytoplasm [um3]"][shared_idx],
-                                labels_full_df.iloc[idx]["Marker size PCM [um3]"][shared_idx],
-                                labels_full_df.iloc[idx]["Avg. marker intensity"][shared_idx],
-                                labels_full_df.iloc[idx]["STD marker intensity"][shared_idx],
-                                labels_full_df.iloc[idx]["Avg. marker intensity cytoplasm"][shared_idx],
-                                labels_full_df.iloc[idx]["STD marker intensity cytoplasm"][shared_idx],
-                                labels_full_df.iloc[idx]["Avg. marker intensity PCM"][shared_idx],
-                                labels_full_df.iloc[idx]["STD marker intensity PCM"][shared_idx],
-                            ]
-                        )
+                        si = list(shared).index(k)
+                        row_vals.extend([
+                            labels_full_df.iloc[m_idx]["Marker size [um3]"][si],
+                            labels_full_df.iloc[m_idx]["Marker size cytoplasm [um3]"][si],
+                            labels_full_df.iloc[m_idx]["Marker size PCM [um3]"][si],
+                            labels_full_df.iloc[m_idx]["Avg. marker intensity"][si],
+                            labels_full_df.iloc[m_idx]["STD marker intensity"][si],
+                            labels_full_df.iloc[m_idx]["Avg. marker intensity cytoplasm"][si],
+                            labels_full_df.iloc[m_idx]["STD marker intensity cytoplasm"][si],
+                            labels_full_df.iloc[m_idx]["Avg. marker intensity PCM"][si],
+                            labels_full_df.iloc[m_idx]["STD marker intensity PCM"][si],
+                        ])
                     else:
-                        row.extend([" "] * 9)
-                xlsx_dict[k] = row
+                        row_vals.extend([''] * n_msub)
 
-            cell_df = pd.DataFrame.from_dict(xlsx_dict, orient="index", columns=columns)
-            cell_df.to_excel(writer, sheet_name="CYTOPLASM", index=True)
+                _write_row(ws_cyto, r, row_vals, alt=alt)
+                r += 1
 
-        resume_df = labels_full_df.drop(
-            columns=[
-                "Shared labels",
-                "Mean nuclei positions [um]",
-                "Mean cytoplasm positions [um]",
-                "Nuclei size [um3]",
-                "Cytoplasm size [um3]",
-                "Marker size [um3]",
-                "Avg. marker intensity",
-                "Marker size cytoplasm [um3]",
-                "Avg. marker intensity cytoplasm",
-                "Marker size PCM [um3]",
-                "Avg. marker intensity PCM",
+        ws_cyto.set_column(0, 0, 10)
+        ws_cyto.set_column(1, 5, 16)
+        for m_i in range(len(single_markers)):
+            col_start = n_base + m_i * n_msub
+            ws_cyto.set_column(col_start, col_start + n_msub - 1, 14)
+        ws_cyto.freeze_panes(3, 1)
+
+        # ══════════════════════════════════════════════════════════════════
+        # SHEET 4 — SUMMARY
+        # ══════════════════════════════════════════════════════════════════
+        ws_sum = wb.add_worksheet('Summary')
+        r = 0
+        r = _write_sheet_title(ws_sum, r, 0, 'POPULATION SUMMARY', 9, _COL_SUM)
+
+        sum_cols = ['Condition', 'Marker', 'Laser', 'Color',
+                    'Count', '% of total',
+                    'Mean nuc. vol. [μm³]', 'SD nuc. vol. [μm³]',
+                    'Mean cyto. vol. [μm³]', 'SD cyto. vol. [μm³]']
+
+        # Add marker-specific mean columns
+        for _, m_name, _ in single_markers:
+            sum_cols += [f'{m_name} mean int.', f'{m_name} SD int.',
+                         f'{m_name} mean vol. [μm³]']
+
+        for c, col in enumerate(sum_cols):
+            ws_sum.write(r, c, col, f_hdr)
+        r += 1
+
+        nuclei_total = (float(nuclei_rows.iloc[0]["Number"])
+                        if not nuclei_rows.empty else 1.0)
+
+        for t in range(len(labels_full_df)):
+            row_data = labels_full_df.iloc[t]
+            cond = row_data["Condition"]
+            if np.size(cond) != 1:
+                continue
+
+            color_key = str(row_data.get("Color", "")).upper()
+            bg = _channel_bg.get(color_key, _default_bg)
+            row_fmt = _fmt(bg_color=bg)
+
+            nuc_sizes  = row_data["Nuclei size [um3]"]
+            cyto_sizes = row_data["Cytoplasm size [um3]"]
+            count      = int(row_data["Number"])
+            pct        = 100.0 * count / nuclei_total if cond != "NUCLEI" else 100.0
+
+            vals = [
+                str(cond),
+                str(row_data.get("Marker", "")),
+                str(row_data.get("Laser", "")),
+                str(row_data.get("Color", "")),
+                count,
+                round(pct, 1),
+                round(float(np.mean(nuc_sizes)),  2) if len(nuc_sizes)  > 0 else '',
+                round(float(np.std(nuc_sizes)),   2) if len(nuc_sizes)  > 0 else '',
+                round(float(np.mean(cyto_sizes)), 2) if len(cyto_sizes) > 0 else '',
+                round(float(np.std(cyto_sizes)),  2) if len(cyto_sizes) > 0 else '',
             ]
-        ).copy()
-        resume_df["Laser"] = [labels_full_df.iloc[t]["Laser"] if np.size(labels_full_df.iloc[t]["Condition"]) == 1 else "" for t in range(len(labels_full_df))]
-        resume_df["Color"] = [labels_full_df.iloc[t]["Color"] if np.size(labels_full_df.iloc[t]["Condition"]) == 1 else "" for t in range(len(labels_full_df))]
 
-        nuclei_rows = labels_full_df[labels_full_df["Condition"] == "NUCLEI"]
-        total_cells = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_full_df.iloc[0]["Number"])
-        resume_df["%"] = [
-            100.0 * labels_full_df.iloc[t]["Number"] / total_cells if labels_full_df.iloc[t]["Condition"] != "NUCLEI" else ""
-            for t in range(len(labels_full_df))
-        ]
-        resume_df["Mean nuclei size [um3]"] = [np.mean(values) if len(values) > 0 else 0.0 for values in labels_full_df["Nuclei size [um3]"]]
-        resume_df["Mean cytoplasm size [um3]"] = [np.mean(values) if len(values) > 0 else 0.0 for values in labels_full_df["Cytoplasm size [um3]"]]
-        resume_df["Mean marker size [um3]"] = [
-            np.mean(values) if labels_full_df.iloc[t]["Condition"] not in ["NUCLEI", "CYTOPLASM"] and np.size(labels_full_df.iloc[t]["Condition"]) == 1 and len(values) > 0 else ""
-            for t, values in enumerate(labels_full_df["Marker size [um3]"])
-        ]
-        resume_df.to_excel(writer, sheet_name="RECAP", index=True)
+            for m_idx2, m_name, m_cond in single_markers:
+                m_row = labels_full_df.iloc[m_idx2]
+                if cond == m_cond:
+                    ints = m_row.get("Avg. marker intensity", [])
+                    vols = m_row.get("Marker size [um3]", [])
+                    vals += [
+                        round(float(np.mean(ints)), 2) if len(ints) > 0 else '',
+                        round(float(np.std(ints)),  2) if len(ints) > 0 else '',
+                        round(float(np.mean(vols)), 2) if len(vols) > 0 else '',
+                    ]
+                else:
+                    vals += ['', '', '']
+
+            for c, v in enumerate(vals):
+                ws_sum.write(r, c, v, row_fmt)
+            r += 1
+
+        ws_sum.set_column(0, 0, 14)
+        ws_sum.set_column(1, 3, 14)
+        ws_sum.set_column(4, 4, 8)
+        ws_sum.set_column(5, 5, 10)
+        ws_sum.set_column(6, len(sum_cols) - 1, 18)
+        ws_sum.freeze_panes(2, 0)
 
     return output_path
 
