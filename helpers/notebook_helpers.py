@@ -1361,18 +1361,28 @@ def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, 
 
 
 def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filtered_img, r_xyz, zooms):
-    """Compute full marker measurements from the filtered image channel."""
+    """Compute full marker measurements from the filtered image channel.
+
+    Uses the assigned segmentation label image (same presence test as
+    compute_marker_stats_for_marker) but measures intensities from the
+    original-resolution filtered_img for higher accuracy.
+    """
     stain_complete_df = _context("stain_complete_df")
+    stain_df          = _context("stain_df")
     condition = stain_complete_df.index[marker_idx]
+    seg_key   = stain_df.index[marker_idx] if stain_df is not None else condition
+
+    marker_img     = seg_stack.get(seg_key)
+    marker_img_cyto = seg_stack.get(seg_key + "_cyto")
+    marker_img_pcm  = seg_stack.get(seg_key + "_PCM")
+    if marker_img is None:
+        return [], [], [], [], [], [], [], [], [], []
+
     channel_idx = None
     for idx, name in enumerate(stain_complete_df.index):
         if name == condition:
             channel_idx = idx
             break
-
-    marker_img = seg_final["Filtered image"][:, :, :, marker_idx]
-    if marker_img is None:
-        return [], [], [], [], [], [], [], [], [], []
 
     shared_labels = []
     marker_sizes = []
@@ -1405,7 +1415,10 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
             avg_marker.append(0.0)
             std_marker.append(0.0)
 
-        cytoplasm_marker_mask = (marker_img > 0) & cytoplasm_mask
+        if marker_img_cyto is not None:
+            cytoplasm_marker_mask = (marker_img_cyto > 0) & cytoplasm_mask
+        else:
+            cytoplasm_marker_mask = (marker_img > 0) & cytoplasm_mask
         voxels_cyto = np.where(cytoplasm_marker_mask)
         marker_cyto_sizes.append(voxels_cyto[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
         if channel_idx is not None and voxels_cyto[0].size > 0:
@@ -1416,7 +1429,10 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
             avg_cyto_marker.append(0.0)
             std_cyto_marker.append(0.0)
 
-        pcm_marker_mask = (marker_img > 0) & pcm_mask
+        if marker_img_pcm is not None:
+            pcm_marker_mask = (marker_img_pcm > 0) & pcm_mask
+        else:
+            pcm_marker_mask = (marker_img > 0) & pcm_mask
         voxels_pcm = np.where(pcm_marker_mask)
         marker_pcm_sizes.append(voxels_pcm[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
         if channel_idx is not None and voxels_pcm[0].size > 0:
@@ -1900,7 +1916,7 @@ def build_labels_dict(
             nucleus_positions=(nuc_positions[i - 1] for i in shared_labels),
             cytoplasm_positions=(cyto_positions[i - 1] for i in shared_labels),
             nucleus_sizes=(nuc_sizes[i - 1] for i in shared_labels),
-            cytoplasm_sizes=(cyto_sizes[i - 1] for i in shared_labels),
+            cytoplasm_sizes=m_cyto_sizes,
             marker_sizes=m_sizes,
             avg_marker=m_avg,
             std_marker=m_std,
@@ -2017,7 +2033,7 @@ def build_full_labels_dict(
             nucleus_positions=(nuc_positions[i - 1] for i in full_labels),
             cytoplasm_positions=(cyto_positions[i - 1] for i in full_labels),
             nucleus_sizes=(nuc_sizes[i - 1] for i in full_labels),
-            cytoplasm_sizes=(cyto_sizes[i - 1] for i in full_labels),
+            cytoplasm_sizes=m_full_cyto_sizes,
             marker_sizes=m_full_sizes,
             avg_marker=m_full_avg,
             std_marker=m_full_std,
@@ -2732,7 +2748,7 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
         for t in range(len(labels_full_df)):
             row_data = labels_full_df.iloc[t]
             cond = row_data["Condition"]
-            if np.size(cond) != 1:
+            if np.size(cond) != 1 or cond == "CYTOPLASM":
                 continue
 
             color_key = str(row_data.get("Color", "")).upper()
