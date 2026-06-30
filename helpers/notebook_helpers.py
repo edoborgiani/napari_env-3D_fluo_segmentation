@@ -1391,6 +1391,8 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
         cytoplasm_mask = seg_stack["Cytoplasm"] == label_id
         pcm_mask = seg_stack["PCM"] == label_id
         marker_mask = ((nucleus_mask + cytoplasm_mask + pcm_mask) > 0) & (marker_img > 0)
+        if not np.any(marker_mask):
+            continue
 
         shared_labels.append(label_id)
         voxels = np.where(marker_mask)
@@ -2505,19 +2507,17 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
         def _fmt(**kw):
             return wb.add_format(kw)
 
-        f_title = _fmt(bold=True, font_size=13, border=1, align='center',
-                       valign='vcenter', bg_color=_COL_HDR)
         f_hdr   = _fmt(bold=True, border=1, align='center', valign='vcenter',
                        bg_color=_COL_HDR, text_wrap=True)
         f_subhd = _fmt(bold=True, border=1, align='center', valign='vcenter',
                        bg_color=_COL_SUBHD, text_wrap=True, font_size=9)
-        f_num   = _fmt(num_format='0.00')
-        f_int   = _fmt()
-        f_pct   = _fmt(num_format='0.0"%"')
-        f_alt   = _fmt(bg_color=_COL_ALT)
-        f_bold  = _fmt(bold=True)
-        f_sec   = _fmt(bold=True, font_size=11, bg_color=_COL_HDR,
-                       border=1, align='left', valign='vcenter')
+        f_num      = _fmt(num_format='0.00')
+        f_num_alt  = _fmt(num_format='0.00', bg_color=_COL_ALT)
+        f_int      = _fmt()
+        f_int_alt  = _fmt(bg_color=_COL_ALT)
+        f_pct      = _fmt(num_format='0.00"%"')
+        f_pct_alt  = _fmt(num_format='0.00"%"', bg_color=_COL_ALT)
+        f_str_alt  = _fmt(bg_color=_COL_ALT)
 
         def _write_sheet_title(ws, row, col, text, width_cols, bg):
             fmt = _fmt(bold=True, font_size=12, border=1, align='center',
@@ -2527,13 +2527,18 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
             return row + 1
 
         def _write_row(ws, row, values, fmts=None, alt=False):
-            base = f_alt if alt else None
             for c, v in enumerate(values):
-                fmt = (fmts[c] if fmts else None) or base
-                if isinstance(v, float):
-                    ws.write_number(row, c, v, fmt or f_num)
+                explicit = fmts[c] if fmts else None
+                if explicit:
+                    fmt = explicit
+                elif isinstance(v, float):
+                    fmt = f_num_alt if alt else f_num
                 elif isinstance(v, int):
-                    ws.write_number(row, c, v, fmt or f_int)
+                    fmt = f_int_alt if alt else f_int
+                else:
+                    fmt = f_str_alt if alt else None
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    ws.write_number(row, c, v, fmt)
                 else:
                     ws.write(row, c, v if v is not None else '', fmt)
 
@@ -2554,10 +2559,18 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
         for i, (idx, srow) in enumerate(original_stain_complete_df.iterrows()):
             color_key = str(srow.get('Color', '')).upper()
             bg = _channel_bg.get(color_key, _default_bg)
-            ch_fmt = _fmt(bg_color=bg, border=1)
-            vals = [str(idx)] + [str(srow.get(c, '')) for c in ['Marker', 'Laser', 'Color', 'Cont_min', 'Cont_max', 'Gamma']]
-            for c, v in enumerate(vals):
-                ws_setup.write(r, c, v, ch_fmt)
+            ch_fmt     = _fmt(bg_color=bg, border=1)
+            ch_fmt_num = _fmt(bg_color=bg, border=1, num_format='0.00')
+            ws_setup.write(r, 0, str(idx),                     ch_fmt)
+            ws_setup.write(r, 1, str(srow.get('Marker', '')),  ch_fmt)
+            ws_setup.write(r, 2, str(srow.get('Laser',  '')),  ch_fmt)
+            ws_setup.write(r, 3, str(srow.get('Color',  '')),  ch_fmt)
+            for j, col in enumerate(['Cont_min', 'Cont_max', 'Gamma']):
+                raw = srow.get(col, '')
+                try:
+                    ws_setup.write_number(r, 4 + j, float(raw), ch_fmt_num)
+                except (ValueError, TypeError):
+                    ws_setup.write(r, 4 + j, str(raw), ch_fmt)
             r += 1
 
         ws_setup.set_column(0, 0, 14)
@@ -2758,7 +2771,13 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
                     vals += ['', '', '']
 
             for c, v in enumerate(vals):
-                ws_sum.write(r, c, v, row_fmt)
+                num_fmt_row = _fmt(bg_color=bg, num_format='0.00') if c > 4 else _fmt(bg_color=bg)
+                if isinstance(v, float):
+                    ws_sum.write_number(r, c, v, num_fmt_row)
+                elif isinstance(v, int):
+                    ws_sum.write_number(r, c, v, row_fmt)
+                else:
+                    ws_sum.write(r, c, v if v != '' else '', row_fmt)
             r += 1
 
         ws_sum.set_column(0, 0, 14)
