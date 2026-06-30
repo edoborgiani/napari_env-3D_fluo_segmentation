@@ -82,6 +82,7 @@ __all__ = [
     "save_merged_figure",
     "save_raw_png",
     "save_single_channel_png",
+    "detect_aggregates",
     "segment_nuclei",
     "segment_nuclei_cellpose",
     "segment_nuclei_watershed",
@@ -95,6 +96,13 @@ __all__ = [
     "voxel_volume",
     "watershed_nuclei",
     "reload_helpers",
+    "run_normalize",
+    "run_resample",
+    "run_denoise",
+    "run_contrast_gamma",
+    "run_smooth",
+    "run_equalize",
+    "run_threshold",
 ]
 
 
@@ -1664,8 +1672,26 @@ def prepare_stain_settings(
 def export_channel_histograms(
     im_final_stack,
     stain_complete_df,
-    output_path,
-    processing_params=None,
+    input_file,
+    ROI_print=None,
+    big_image=True,
+    name_setup='',
+    nuclei_diameter=None,
+    cell_diameter=None,
+    cyto_factor=None,
+    PCM_factor=None,
+    zoom_factors=None,
+    scale_factor=1.0,
+    trig_cellpose=False,
+    trig_stardist=False,
+    multilabel=False,
+    cyto_markers=None,
+    nuclei_split_config=None,
+    sigma=0.5,
+    num_plateaus=2,
+    plateau_factor=0.7,
+    threshold_method='otsu',
+    aggregate_grow_factor=2.0,
     progress=None,
 ):
     """
@@ -1699,6 +1725,32 @@ def export_channel_histograms(
     -------
     output_path : str or Path
     """
+    from pathlib import Path as _Path
+    output_path = _Path(input_file).stem + '_histograms.xlsx'
+
+    processing_params = {
+        'Input file':                     str(input_file),
+        'ROI [x0,x1,y0,y1,z0,z1]':        str(ROI_print),
+        'Big image mode':                 str(big_image),
+        'Experiment name':                str(name_setup),
+        'Nuclei diameter (um)':           str(nuclei_diameter),
+        'Cell diameter (um)':             str(cell_diameter),
+        'Cyto factor':                    str(cyto_factor),
+        'PCM factor':                     str(PCM_factor),
+        'Zoom factors [Z,Y,X]':           str(zoom_factors),
+        'Scale factor':                   str(scale_factor),
+        'Use Cellpose':                   str(trig_cellpose),
+        'Use StarDist':                   str(trig_stardist),
+        'Multilabel':                     str(multilabel),
+        'Cyto markers':                   str(cyto_markers),
+        'Nuclei split config':            str(nuclei_split_config),
+        'Sigma (Gaussian smoothing)':     str(sigma),
+        'Num plateaus (histogram eq.)':   str(num_plateaus),
+        'Plateau factor (histogram eq.)': str(plateau_factor),
+        'Threshold method':               str(threshold_method),
+        'Aggregate grow factor':          str(aggregate_grow_factor),
+    }
+
     _stage_abbrev = {
         'Original image':   'Orig',
         'Normalized image': 'Norm',
@@ -1844,6 +1896,7 @@ def export_channel_histograms(
         params_ws.set_column(0, 0, 35)
         params_ws.set_column(1, 10, 20)
 
+    print(f"Histograms saved to: {output_path}")
     return output_path
 
 
@@ -2050,15 +2103,19 @@ def build_full_labels_dict(
 
 def build_labels_df(
     im_segmentation_stack,
-    filtered_img,
+    im_final_stack,
     stain_complete_df,
     stain_df,
-    r_xyz,
+    r_zX,
+    r_zY,
+    r_zZ,
     zooms,
     multilabel=False,
     progress=None,
 ):
-    """Build the compact quantification dictionary, convert it to DataFrames, and return both."""
+    """Build the compact quantification dictionary, display a preview, and return the DataFrame."""
+    filtered_img = im_final_stack['Filtered image']
+    r_xyz = (r_zX, r_zY, r_zZ)
     labels_dict = build_labels_dict(
         im_segmentation_stack,
         filtered_img,
@@ -2069,19 +2126,28 @@ def build_labels_df(
         multilabel=multilabel,
         progress=progress,
     )
-    return labels_dict_to_dataframe(labels_dict, truncate=True, progress=progress)
+    labels_df, truncated_df = labels_dict_to_dataframe(labels_dict, truncate=True, progress=progress)
+    try:
+        from IPython.display import display as _display
+        _display(truncated_df)
+    except Exception:
+        pass
+    return labels_df
 
 
 def build_full_labels_df(
     im_segmentation_stack,
     im_final_stack,
-    filtered_img,
     stain_complete_df,
-    r_xyz,
+    r_X,
+    r_Y,
+    r_Z,
     zooms,
     progress=None,
 ):
     """Build the full quantification dictionary and convert it to a DataFrame."""
+    filtered_img = im_final_stack['Filtered image']
+    r_xyz = (r_X, r_Y, r_Z)
     labels_full_dict = build_full_labels_dict(
         im_segmentation_stack,
         im_final_stack,
@@ -2230,7 +2296,6 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
 def build_histogram_report(
     im_segmentation_stack,
     im_final_stack,
-    filtered_img,
     stain_df,
     stain_complete_df,
     input_file,
@@ -2244,6 +2309,8 @@ def build_histogram_report(
 
     if thumb_size is None:
         thumb_size = (2.0 * inch, 2.0 * inch)
+
+    filtered_img = im_final_stack['Filtered image']
 
     hist_data, intensity_ranges = collect_histogram_data(
         im_segmentation_stack,
@@ -2379,8 +2446,9 @@ def plot_nucleus_kdes(hist_data, stain_complete_df, progress=None, max_subplots=
     return fig, axes, x_grid
 
 
-def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_in, r_X, r_Y, r_Z, zoom_factors, progress=None):
+def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_final_stack, r_X, r_Y, r_Z, zoom_factors, progress=None):
     """Plot X/Y/Z spatial distributions for each population."""
+    im_in = im_final_stack['Filtered image']
     fig, axs = plt.subplots(3, 1, figsize=(15, 15))
 
     for idx, marker in _progress_iter(
@@ -2803,6 +2871,7 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
         ws_sum.set_column(6, len(sum_cols) - 1, 18)
         ws_sum.freeze_panes(2, 0)
 
+    print(f"Segmentation report saved to: {output_path}")
     return output_path
 
 
@@ -3870,6 +3939,115 @@ def segment_nuclei_watershed(
 
     return im_out, debug_info
 
+
+# ── Pipeline wrappers (Cell-level helpers) ─────────────────────────────────
+# Each function handles one processing step end-to-end:
+# updates im_final_stack in-place, plots the resulting histogram, and returns
+# the updated stack (plus any derived values).
+
+def run_normalize(im_final_stack, stain_complete_df):
+    """Normalize each channel to [0, 255] and display histogram."""
+    im_final_stack['Normalized image'] = normalize_image_channels(im_final_stack['Original image'])
+    hist_plot(im_final_stack['Normalized image'], stain_complete_df)
+    return im_final_stack
+
+
+def run_resample(im_final_stack, stain_complete_df, zoom_factors, meta):
+    """Resample to isotropic voxel spacing and display histogram.
+
+    Returns
+    -------
+    im_final_stack : dict
+    r_zX, r_zY, r_zZ : float  —  isotropic voxel sizes in µm
+    """
+    im_final_stack['Zoomed image'], r_zX, r_zY, r_zZ = resample_to_isotropic(
+        im_final_stack['Normalized image'], zoom_factors, meta=meta
+    )
+    hist_plot(im_final_stack['Zoomed image'], stain_complete_df)
+    return im_final_stack, r_zX, r_zY, r_zZ
+
+
+def run_denoise(im_final_stack, stain_complete_df):
+    """Apply median filter for noise removal and display histogram."""
+    im_final_stack['Denoised image'] = apply_median_denoise(im_final_stack['Zoomed image'])
+    hist_plot(im_final_stack['Denoised image'], stain_complete_df)
+    return im_final_stack
+
+
+def run_contrast_gamma(im_final_stack, stain_complete_df):
+    """Apply per-channel contrast and gamma adjustments and display histogram."""
+    im_final_stack['Adjusted image'] = apply_contrast_gamma_per_channel(
+        im_final_stack['Denoised image'], stain_complete_df
+    )
+    hist_plot(im_final_stack['Adjusted image'], stain_complete_df)
+    return im_final_stack
+
+
+def run_smooth(im_final_stack, stain_complete_df, sigma=0.5):
+    """Apply Gaussian smoothing and display histogram.
+
+    Parameters
+    ----------
+    sigma : float
+        Standard deviation of the Gaussian kernel in voxels.
+        Controls noise suppression vs. detail preservation.
+        0 = no smoothing; 0.5 (default) = mild; 1–2 = stronger (noisier data).
+    """
+    im_final_stack['Filtered image'] = apply_gaussian_smoothing(
+        im_final_stack['Adjusted image'], sigma
+    )
+    hist_plot(im_final_stack['Filtered image'], stain_complete_df)
+    return im_final_stack
+
+
+def run_equalize(im_final_stack, stain_complete_df, num_plateaus=2, plateau_factor=0.7):
+    """Apply histogram equalization and display histogram.
+
+    Parameters
+    ----------
+    num_plateaus : int
+        Number of clipping plateaus applied during equalization.
+        Higher values redistribute intensity more aggressively.
+        2 (default) suits most data; increase to 3–4 for dim channels.
+    plateau_factor : float
+        Clipping height relative to the mean histogram bin count.
+        Lower = stronger clipping. Typical range 0.5–1.0.
+    """
+    im_final_stack['Equalized image'] = apply_histogram_equalization_per_channel(
+        im_final_stack['Filtered image'], num_plateaus, plateau_factor
+    )
+    hist_plot(im_final_stack['Equalized image'], stain_complete_df)
+    return im_final_stack
+
+
+def run_threshold(im_final_stack, stain_complete_df,
+                  nuclei_diameter, cell_diameter,
+                  r_zX, r_zY, r_zZ,
+                  threshold_method='otsu',
+                  progress=None):
+    """Apply combined thresholding and store the result in im_final_stack.
+
+    Parameters
+    ----------
+    threshold_method : str
+        Global thresholding algorithm used as one component (15%) of the
+        combined threshold (the rest is Sauvola local + statistical background).
+        - ``'otsu'``   : maximises inter-class variance (default; bimodal data).
+        - ``'median'`` : threshold at median non-zero intensity (sparse signal).
+        - ``'huang'``  : fuzzy entropy method (dim or diffuse signal).
+    """
+    im_final_stack["Threshold image"] = apply_threshold_per_channel(
+        im_final_stack["Equalized image"],
+        stain_complete_df=stain_complete_df,
+        nuclei_diameter=nuclei_diameter,
+        cell_diameter=cell_diameter,
+        r_zxyz=(r_zX, r_zY, r_zZ),
+        threshold_method=threshold_method,
+        progress=progress,
+    )
+    return im_final_stack
+
+
 def normalize_image_channels(image_stack):
     """
     Normalize each channel to [0, 255] range independently.
@@ -4635,6 +4813,28 @@ def segment_nuclei(
 
         im_segmentation_stack['Nuclei'] = im_out
 
+    return im_segmentation_stack
+
+
+def detect_aggregates(im_segmentation_stack, stain_df, aggregate_grow_factor=2.0):
+    """Detect cell aggregates by growing cytoplasm labels and masking overlap.
+
+    Only runs when a NUCLEI or CYTOPLASM channel is present (i.e. not LD mode).
+    Updates ``im_segmentation_stack`` in-place with an ``'Aggregates'`` key.
+
+    Returns
+    -------
+    im_segmentation_stack : dict
+        Updated with ``'Aggregates'`` label array (or unchanged if not applicable).
+    """
+    from scipy.ndimage import label as _label
+
+    if ('NUCLEI' in stain_df.index) | ('CYTOPLASM' in stain_df.index):
+        im_out, _ = _label(
+            grow_labels(im_segmentation_stack['Cytoplasm'], aggregate_grow_factor) > 0
+        )
+        im_segmentation_stack = dict(im_segmentation_stack)
+        im_segmentation_stack['Aggregates'] = im_out * (im_segmentation_stack['Cytoplasm'] > 0)
     return im_segmentation_stack
 
 
