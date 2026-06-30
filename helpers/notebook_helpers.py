@@ -2266,7 +2266,7 @@ def collect_histogram_data(im_segmentation_stack, filtered_img, stain_df, stain_
     intensity_ranges = {}
 
     for c in _progress_iter(range(filtered_img.shape[3]), progress, desc="Step 26A - Collect Histogram Data"):
-        if stain_df.index[c] == "NUCLEI":
+        if stain_df.index[c] in ("NUCLEI", "CYTOPLASM"):
             continue
 
         condition = stain_complete_df.index[c]
@@ -2371,9 +2371,9 @@ def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_in, r_
         desc="Step 28 - Plot Spatial Distributions",
         total=len(labels_df.index),
     ):
-        xcoor = [t[0] for t in labels_df.iloc[idx]["Mean cytoplasm positions [um]"]]
-        ycoor = [t[1] for t in labels_df.iloc[idx]["Mean cytoplasm positions [um]"]]
-        zcoor = [t[2] for t in labels_df.iloc[idx]["Mean cytoplasm positions [um]"]]
+        xcoor = [t[0] for t in labels_df.iloc[idx]["Mean nuclei positions [um]"]]
+        ycoor = [t[1] for t in labels_df.iloc[idx]["Mean nuclei positions [um]"]]
+        zcoor = [t[2] for t in labels_df.iloc[idx]["Mean nuclei positions [um]"]]
 
         xcount, xbins = np.histogram(xcoor, range=(0, im_in.shape[2] * r_X / zoom_factors[2]), bins=30)
         ycount, ybins = np.histogram(ycoor, range=(0, im_in.shape[1] * r_Y / zoom_factors[1]), bins=30)
@@ -2383,8 +2383,10 @@ def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_in, r_
         zbin_centers = (zbins[:-1] + zbins[1:]) / 2
 
         condition = labels_df.iloc[idx]["Condition"]
+        if condition == "CYTOPLASM":
+            continue
         color = _condition_color(condition, stain_complete_df, stain_df=stain_df)
-        if np.size(marker) == 1 and condition != "NUCLEI":
+        if np.size(marker) == 1:
             axs[0].plot(xbin_centers, xcount, label=str(condition), color=color)
             axs[1].plot(ybin_centers, ycount, label=str(condition), color=color)
             axs[2].plot(zbin_centers, zcount, label=str(condition), color=color)
@@ -4453,34 +4455,35 @@ def segment_cytoplasm(
             "Run nuclei segmentation first so im_segmentation_stack contains 'Nuclei'."
         )
 
-    if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index) or len(cyto_markers) > 0):
+    if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index)
+            or len(cyto_markers) > 0 or cyto_factor > 1):
         return im_segmentation_stack, stain_complete_df
 
     im_in = im_final_stack['Threshold image'].copy()
     im_out = np.zeros_like(im_in[:, :, :, 0], dtype=np.int32)
 
-    for c in progress(range(im_in.shape[3]), desc='Step 18A - Segment Cytoplasm'):
-        if stain_df.index[c] == 'CYTOPLASM':
-            from scipy import ndimage as _ndi
-            distance = _ndi.distance_transform_edt(
-                im_in[:, :, :, c], sampling=[r_zZ, r_zY, r_zX]
-            )
-            radius_X = int((nuclei_diameter / 2.0) / r_zX)
-            radius_Y = int((nuclei_diameter / 2.0) / r_zY)
-            radius_Z = int((nuclei_diameter / 2.0) / r_zZ)
-            coords = peak_local_max(
-                distance,
-                footprint=make_anisotropic_footprint(radius_Z, radius_Y, radius_X),
-                labels=im_in[:, :, :, c].astype(np.int32),
-            )
-            mask = np.zeros(distance.shape, dtype=bool)
-            mask[tuple(coords.T)] = True
-            _, _ = skimage_label(mask, return_num=True)
-            im_out = watershed(-distance, im_segmentation_stack['Nuclei'], mask=im_in[:, :, :, c])
+    has_cyto_channel = 'CYTOPLASM' in stain_df.index
 
-    if 'CYTOPLASM' not in stain_df.index:
+    if has_cyto_channel:
+        for c in progress(range(im_in.shape[3]), desc='Step 18A - Segment Cytoplasm'):
+            if stain_df.index[c] == 'CYTOPLASM':
+                from scipy import ndimage as _ndi
+                cyto_binary = im_in[:, :, :, c] > 0
+                nuc_mask = im_segmentation_stack['Nuclei'] > 0
+                combined_mask = cyto_binary | nuc_mask
+                distance = _ndi.distance_transform_edt(
+                    combined_mask, sampling=[r_zZ, r_zY, r_zX]
+                )
+                im_out = watershed(
+                    -distance, im_segmentation_stack['Nuclei'],
+                    mask=combined_mask,
+                )
+                print(f"Cytoplasm segmented from CYTOPLASM channel + nuclei region (watershed)")
+                break
+    else:
         if len(cyto_markers) == 0:
             im_out = grow_labels(im_segmentation_stack['Nuclei'], cyto_factor)
+            print(f"Cytoplasm grown from nuclei labels (factor={cyto_factor})")
         else:
             im_out = im_segmentation_stack['Nuclei'] > 0
             for c in progress(range(im_in.shape[3]), desc='Step 18B - Apply Cyto Markers'):
@@ -4492,8 +4495,30 @@ def segment_cytoplasm(
             im_out = grow_markers_within_islands_limited(
                 im_segmentation_stack['Nuclei'], binary_mask, max_distance=10.0
             )
+            print(f"Cytoplasm expanded using markers: {cyto_markers}")
         stain_complete_df = stain_complete_df.copy()
         stain_complete_df.loc['CYTOPLASM'] = ['', '', '', '', '', '']
+
+    nuclei_labels = im_segmentation_stack['Nuclei']
+    max_label = int(nuclei_labels.max())
+    filled = 0
+    for label_id in range(1, max_label + 1):
+        nuc_mask = nuclei_labels == label_id
+        if not np.any(nuc_mask):
+            continue
+        cyto_mask = im_out == label_id
+        cyto_beyond_nuc = cyto_mask & ~nuc_mask
+        if np.any(cyto_beyond_nuc):
+            continue
+        im_out[cyto_mask] = 0
+        single = np.zeros_like(nuclei_labels, dtype=np.int32)
+        single[nuc_mask] = label_id
+        grown = grow_labels(single, cyto_factor)
+        fill_mask = (grown == label_id) & (im_out == 0)
+        im_out[fill_mask] = label_id
+        filled += 1
+    if filled > 0:
+        print(f"Cytoplasm gap-filled for {filled} nuclei by label-grow (factor={cyto_factor})")
 
     im_segmentation_stack = dict(im_segmentation_stack)
     im_segmentation_stack['Cytoplasm'] = im_out.copy()
@@ -4532,11 +4557,13 @@ def segment_pcm(
     if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index)):
         return im_segmentation_stack
 
-    if len(cyto_markers) == 0:
-        im_out = grow_labels(im_segmentation_stack['Nuclei'], PCM_factor)
-    else:
+    has_cyto_channel = 'CYTOPLASM' in stain_df.index
+
+    if has_cyto_channel or len(cyto_markers) > 0:
         P_factor = int(PCM_factor - cyto_factor)
         im_out = grow_labels(im_segmentation_stack['Cytoplasm'], P_factor)
+    else:
+        im_out = grow_labels(im_segmentation_stack['Nuclei'], PCM_factor)
 
     im_out = im_out - im_segmentation_stack['Cytoplasm']
 
@@ -4713,6 +4740,11 @@ def view_processing_results(
                     im_segmentation_stack[idx].astype(np.int32),
                     name=f'{idx} ({marker})', blending='additive', scale=scale_zoom,
                 )
+        if 'Cytoplasm' in im_segmentation_stack and 'CYTOPLASM' not in stain_df.index:
+            viewer_1.add_labels(
+                im_segmentation_stack['Cytoplasm'].astype(np.int32),
+                name='CYTOPLASM (computed)', blending='additive', scale=scale_zoom,
+            )
         if 'Aggregates' in im_segmentation_stack:
             viewer_1.add_labels(
                 im_segmentation_stack['Aggregates'].astype(np.int32),
