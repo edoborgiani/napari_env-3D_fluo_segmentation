@@ -1,4 +1,4 @@
-﻿from collections import defaultdict
+from collections import defaultdict
 import os
 
 import cv2
@@ -2346,30 +2346,42 @@ def build_histogram_report(
 
 
 def collect_histogram_data(im_segmentation_stack, filtered_img, stain_df, stain_complete_df, progress=None):
-    """Collect per-nucleus intensity values for all non-nuclear markers."""
+    """Collect per-nucleus intensity values for all non-nuclear markers.
+
+    Uses the assigned segmentation label image (from assign_channel_labels) to
+    determine which voxels belong to a positive cell — matching the mask used by
+    compute_full_marker_stats_for_marker so that avg/STD values in the PDF report
+    are identical to those in the Excel quantification table.
+    """
     hist_data = {}
     intensity_ranges = {}
 
     for c in _progress_iter(range(filtered_img.shape[3]), progress, desc="Step 26A - Collect Histogram Data"):
-        if stain_df.index[c] in ("NUCLEI", "CYTOPLASM"):
+        seg_key = stain_df.index[c]
+        if seg_key in ("NUCLEI", "CYTOPLASM"):
+            continue
+
+        assigned = im_segmentation_stack.get(seg_key)
+        if assigned is None:
             continue
 
         condition = stain_complete_df.index[c]
-        marker_img = filtered_img[:, :, :, c]
-        intensity_ranges[condition] = (float(marker_img.min()), float(marker_img.max()))
+        intensity_img = filtered_img[:, :, :, c]
+        intensity_ranges[condition] = (float(intensity_img.min()), float(intensity_img.max()))
         max_n = int(np.max(im_segmentation_stack["Nuclei"]))
 
         for nucleus_id in _progress_iter(range(1, max_n + 1), progress, desc=f"Step 26B - {condition} Nuclei"):
             hist_data.setdefault(nucleus_id, {})
             hist_data[nucleus_id].setdefault(condition, [])
 
-            nuc_mask = im_segmentation_stack["Nuclei"] == nucleus_id
+            nuc_mask  = im_segmentation_stack["Nuclei"]    == nucleus_id
             cyto_mask = im_segmentation_stack["Cytoplasm"] == nucleus_id
-            pcm_mask = im_segmentation_stack["PCM"] == nucleus_id
-            mask_marker = (marker_img > 0) & ((nuc_mask + cyto_mask + pcm_mask) > 0)
+            pcm_mask  = im_segmentation_stack["PCM"]       == nucleus_id
+            cell_mask = (nuc_mask | cyto_mask | pcm_mask)
+            mask_marker = (assigned > 0) & cell_mask
 
             if np.any(mask_marker):
-                values = marker_img[mask_marker]
+                values = intensity_img[mask_marker]
                 if values.size > 0:
                     hist_data[nucleus_id][condition].extend(values.tolist())
 
@@ -5445,9 +5457,9 @@ def build_vtk_volumes(
             blocks_PCM.append(mesh_PCM)
 
     stem = str(_Path(input_file).stem)
-    blocks_nuclei.extract_geometry().save(stem + '_NUCLEI_labelled.vtk')
-    blocks_cyto.extract_geometry().save(stem + '_CYTOPLASM_labelled.vtk')
-    blocks_PCM.extract_geometry().save(stem + '_PCM_labelled.vtk')
+    blocks_nuclei.extract_surface(algorithm=None).save(stem + '_NUCLEI_labelled.vtk')
+    blocks_cyto.extract_surface(algorithm=None).save(stem + '_CYTOPLASM_labelled.vtk')
+    blocks_PCM.extract_surface(algorithm=None).save(stem + '_PCM_labelled.vtk')
 
 
 def export_marker_stl(
@@ -5547,8 +5559,10 @@ def export_fea_mesh(
             nodes, elems = tet.node, tet.elem
     else:
         nodes, elems = tet.node, tet.elem
-    tet.write('FE_segmentation_full.vtk', binary=False)
-
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='.*binary.*', category=DeprecationWarning)
+        tet.write('FE_segmentation_full.vtk', binary=False)
     meshel = meshio.read('FE_segmentation_full.vtk')
     meshel.write('FE_segmentation.inp')
 
