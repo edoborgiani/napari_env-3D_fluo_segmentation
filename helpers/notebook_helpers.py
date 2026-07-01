@@ -2139,15 +2139,19 @@ def build_full_labels_df(
     im_segmentation_stack,
     im_final_stack,
     stain_complete_df,
-    r_X,
-    r_Y,
-    r_Z,
+    r_zX,
+    r_zY,
+    r_zZ,
     zooms,
     progress=None,
 ):
-    """Build the full quantification dictionary and convert it to a DataFrame."""
+    """Build the full quantification dictionary and convert it to a DataFrame.
+
+    Uses zoomed voxel sizes (r_zX, r_zY, r_zZ) because the segmentation arrays
+    are in zoomed pixel space — consistent with build_labels_df (Cell 24).
+    """
     filtered_img = im_final_stack['Filtered image']
-    r_xyz = (r_X, r_Y, r_Z)
+    r_xyz = (r_zX, r_zY, r_zZ)
     labels_full_dict = build_full_labels_dict(
         im_segmentation_stack,
         im_final_stack,
