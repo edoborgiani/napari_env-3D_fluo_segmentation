@@ -2825,6 +2825,7 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
         nuclei_total = (float(nuclei_rows.iloc[0]["Number"])
                         if not nuclei_rows.empty else 1.0)
 
+        # ── Single-condition rows ─────────────────────────────────────────
         for t in range(len(labels_full_df)):
             row_data = labels_full_df.iloc[t]
             cond = row_data["Condition"]
@@ -2872,6 +2873,53 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
                     ws_sum.write_number(r, c, v, num_fmt_row)
                 elif isinstance(v, int):
                     ws_sum.write_number(r, c, v, row_fmt)
+                else:
+                    ws_sum.write(r, c, v if v != '' else '', row_fmt)
+            r += 1
+
+        # ── Multilabel combination rows ───────────────────────────────────
+        _COL_MULTI = '#FFFFFF'
+        has_multi = any(
+            np.size(labels_full_df.iloc[t]["Condition"]) != 1
+            for t in range(len(labels_full_df))
+        )
+        if has_multi:
+            sec_fmt = _fmt(bold=True, bg_color=_COL_SUM, border=1)
+            ws_sum.write(r, 0, 'MULTILABEL COMBINATIONS', sec_fmt)
+            for c in range(1, len(sum_cols)):
+                ws_sum.write(r, c, '', sec_fmt)
+            ws_sum.set_row(r, 16)
+            r += 1
+
+        for t in range(len(labels_full_df)):
+            row_data = labels_full_df.iloc[t]
+            cond = row_data["Condition"]
+            if np.size(cond) == 1:
+                continue
+
+            row_fmt     = _fmt(bg_color=_COL_MULTI)
+            row_fmt_num = _fmt(bg_color=_COL_MULTI, num_format='0.00')
+
+            cond_str   = ' + '.join(str(c) for c in cond) if hasattr(cond, '__iter__') else str(cond)
+            nuc_sizes  = row_data["Nuclei size [um3]"]
+            cyto_sizes = row_data["Cytoplasm size [um3]"]
+            count      = int(row_data["Number"])
+            pct        = 100.0 * count / nuclei_total
+
+            vals = [
+                cond_str, '', '', '',
+                count,
+                round(pct, 1),
+                round(float(np.mean(nuc_sizes)),  2) if len(nuc_sizes)  > 0 else '',
+                round(float(np.std(nuc_sizes)),   2) if len(nuc_sizes)  > 0 else '',
+                round(float(np.mean(cyto_sizes)), 2) if len(cyto_sizes) > 0 else '',
+                round(float(np.std(cyto_sizes)),  2) if len(cyto_sizes) > 0 else '',
+            ] + [''] * (len(single_markers) * 3)
+
+            for c, v in enumerate(vals):
+                fmt = row_fmt_num if c > 4 and isinstance(v, float) else row_fmt
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    ws_sum.write_number(r, c, v, fmt)
                 else:
                     ws_sum.write(r, c, v if v != '' else '', row_fmt)
             r += 1
@@ -5456,10 +5504,18 @@ def build_vtk_volumes(
             blocks_cyto.append(mesh_cyto)
             blocks_PCM.append(mesh_PCM)
 
+    def _to_surface(block):
+        if hasattr(block, 'extract_surface'):
+            try:
+                return block.extract_surface(algorithm=None)
+            except TypeError:
+                return block.extract_surface()
+        return block.extract_geometry()
+
     stem = str(_Path(input_file).stem)
-    blocks_nuclei.extract_surface(algorithm=None).save(stem + '_NUCLEI_labelled.vtk')
-    blocks_cyto.extract_surface(algorithm=None).save(stem + '_CYTOPLASM_labelled.vtk')
-    blocks_PCM.extract_surface(algorithm=None).save(stem + '_PCM_labelled.vtk')
+    _to_surface(blocks_nuclei).save(stem + '_NUCLEI_labelled.vtk')
+    _to_surface(blocks_cyto).save(stem + '_CYTOPLASM_labelled.vtk')
+    _to_surface(blocks_PCM).save(stem + '_PCM_labelled.vtk')
 
 
 def export_marker_stl(
