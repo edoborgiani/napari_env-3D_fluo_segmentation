@@ -1,4 +1,4 @@
-﻿napari[all]
+napari[all]
 numpy
 scipy
 scikit-image
@@ -19,6 +19,6 @@ tetgen<0.7; python_version < "3.10"
 tetgen>=0.7; python_version >= "3.10"
 meshlib>=3.0.6
 pandas
-vispy
+xlsxwriter
 reportlab
 Pillow
