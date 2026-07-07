@@ -87,6 +87,7 @@ __all__ = [
     "segment_nuclei_cellpose",
     "segment_nuclei_watershed",
     "segment_cytoplasm",
+    "segment_cytoplasm_cellpose",
     "segment_pcm",
     "set_notebook_context",
     "shrink_to_markers",
@@ -1684,6 +1685,7 @@ def export_channel_histograms(
     scale_factor=1.0,
     trig_cellpose=False,
     trig_stardist=False,
+    trig_cellpose_cyto=False,
     multilabel=False,
     cyto_markers=None,
     nuclei_split_config=None,
@@ -1741,6 +1743,7 @@ def export_channel_histograms(
         'Scale factor':                   str(scale_factor),
         'Use Cellpose':                   str(trig_cellpose),
         'Use StarDist':                   str(trig_stardist),
+        'Use Cellpose (cytoplasm shape)': str(trig_cellpose_cyto),
         'Multilabel':                     str(multilabel),
         'Cyto markers':                   str(cyto_markers),
         'Nuclei split config':            str(nuclei_split_config),
@@ -4700,6 +4703,68 @@ def segment_nuclei_cellpose(image_3d, nuclei_diameter, voxel_size, model_type='n
     return labels.astype(np.int32)
 
 
+def segment_cytoplasm_cellpose(image_3d, cell_diameter, voxel_size, nuclei_labels, model_type='cyto3'):
+    """Shape whole-cell (cytoplasm) instances using Cellpose 3D, seeded by nuclei labels.
+
+    Cellpose segments the cell bodies independently of the nuclei labelling, so
+    each resulting instance is relabelled to the nucleus label it overlaps the
+    most with. Instances with no nucleus overlap are discarded (background);
+    nuclei with no matching instance are left for the caller's gap-fill step.
+
+    Parameters
+    ----------
+    image_3d : ndarray (Z, Y, X)
+        Single-channel intensity image (e.g. filtered CYTOPLASM channel).
+    cell_diameter : float
+        Approximate whole-cell diameter in micrometers.
+    voxel_size : tuple (Z, Y, X)
+        Physical voxel spacing in micrometers, used for anisotropy.
+    nuclei_labels : ndarray (Z, Y, X), int
+        Nuclei label volume used to reconcile Cellpose instance IDs with the
+        rest of the pipeline's nuclei-driven labelling.
+    model_type : str
+        Cellpose model name (default ``'cyto3'``).
+
+    Returns
+    -------
+    labels : ndarray (Z, Y, X), int32
+        Integer label volume matching nuclei IDs (0 = background).
+    """
+    from cellpose import models
+
+    model = models.Cellpose(model_type=model_type, gpu=True)
+
+    xy_spacing = float(np.mean([voxel_size[1], voxel_size[2]]))
+    diameter_px = cell_diameter / xy_spacing
+    anisotropy = float(voxel_size[0] / xy_spacing)
+
+    cell_labels, _, _, _ = model.eval(
+        image_3d,
+        diameter=diameter_px,
+        anisotropy=anisotropy,
+        do_3D=True,
+        channels=[0, 0],
+    )
+
+    labels = np.zeros_like(cell_labels, dtype=np.int32)
+    for cell_id in np.unique(cell_labels):
+        if cell_id == 0:
+            continue
+        instance_mask = cell_labels == cell_id
+        overlapping_nuclei = nuclei_labels[instance_mask]
+        overlapping_nuclei = overlapping_nuclei[overlapping_nuclei > 0]
+        if overlapping_nuclei.size == 0:
+            continue
+        labels[instance_mask] = int(np.argmax(np.bincount(overlapping_nuclei)))
+
+    print(
+        f"Cellpose: {int(np.count_nonzero(np.unique(labels)))} cells shaped "
+        f"(model={model_type}, diameter_px={diameter_px:.1f}, "
+        f"anisotropy={anisotropy:.2f})"
+    )
+    return labels
+
+
 def segment_nuclei(
     im_final_stack,
     stain_df,
@@ -4911,12 +4976,16 @@ def segment_cytoplasm(
     cyto_factor,
     nuclei_diameter,
     r_zxyz,
+    cell_diameter=None,
+    trig_cellpose_cyto=False,
     progress=None,
 ):
     """
     Segment cytoplasm from the thresholded image.
 
-    If a CYTOPLASM channel is present it is segmented with watershed.
+    If a CYTOPLASM channel is present it is segmented with watershed, or with
+    Cellpose 3D (if ``trig_cellpose_cyto`` is True) to shape cells directly from
+    the CYTOPLASM channel intensity, then relabelled to match nuclei IDs.
     Otherwise cytoplasm is grown from nuclei labels using cyto_markers (if any)
     or a simple label-grow.
 
@@ -4936,6 +5005,13 @@ def segment_cytoplasm(
         Approximate nucleus diameter in micrometers.
     r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
         Isotropic voxel sizes.
+    cell_diameter : float, optional
+        Approximate whole-cell diameter in micrometers. Required when
+        ``trig_cellpose_cyto`` is True.
+    trig_cellpose_cyto : bool
+        If True and a CYTOPLASM channel is present, shape cells with Cellpose 3D
+        instead of the nuclei-seeded watershed. Lets nuclei come from one method
+        (e.g. StarDist) while cell shape comes from Cellpose.
     progress : callable, optional
         Progress wrapper.
 
@@ -4970,18 +5046,32 @@ def segment_cytoplasm(
     if has_cyto_channel:
         for c in progress(range(im_in.shape[3]), desc='Step 18A - Segment Cytoplasm'):
             if stain_df.index[c] == 'CYTOPLASM':
-                from scipy import ndimage as _ndi
-                cyto_binary = im_in[:, :, :, c] > 0
-                nuc_mask = im_segmentation_stack['Nuclei'] > 0
-                combined_mask = cyto_binary | nuc_mask
-                distance = _ndi.distance_transform_edt(
-                    combined_mask, sampling=[r_zZ, r_zY, r_zX]
-                )
-                im_out = watershed(
-                    -distance, im_segmentation_stack['Nuclei'],
-                    mask=combined_mask,
-                )
-                print(f"Cytoplasm segmented from CYTOPLASM channel + nuclei region (watershed)")
+                if trig_cellpose_cyto:
+                    if cell_diameter is None:
+                        raise ValueError(
+                            "cell_diameter is required when trig_cellpose_cyto=True."
+                        )
+                    im_filt = im_final_stack['Filtered image'].copy()
+                    im_out = segment_cytoplasm_cellpose(
+                        im_filt[:, :, :, c],
+                        cell_diameter=cell_diameter,
+                        voxel_size=(r_zZ, r_zY, r_zX),
+                        nuclei_labels=im_segmentation_stack['Nuclei'],
+                    )
+                    print("Cytoplasm shaped from CYTOPLASM channel via Cellpose 3D")
+                else:
+                    from scipy import ndimage as _ndi
+                    cyto_binary = im_in[:, :, :, c] > 0
+                    nuc_mask = im_segmentation_stack['Nuclei'] > 0
+                    combined_mask = cyto_binary | nuc_mask
+                    distance = _ndi.distance_transform_edt(
+                        combined_mask, sampling=[r_zZ, r_zY, r_zX]
+                    )
+                    im_out = watershed(
+                        -distance, im_segmentation_stack['Nuclei'],
+                        mask=combined_mask,
+                    )
+                    print(f"Cytoplasm segmented from CYTOPLASM channel + nuclei region (watershed)")
                 break
     else:
         if len(cyto_markers) == 0:

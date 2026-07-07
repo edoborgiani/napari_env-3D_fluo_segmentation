@@ -31,6 +31,13 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 
 ## Getting Started
 
+> **Tip — faster installs:** `requirements.txt` pulls in several large, dependency-heavy packages (napari, TensorFlow, PyTorch-based Cellpose, VTK/PyVista, SimpleITK). Plain `pip` can take a long time to resolve and download all of them. Installing [`uv`](https://github.com/astral-sh/uv) first and using it in place of `pip install` (same `requirements.txt`, no other changes needed) resolves and installs the same packages dramatically faster:
+> ```
+> pip install uv
+> uv pip install -r requirements.txt
+> ```
+> The plain `pip install -r requirements.txt` commands below still work exactly the same if you'd rather not add `uv`.
+
 ### Windows
 
 1. **Clone the repository**
@@ -164,8 +171,8 @@ The notebook installs optional packages automatically via `notebook_setup_helper
 - Small artefact islands removed via `remove_small_islands()`.
 
 ### 8. Segmentation
-- **Nuclei**: 3D watershed (`segment_nuclei_watershed()`) or StarDist2D slice-by-slice with 3D merging (`stardist3d_from_2d()`).
-- **Cytoplasm / PCM**: grown from nuclei via `grow_labels()` or from additional channels.
+- **Nuclei**: 3D watershed (`segment_nuclei_watershed()`), StarDist2D slice-by-slice with 3D merging (`stardist3d_from_2d()`), or Cellpose 3D (`segment_nuclei_cellpose()`).
+- **Cytoplasm / PCM**: grown from nuclei via `grow_labels()`, from additional channels, or shaped directly with Cellpose 3D (`segment_cytoplasm_cellpose()`) and relabelled to the nuclei IDs — independent of which method found the nuclei, so e.g. StarDist nuclei + Cellpose cell shape is a valid combination.
 - **Label assignment**: `assign_labels()` maps segmented structures to marker channels.
 - **Aggregate detection**: large multi-cell aggregates flagged separately.
 
@@ -252,7 +259,7 @@ See `requirements.txt` for the full list. Key dependencies:
 - `aicsimageio[nd2]`, `nd2reader`
 - `pyvista`, `SimpleITK`, `csbdeep`, `stardist`
 - `meshio`, `tetgen`, `meshlib`
-- `xlsxwriter`, `reportlab`, `Pillow`, `vispy`
+- `xlsxwriter`, `reportlab`, `Pillow`
 
 ## Contributing
 Contributions are welcome. Please open issues or pull requests for bug fixes, improvements, or new features.
