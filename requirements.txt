@@ -1,24 +1,34 @@
+# Core / visualization
 napari[all]
 numpy
 scipy
 scikit-image
 matplotlib
+Pillow
+
+# Notebook environment
 jupyter
+
+# Image I/O
 opencv-python
 aicsimageio[nd2]>=4.0
 nd2reader
-xlsxwriter
-pyvista>=0.43
-simpleitk
+
+# Segmentation models
 tensorflow>=2.16,<2.17
 csbdeep
 stardist
 cellpose>=3.0
+
+# 3D processing / meshing
+simpleitk
+pyvista>=0.43
 meshio
 tetgen<0.7; python_version < "3.10"
 tetgen>=0.7; python_version >= "3.10"
 meshlib>=3.0.6
+
+# Data / reporting
 pandas
 xlsxwriter
 reportlab
-Pillow
