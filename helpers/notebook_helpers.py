@@ -209,7 +209,7 @@ def load_image_with_roi(input_file: str, roi_coords, big_image=True):
     """Open a microscopy file and load the requested ROI in ZYXC order."""
     meta = open_image_file(input_file)
     image, _ = extract_roi_from_metadata(meta, roi_coords, big_image=big_image)
-    print(image.shape)
+    print(f"ROI of the image (Z, Y, X, C): {image.shape}")
     return meta, image
 
 
@@ -531,7 +531,7 @@ def hist_plot(im_in, stain_complete_df, thresh=0, legend=False):
             axs[c].legend(("cdf", "histogram"), loc="upper left")
         if thresh > 0:
             axs[c].plot([thresh, thresh], [0, cdf_normalized.max()], color="g")
-        axs[c].set_title(stain_complete_df.index[c])
+        axs[c].set_title(stain_complete_df.loc[stain_complete_df.index[c], "Marker"])
         axs[c].set_yscale("log")
     return fig, axs
 
@@ -605,7 +605,6 @@ def stardist3d_from_2d(
 
     z_spacing, y_spacing, x_spacing = voxel_size
 
-    print(f"Running StarDist2D on {img_3d.shape[0]} z-slices...")
     model = StarDist2D.from_pretrained(model_name)
 
     labels_3d = np.zeros_like(img_3d, dtype=np.int32)
@@ -623,7 +622,6 @@ def stardist3d_from_2d(
 
     labels_3d = skimage.measure.label(labels_3d > 0, connectivity=1)
 
-    print("Computing distance transform with anisotropic voxel spacing...")
     distance = ndi.distance_transform_edt(labels_3d > 0, sampling=voxel_size)
 
     footprint = np.ones(
@@ -646,10 +644,8 @@ def stardist3d_from_2d(
     for marker_id, coord in enumerate(local_max, start=1):
         markers[tuple(coord)] = marker_id
 
-    print("Running 3D watershed to split connected nuclei...")
     labels_split = watershed(-distance, markers, mask=labels_3d > 0)
 
-    print(f"Done. Found {labels_split.max()} nuclei.")
     return labels_split
 
 
@@ -1632,6 +1628,10 @@ def prepare_stain_settings(
                 blending="additive",
             )
 
+        print(
+            "A napari window has opened — check it, adjust the contrast and gamma "
+            "for each channel, then close the window to continue."
+        )
         napari_module.run()
         image_layers = [layer for layer in viewer.layers if isinstance(layer, napari_module.layers.Image)]
         contrast_limits = {layer.name: layer.contrast_limits for layer in image_layers}
@@ -4410,7 +4410,7 @@ def prepare_image_stack(img, meta, ROI, big_image, nuclei_diameter, cell_diamete
         if chan_axis is not None and chan_axis != 3:
             orig = np.moveaxis(orig, chan_axis, -1)
 
-    print(f"Image stack ready — shape: {orig.shape}")
+    print("Image stack ready.")
     return {'Original image': orig}, nuclei_radius, cell_radius, nuclei_volume, cell_volume
 
 
@@ -4554,6 +4554,7 @@ def apply_threshold_per_channel(
     cell_size = int(cell_diameter / (np.mean([r_zX, r_zY])))
 
     for c in progress(range(image_stack.shape[3]), desc='Step 15 - Threshold Channels'):
+        marker_name = stain_complete_df.loc[stain_complete_df.index[c], 'Marker']
         img = sitk.GetImageFromArray(image_stack[:, :, :, c])
 
         # Compute global threshold value based on chosen method
@@ -4595,7 +4596,6 @@ def apply_threshold_per_channel(
         if non_zero.size > 0:
             hist, bins = np.histogram(non_zero, bins=256, range=(0, non_zero.max()))
             mode_bin = bins[np.argmax(hist)]
-            print(mode_bin)
             bg_mask = (arr >= mode_bin - 5) & (arr <= mode_bin + 5) & (arr > 0)
             gain_tot = 6.0
             gain_ass = gain_tot * (255.0 - 4.0 * mode_bin) / 255.0
@@ -4639,10 +4639,16 @@ def apply_threshold_per_channel(
                 saturation_floor = float(np.percentile(non_zero, sat_pct))
                 final_thr = np.maximum(final_thr, saturation_floor)
                 print(
-                    f"  ch {c}: oversaturation detected "
+                    f"  [{marker_name}] oversaturation detected "
                     f"({saturated_fraction * 100:.1f}% near-max), "
                     f"threshold floor raised to P{sat_pct:.0f}={saturation_floor:.1f}"
                 )
+
+        print(
+            f"  [{marker_name}] threshold chosen: global ({threshold_method}) = "
+            f"{global_thr_value:.1f}, combined (mean of Sauvola + statistical + "
+            f"global) = {float(np.mean(final_thr)):.1f}"
+        )
 
         # Gain-based primary mask and rescue
         gain = arr / (bg_mean + 1e-6)
@@ -4695,11 +4701,7 @@ def segment_nuclei_cellpose(image_3d, nuclei_diameter, voxel_size, model_type='n
         channels=[0, 0],
     )
 
-    print(
-        f"Cellpose: {int(labels.max())} nuclei segmented "
-        f"(model={model_type}, diameter_px={diameter_px:.1f}, "
-        f"anisotropy={anisotropy:.2f})"
-    )
+    print(f"Nuclei found: {int(labels.max())}")
     return labels.astype(np.int32)
 
 
@@ -4833,7 +4835,7 @@ def segment_nuclei(
             im_thresh = im_thresh | (im_in[:, :, :, c] > 0)
 
         split_cfg = dict(nuclei_split_config)
-        im_out, debug_info = segment_nuclei_watershed(
+        im_out, _ = segment_nuclei_watershed(
             binary_mask=im_thresh,
             r_zX=r_zX,
             r_zY=r_zY,
@@ -4842,32 +4844,7 @@ def segment_nuclei(
             **split_cfg,
         )
 
-        erosion_triplets = debug_info['erosion_triplets']
-        er_z = [e[0] for e in erosion_triplets] if erosion_triplets else [1]
-        er_y = [e[1] for e in erosion_triplets] if erosion_triplets else [1]
-        er_x = [e[2] for e in erosion_triplets] if erosion_triplets else [1]
-
-        print(
-            f"LD mode: {int(im_out.max())} cells segmented "
-            f"(shrink_factor={split_cfg['nuclei_bridge_shrink_factor']}, "
-            f"diameter_range=[{debug_info['dmin']:.2f},{debug_info['dmax']:.2f}]x, "
-            f"scales={debug_info['n_scales']}, "
-            f"scales_with_seeds={debug_info['scales_with_seeds']}, "
-            f"peak_seeds={debug_info['added_peak_seed_count']}, "
-            f"z_anisotropy={debug_info['z_anisotropy']:.2f}, "
-            f"z_weight={debug_info['z_split_weight']:.2f}, "
-            f"erosion Z={min(er_z)}-{max(er_z)} "
-            f"Y={min(er_y)}-{max(er_y)} "
-            f"X={min(er_x)}-{max(er_x)} vox, "
-            f"min_seed_vox={debug_info['min_seed_vox']}, "
-            f"min_cell_vox={debug_info['min_cell_vox']}, "
-            f"boundary_components={len(debug_info['boundary_components'])}, "
-            f"added_component_seeds={debug_info['added_seed_count']}, "
-            f"restored_isolated_voxels={debug_info['restored_isolated_count']}, "
-            f"removed_by_roundness={debug_info['removed_by_roundness']}, "
-            f"z_consistency_splits={debug_info['z_consistency_splits']}, "
-            f"z_consistency_merges={debug_info['z_consistency_merges']})"
-        )
+        print(f"Nuclei found: {int(im_out.max())}")
 
         im_segmentation_stack['Nuclei'] = im_out
         im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
@@ -4901,10 +4878,11 @@ def segment_nuclei(
                 im_mask, footprint=np.ones((2, 2, 2))
             ).astype(im_mask.dtype)
             im_out, _ = skimage_label((transl * im_mask) > 0, return_num=True)
+            print(f"Nuclei found: {int(im_out.max())}")
 
         else:
             binary_mask = im_in[:, :, :, c].astype(bool)
-            im_out, debug_info = segment_nuclei_watershed(
+            im_out, _ = segment_nuclei_watershed(
                 binary_mask=binary_mask,
                 r_zX=r_zX,
                 r_zY=r_zY,
@@ -4913,32 +4891,7 @@ def segment_nuclei(
                 **split_cfg,
             )
 
-            erosion_triplets = debug_info['erosion_triplets']
-            er_z = [e[0] for e in erosion_triplets] if erosion_triplets else [1]
-            er_y = [e[1] for e in erosion_triplets] if erosion_triplets else [1]
-            er_x = [e[2] for e in erosion_triplets] if erosion_triplets else [1]
-
-            print(
-                f"Nuclei found: {int(im_out.max())} "
-                f"(shrink_factor={split_cfg['nuclei_bridge_shrink_factor']}, "
-                f"diameter_range=[{debug_info['dmin']:.2f},{debug_info['dmax']:.2f}]x, "
-                f"scales={debug_info['n_scales']}, "
-                f"scales_with_seeds={debug_info['scales_with_seeds']}, "
-                f"peak_seeds={debug_info['added_peak_seed_count']}, "
-                f"z_anisotropy={debug_info['z_anisotropy']:.2f}, "
-                f"z_weight={debug_info['z_split_weight']:.2f}, "
-                f"erosion Z={min(er_z)}-{max(er_z)} "
-                f"Y={min(er_y)}-{max(er_y)} "
-                f"X={min(er_x)}-{max(er_x)} vox, "
-                f"min_seed_vox={debug_info['min_seed_vox']}, "
-                f"min_cell_vox={debug_info['min_cell_vox']}, "
-                f"boundary_components={len(debug_info['boundary_components'])}, "
-                f"added_component_seeds={debug_info['added_seed_count']}, "
-                f"restored_isolated_voxels={debug_info['restored_isolated_count']}, "
-                f"removed_by_roundness={debug_info['removed_by_roundness']}, "
-                f"z_consistency_splits={debug_info['z_consistency_splits']}, "
-                f"z_consistency_merges={debug_info['z_consistency_merges']})"
-            )
+            print(f"Nuclei found: {int(im_out.max())}")
 
         im_segmentation_stack['Nuclei'] = im_out
 
