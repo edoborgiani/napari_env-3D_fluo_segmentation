@@ -536,63 +536,36 @@ def hist_plot(im_in, stain_complete_df, thresh=0, legend=False):
     return fig, axs
 
 
-def hist_plot_with_threshold_preview(
-    im_in,
-    stain_complete_df,
-    nuclei_diameter,
-    cell_diameter,
-    r_zxyz,
-    threshold_method='otsu',
-):
-    """Plot each channel's histogram with the global and combined threshold marked.
+def hist_plot_with_thresholds(im_in, stain_complete_df, global_thresholds, combined_thresholds):
+    """Plot each channel's histogram with its global and combined threshold marked.
 
-    Lets you judge, right after equalization (Cell 14), whether the automatic
-    thresholding in Cell 15 will land in a sensible place before committing to
-    it — useful for tuning `num_plateaus`/`plateau_factor` upstream. The
-    thresholds are computed with the same logic `apply_threshold_per_channel`
-    uses, via `threshold_method` (default 'otsu'; the global component is only
-    15% of the combined value, so this preview stays representative even if
-    you later pick a different method in Cell 15).
+    Used by `apply_threshold_per_channel` (Cell 15) to show, right after
+    thresholding, where the global (dashed orange) and combined — Sauvola +
+    statistical + global — (solid red) threshold values landed for each
+    channel.
 
     Parameters
     ----------
     im_in : ndarray, shape (Z, Y, X, C)
-        Equalized image stack.
-    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
-        Isotropic voxel sizes in micrometers per pixel.
+        Equalized image stack (the one thresholding was applied to).
+    global_thresholds, combined_thresholds : sequence of float
+        One value per channel, in the same order as `stain_complete_df.index`.
     """
-    r_zX, r_zY, _ = r_zxyz
-    nuclei_size = int(nuclei_diameter / (np.mean([r_zX, r_zY])))
-    cell_size = int(cell_diameter / (np.mean([r_zX, r_zY])))
-
     fig, axs = plt.subplots(1, im_in.shape[3], figsize=(15, 2))
     for c in range(im_in.shape[3]):
         idx = stain_complete_df.index[c]
-        arr = im_in[:, :, :, c]
-        is_nuclei = idx == "NUCLEI"
-
-        global_thr, final_thr, *_ = _compute_channel_threshold_stats(
-            arr, is_nuclei, nuclei_size, cell_size, threshold_method,
-            marker_name=stain_complete_df.loc[idx, "Marker"], verbose=False,
-        )
-        combined_thr = float(np.mean(final_thr))
-
         color = stain_complete_df.loc[idx, "Color"]
         axs[c].hist(
-            arr.flatten(),
+            im_in[:, :, :, c].flatten(),
             256,
             [0, 256],
             color=color if color != "WHITE" else "GRAY",
         )
-        axs[c].axvline(global_thr, color="orange", linestyle="--", label="Global")
-        axs[c].axvline(combined_thr, color="red", linestyle="-", label="Combined")
+        axs[c].axvline(global_thresholds[c], color="orange", linestyle="--", label="Global")
+        axs[c].axvline(combined_thresholds[c], color="red", linestyle="-", label="Combined")
         axs[c].set_xlim([0, 256])
         axs[c].set_title(stain_complete_df.loc[idx, "Marker"])
         axs[c].set_yscale("log")
-        print(
-            f"  [{stain_complete_df.loc[idx, 'Marker']}] preview threshold "
-            f"({threshold_method}): global = {global_thr:.1f}, combined = {combined_thr:.1f}"
-        )
 
     axs[0].legend(loc="upper right", fontsize=6)
     return fig, axs
@@ -4130,11 +4103,7 @@ def run_smooth(im_final_stack, stain_complete_df, sigma=0.5):
     return im_final_stack
 
 
-def run_equalize(
-    im_final_stack, stain_complete_df, num_plateaus=2, plateau_factor=0.7,
-    nuclei_diameter=None, cell_diameter=None, r_zX=None, r_zY=None, r_zZ=None,
-    threshold_preview_method='otsu',
-):
+def run_equalize(im_final_stack, stain_complete_df, num_plateaus=2, plateau_factor=0.7):
     """Apply histogram equalization and display histogram.
 
     Parameters
@@ -4146,23 +4115,11 @@ def run_equalize(
     plateau_factor : float
         Clipping height relative to the mean histogram bin count.
         Lower = stronger clipping. Typical range 0.5–1.0.
-    nuclei_diameter, cell_diameter, r_zX, r_zY, r_zZ : optional
-        When all five are supplied, the histogram also marks where the
-        automatic global and combined thresholds (Cell 15) would fall,
-        computed with `threshold_preview_method` (default 'otsu'). Leave
-        unset to fall back to the plain histogram.
     """
     im_final_stack['Equalized image'] = apply_histogram_equalization_per_channel(
         im_final_stack['Filtered image'], num_plateaus, plateau_factor
     )
-    if None not in (nuclei_diameter, cell_diameter, r_zX, r_zY, r_zZ):
-        hist_plot_with_threshold_preview(
-            im_final_stack['Equalized image'], stain_complete_df,
-            nuclei_diameter=nuclei_diameter, cell_diameter=cell_diameter,
-            r_zxyz=(r_zX, r_zY, r_zZ), threshold_method=threshold_preview_method,
-        )
-    else:
-        hist_plot(im_final_stack['Equalized image'], stain_complete_df)
+    hist_plot(im_final_stack['Equalized image'], stain_complete_df)
     return im_final_stack
 
 
@@ -4744,6 +4701,9 @@ def apply_threshold_per_channel(
     nuclei_size = int(nuclei_diameter / (np.mean([r_zX, r_zY])))
     cell_size = int(cell_diameter / (np.mean([r_zX, r_zY])))
 
+    global_thresholds = []
+    combined_thresholds = []
+
     for c in progress(range(image_stack.shape[3]), desc='Step 15 - Threshold Channels'):
         marker_name = stain_complete_df.loc[stain_complete_df.index[c], 'Marker']
         is_nuclei = stain_complete_df.index[c] == "NUCLEI"
@@ -4753,11 +4713,14 @@ def apply_threshold_per_channel(
             arr, is_nuclei, nuclei_size, cell_size, threshold_method,
             marker_name=marker_name, verbose=True,
         )
+        combined_thr_value = float(np.mean(final_thr))
+        global_thresholds.append(global_thr_value)
+        combined_thresholds.append(combined_thr_value)
 
         print(
             f"  [{marker_name}] threshold chosen: global ({threshold_method}) = "
             f"{global_thr_value:.1f}, combined (mean of Sauvola + statistical + "
-            f"global) = {float(np.mean(final_thr)):.1f}"
+            f"global) = {combined_thr_value:.1f}"
         )
 
         # Gain-based primary mask and rescue
@@ -4772,6 +4735,8 @@ def apply_threshold_per_channel(
             min_size = np.ceil(0.4 * np.pi * ((nuclei_size / 2) ** 2))
 
         im_out[:, :, :, c] = remove_small_islands(arrayseg, min_size)
+
+    hist_plot_with_thresholds(image_stack, stain_complete_df, global_thresholds, combined_thresholds)
 
     return im_out
 
