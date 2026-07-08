@@ -536,6 +536,68 @@ def hist_plot(im_in, stain_complete_df, thresh=0, legend=False):
     return fig, axs
 
 
+def hist_plot_with_threshold_preview(
+    im_in,
+    stain_complete_df,
+    nuclei_diameter,
+    cell_diameter,
+    r_zxyz,
+    threshold_method='otsu',
+):
+    """Plot each channel's histogram with the global and combined threshold marked.
+
+    Lets you judge, right after equalization (Cell 14), whether the automatic
+    thresholding in Cell 15 will land in a sensible place before committing to
+    it — useful for tuning `num_plateaus`/`plateau_factor` upstream. The
+    thresholds are computed with the same logic `apply_threshold_per_channel`
+    uses, via `threshold_method` (default 'otsu'; the global component is only
+    15% of the combined value, so this preview stays representative even if
+    you later pick a different method in Cell 15).
+
+    Parameters
+    ----------
+    im_in : ndarray, shape (Z, Y, X, C)
+        Equalized image stack.
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
+        Isotropic voxel sizes in micrometers per pixel.
+    """
+    r_zX, r_zY, _ = r_zxyz
+    nuclei_size = int(nuclei_diameter / (np.mean([r_zX, r_zY])))
+    cell_size = int(cell_diameter / (np.mean([r_zX, r_zY])))
+
+    fig, axs = plt.subplots(1, im_in.shape[3], figsize=(15, 2))
+    for c in range(im_in.shape[3]):
+        idx = stain_complete_df.index[c]
+        arr = im_in[:, :, :, c]
+        is_nuclei = idx == "NUCLEI"
+
+        global_thr, final_thr, *_ = _compute_channel_threshold_stats(
+            arr, is_nuclei, nuclei_size, cell_size, threshold_method,
+            marker_name=stain_complete_df.loc[idx, "Marker"], verbose=False,
+        )
+        combined_thr = float(np.mean(final_thr))
+
+        color = stain_complete_df.loc[idx, "Color"]
+        axs[c].hist(
+            arr.flatten(),
+            256,
+            [0, 256],
+            color=color if color != "WHITE" else "GRAY",
+        )
+        axs[c].axvline(global_thr, color="orange", linestyle="--", label="Global")
+        axs[c].axvline(combined_thr, color="red", linestyle="-", label="Combined")
+        axs[c].set_xlim([0, 256])
+        axs[c].set_title(stain_complete_df.loc[idx, "Marker"])
+        axs[c].set_yscale("log")
+        print(
+            f"  [{stain_complete_df.loc[idx, 'Marker']}] preview threshold "
+            f"({threshold_method}): global = {global_thr:.1f}, combined = {combined_thr:.1f}"
+        )
+
+    axs[0].legend(loc="upper right", fontsize=6)
+    return fig, axs
+
+
 def napari_contrast_gamma_uint8(image, contrast_limits, gamma):
     """Apply Napari-style contrast limits and gamma, returning uint8."""
     clim_min, clim_max = contrast_limits
@@ -1633,6 +1695,7 @@ def prepare_stain_settings(
             "for each channel, then close the window to continue."
         )
         napari_module.run()
+        settings.application.ipy_interactive = True
         image_layers = [layer for layer in viewer.layers if isinstance(layer, napari_module.layers.Image)]
         contrast_limits = {layer.name: layer.contrast_limits for layer in image_layers}
         gamma_values = {layer.name: layer.gamma for layer in image_layers}
@@ -4067,7 +4130,11 @@ def run_smooth(im_final_stack, stain_complete_df, sigma=0.5):
     return im_final_stack
 
 
-def run_equalize(im_final_stack, stain_complete_df, num_plateaus=2, plateau_factor=0.7):
+def run_equalize(
+    im_final_stack, stain_complete_df, num_plateaus=2, plateau_factor=0.7,
+    nuclei_diameter=None, cell_diameter=None, r_zX=None, r_zY=None, r_zZ=None,
+    threshold_preview_method='otsu',
+):
     """Apply histogram equalization and display histogram.
 
     Parameters
@@ -4079,11 +4146,23 @@ def run_equalize(im_final_stack, stain_complete_df, num_plateaus=2, plateau_fact
     plateau_factor : float
         Clipping height relative to the mean histogram bin count.
         Lower = stronger clipping. Typical range 0.5–1.0.
+    nuclei_diameter, cell_diameter, r_zX, r_zY, r_zZ : optional
+        When all five are supplied, the histogram also marks where the
+        automatic global and combined thresholds (Cell 15) would fall,
+        computed with `threshold_preview_method` (default 'otsu'). Leave
+        unset to fall back to the plain histogram.
     """
     im_final_stack['Equalized image'] = apply_histogram_equalization_per_channel(
         im_final_stack['Filtered image'], num_plateaus, plateau_factor
     )
-    hist_plot(im_final_stack['Equalized image'], stain_complete_df)
+    if None not in (nuclei_diameter, cell_diameter, r_zX, r_zY, r_zZ):
+        hist_plot_with_threshold_preview(
+            im_final_stack['Equalized image'], stain_complete_df,
+            nuclei_diameter=nuclei_diameter, cell_diameter=cell_diameter,
+            r_zxyz=(r_zX, r_zY, r_zZ), threshold_method=threshold_preview_method,
+        )
+    else:
+        hist_plot(im_final_stack['Equalized image'], stain_complete_df)
     return im_final_stack
 
 
@@ -4501,6 +4580,121 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
     return viewer
 
 
+def _compute_channel_threshold_stats(
+    arr,
+    is_nuclei,
+    nuclei_size,
+    cell_size,
+    threshold_method,
+    marker_name="",
+    verbose=True,
+):
+    """Compute the global, statistical, and combined threshold values for one channel.
+
+    Shared by `apply_threshold_per_channel` (Cell 15, which also builds the
+    binary mask) and `run_equalize`'s threshold preview (Cell 14, which only
+    needs the scalar values to draw histogram markers).
+
+    Returns
+    -------
+    global_thr_value : float
+    final_thr : ndarray or float
+        Combined threshold map (Sauvola + statistical + global), after the
+        oversaturation floor correction.
+    statistical_thr : float
+    gain_ass : float
+    bg_mean : float
+    """
+    import SimpleITK as sitk
+    from skimage.filters import threshold_sauvola
+
+    img = sitk.GetImageFromArray(arr)
+
+    # Compute global threshold value based on chosen method
+    rescaler = sitk.RescaleIntensityImageFilter()
+    rescaler.SetOutputMinimum(0)
+    rescaler.SetOutputMaximum(255)
+    stretched = rescaler.Execute(img)
+
+    if threshold_method == 'otsu':
+        th_filter = sitk.OtsuThresholdImageFilter()
+        th_filter.Execute(stretched)
+        th_filter.Execute(img)
+        global_thr_value = th_filter.GetThreshold()
+    elif threshold_method == 'median':
+        non_zero_tmp = arr[arr > 0]
+        global_thr_value = float(np.median(non_zero_tmp)) if non_zero_tmp.size > 0 else 0.0
+    elif threshold_method == 'huang':
+        th_filter = sitk.HuangThresholdImageFilter()
+        th_filter.Execute(stretched)
+        th_filter.Execute(img)
+        global_thr_value = th_filter.GetThreshold()
+    else:
+        raise ValueError(f"threshold_method must be one of ('otsu', 'median', 'huang'), got '{threshold_method}'")
+
+    window_size = nuclei_size if is_nuclei else 4 * cell_size + 1
+    if int(window_size) % 2 == 0:
+        window_size += 1
+
+    # Sauvola threshold map
+    sauvola_value = threshold_sauvola(arr, window_size=int(window_size))
+
+    # Global statistical background, excluding zeros
+    non_zero = arr[arr > 0]
+    if non_zero.size > 0:
+        hist, bins = np.histogram(non_zero, bins=256, range=(0, non_zero.max()))
+        mode_bin = bins[np.argmax(hist)]
+        bg_mask = (arr >= mode_bin - 5) & (arr <= mode_bin + 5) & (arr > 0)
+        gain_tot = 6.0
+        gain_ass = gain_tot * (255.0 - 4.0 * mode_bin) / 255.0
+        bg_vals = arr[bg_mask]
+        if bg_vals.size < 50:
+            p10 = np.percentile(non_zero, 10)
+            bg_vals = non_zero[non_zero <= p10]
+    else:
+        bg_vals = arr
+        gain_ass = 6.0
+
+    bg_mean = bg_vals.mean()
+
+    bg_mean_z = arr.mean()
+    bg_std_z = arr.std() + 1e-6
+    statistical_thr = bg_mean_z + 3.0 * bg_std_z
+
+    # Clip Sauvola to avoid over-thresholding large/bright cells
+    max_sauvola = bg_mean_z + 2.0 * bg_std_z
+    sauvola_clipped = np.minimum(sauvola_value, max_sauvola)
+
+    # Combined threshold map
+    final_thr = (
+        0.60 * sauvola_clipped +
+        0.25 * statistical_thr +
+        0.15 * global_thr_value
+    )
+
+    # Oversaturation correction: when many voxels are near the max
+    # intensity, the halo around bright objects is also bright and passes
+    # normal thresholds.  Detect this and raise the threshold floor so
+    # only genuinely bright tissue is kept.
+    if non_zero.size > 0:
+        max_val = float(arr.max())
+        saturation_level = max_val * 0.97
+        saturated_count = int(np.sum(non_zero >= saturation_level))
+        saturated_fraction = saturated_count / non_zero.size
+        if saturated_fraction > 0.01:
+            sat_pct = min(95.0, 75.0 + saturated_fraction * 500.0)
+            saturation_floor = float(np.percentile(non_zero, sat_pct))
+            final_thr = np.maximum(final_thr, saturation_floor)
+            if verbose:
+                print(
+                    f"  [{marker_name}] oversaturation detected "
+                    f"({saturated_fraction * 100:.1f}% near-max), "
+                    f"threshold floor raised to P{sat_pct:.0f}={saturation_floor:.1f}"
+                )
+
+    return global_thr_value, final_thr, statistical_thr, gain_ass, bg_mean
+
+
 def apply_threshold_per_channel(
     image_stack,
     stain_complete_df,
@@ -4538,9 +4732,6 @@ def apply_threshold_per_channel(
     im_out : ndarray, shape (Z, Y, X, C)
         Binary thresholded image stack (same dtype as input).
     """
-    import SimpleITK as sitk
-    from skimage.filters import threshold_sauvola
-
     _valid_methods = ('otsu', 'median', 'huang')
     if threshold_method not in _valid_methods:
         raise ValueError(f"threshold_method must be one of {_valid_methods}, got '{threshold_method}'")
@@ -4555,94 +4746,13 @@ def apply_threshold_per_channel(
 
     for c in progress(range(image_stack.shape[3]), desc='Step 15 - Threshold Channels'):
         marker_name = stain_complete_df.loc[stain_complete_df.index[c], 'Marker']
-        img = sitk.GetImageFromArray(image_stack[:, :, :, c])
+        is_nuclei = stain_complete_df.index[c] == "NUCLEI"
+        arr = image_stack[:, :, :, c]
 
-        # Compute global threshold value based on chosen method
-        rescaler = sitk.RescaleIntensityImageFilter()
-        rescaler.SetOutputMinimum(0)
-        rescaler.SetOutputMaximum(255)
-        stretched = rescaler.Execute(img)
-
-        if threshold_method == 'otsu':
-            th_filter = sitk.OtsuThresholdImageFilter()
-            th_filter.Execute(stretched)
-            th_filter.Execute(img)
-            global_thr_value = th_filter.GetThreshold()
-        elif threshold_method == 'median':
-            arr_tmp = sitk.GetArrayFromImage(img)
-            non_zero_tmp = arr_tmp[arr_tmp > 0]
-            global_thr_value = float(np.median(non_zero_tmp)) if non_zero_tmp.size > 0 else 0.0
-        elif threshold_method == 'huang':
-            th_filter = sitk.HuangThresholdImageFilter()
-            th_filter.Execute(stretched)
-            th_filter.Execute(img)
-            global_thr_value = th_filter.GetThreshold()
-
-        if stain_complete_df.index[c] == "NUCLEI":
-            window_size = 1 * nuclei_size
-        else:
-            window_size = 4 * cell_size + 1
-
-        if int(window_size) % 2 == 0:
-            window_size += 1
-
-        arr = sitk.GetArrayFromImage(img)
-
-        # Sauvola threshold map
-        sauvola_value = threshold_sauvola(arr, window_size=int(window_size))
-
-        # Global statistical background, excluding zeros
-        non_zero = arr[arr > 0]
-        if non_zero.size > 0:
-            hist, bins = np.histogram(non_zero, bins=256, range=(0, non_zero.max()))
-            mode_bin = bins[np.argmax(hist)]
-            bg_mask = (arr >= mode_bin - 5) & (arr <= mode_bin + 5) & (arr > 0)
-            gain_tot = 6.0
-            gain_ass = gain_tot * (255.0 - 4.0 * mode_bin) / 255.0
-            bg_vals = arr[bg_mask]
-            if bg_vals.size < 50:
-                p10 = np.percentile(non_zero, 10)
-                bg_vals = non_zero[non_zero <= p10]
-        else:
-            bg_vals = arr
-            gain_ass = 6.0
-
-        bg_mean = bg_vals.mean()
-        bg_std = bg_vals.std() + 1e-6  # noqa: F841
-
-        bg_mean_z = arr.mean()
-        bg_std_z = arr.std() + 1e-6
-        statistical_thr = bg_mean_z + 3.0 * bg_std_z
-
-        # Clip Sauvola to avoid over-thresholding large/bright cells
-        max_sauvola = bg_mean_z + 2.0 * bg_std_z
-        sauvola_clipped = np.minimum(sauvola_value, max_sauvola)
-
-        # Combined threshold map
-        final_thr = (
-            0.60 * sauvola_clipped +
-            0.25 * statistical_thr +
-            0.15 * global_thr_value
+        global_thr_value, final_thr, statistical_thr, gain_ass, bg_mean = _compute_channel_threshold_stats(
+            arr, is_nuclei, nuclei_size, cell_size, threshold_method,
+            marker_name=marker_name, verbose=True,
         )
-
-        # Oversaturation correction: when many voxels are near the max
-        # intensity, the halo around bright objects is also bright and passes
-        # normal thresholds.  Detect this and raise the threshold floor so
-        # only genuinely bright tissue is kept.
-        if non_zero.size > 0:
-            max_val = float(arr.max())
-            saturation_level = max_val * 0.97
-            saturated_count = int(np.sum(non_zero >= saturation_level))
-            saturated_fraction = saturated_count / non_zero.size
-            if saturated_fraction > 0.01:
-                sat_pct = min(95.0, 75.0 + saturated_fraction * 500.0)
-                saturation_floor = float(np.percentile(non_zero, sat_pct))
-                final_thr = np.maximum(final_thr, saturation_floor)
-                print(
-                    f"  [{marker_name}] oversaturation detected "
-                    f"({saturated_fraction * 100:.1f}% near-max), "
-                    f"threshold floor raised to P{sat_pct:.0f}={saturation_floor:.1f}"
-                )
 
         print(
             f"  [{marker_name}] threshold chosen: global ({threshold_method}) = "
@@ -4942,6 +5052,12 @@ def segment_cytoplasm(
     Otherwise cytoplasm is grown from nuclei labels using cyto_markers (if any)
     or a simple label-grow.
 
+    When cyto_markers are used, each cell's marker-derived cytoplasm volume is
+    compared against 50% of the expected (spherical) cell volume computed from
+    ``cell_diameter``. Cells falling short are replaced with a growth-factor
+    expansion (``cyto_factor``) instead, the same way as fully unsignalled
+    cells.
+
     Parameters
     ----------
     im_final_stack : dict
@@ -5042,6 +5158,33 @@ def segment_cytoplasm(
                 im_segmentation_stack['Nuclei'], binary_mask, max_distance=10.0
             )
             print(f"Cytoplasm expanded using markers: {cyto_markers}")
+
+            if cell_diameter is not None:
+                nuclei_labels = im_segmentation_stack['Nuclei']
+                voxel_volume = r_zX * r_zY * r_zZ
+                expected_cell_volume = (4.0 / 3.0) * np.pi * (cell_diameter / 2.0) ** 3
+                min_cyto_volume = 0.5 * expected_cell_volume
+                max_label = int(nuclei_labels.max())
+                undersized = 0
+                for label_id in range(1, max_label + 1):
+                    nuc_mask = nuclei_labels == label_id
+                    if not np.any(nuc_mask):
+                        continue
+                    cyto_mask = im_out == label_id
+                    cyto_volume = np.count_nonzero(cyto_mask) * voxel_volume
+                    if cyto_volume >= min_cyto_volume:
+                        continue
+                    im_out[cyto_mask] = 0
+                    single = np.zeros_like(nuclei_labels, dtype=np.int32)
+                    single[nuc_mask] = label_id
+                    grown = grow_labels(single, cyto_factor)
+                    im_out[(grown == label_id) & (im_out == 0)] = label_id
+                    undersized += 1
+                if undersized > 0:
+                    print(
+                        f"Cytoplasm replaced with growth factor (factor={cyto_factor}) for "
+                        f"{undersized} cells (marker-derived volume < 50% of expected cell size)"
+                    )
         stain_complete_df = stain_complete_df.copy()
         stain_complete_df.loc['CYTOPLASM'] = ['', '', '', '', '', '']
 
