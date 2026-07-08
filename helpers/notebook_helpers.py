@@ -5018,7 +5018,7 @@ def segment_cytoplasm(
     or a simple label-grow.
 
     When cyto_markers are used, each cell's marker-derived cytoplasm volume is
-    compared against 50% of the expected (spherical) cell volume computed from
+    compared against 20% of the expected (spherical) cell volume computed from
     ``cell_diameter``. Cells falling short are replaced with a growth-factor
     expansion (``cyto_factor``) instead, the same way as fully unsignalled
     cells.
@@ -5128,7 +5128,7 @@ def segment_cytoplasm(
                 nuclei_labels = im_segmentation_stack['Nuclei']
                 voxel_volume = r_zX * r_zY * r_zZ
                 expected_cell_volume = (4.0 / 3.0) * np.pi * (cell_diameter / 2.0) ** 3
-                min_cyto_volume = 0.5 * expected_cell_volume
+                min_cyto_volume = 0.2 * expected_cell_volume
                 max_label = int(nuclei_labels.max())
                 undersized = 0
                 for label_id in range(1, max_label + 1):
@@ -5148,7 +5148,7 @@ def segment_cytoplasm(
                 if undersized > 0:
                     print(
                         f"Cytoplasm replaced with growth factor (factor={cyto_factor}) for "
-                        f"{undersized} cells (marker-derived volume < 50% of expected cell size)"
+                        f"{undersized} cells (marker-derived volume < 20% of expected cell size)"
                     )
         stain_complete_df = stain_complete_df.copy()
         stain_complete_df.loc['CYTOPLASM'] = ['', '', '', '', '', '']
