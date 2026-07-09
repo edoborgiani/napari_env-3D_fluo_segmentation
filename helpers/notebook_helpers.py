@@ -5014,8 +5014,11 @@ def segment_cytoplasm(
     If a CYTOPLASM channel is present it is segmented with watershed, or with
     Cellpose 3D (if ``trig_cellpose_cyto`` is True) to shape cells directly from
     the CYTOPLASM channel intensity, then relabelled to match nuclei IDs.
-    Otherwise cytoplasm is grown from nuclei labels using cyto_markers (if any)
-    or a simple label-grow.
+    Otherwise cytoplasm is grown from nuclei labels: with ``cyto_markers``, each
+    marker-positive voxel is assigned to its nearest nucleus by watershed (same
+    proximity logic as the CYTOPLASM-channel case, just seeded from the union of
+    the listed marker channels' thresholds instead of a dedicated channel); with
+    no markers at all, it falls back to a simple label-grow.
 
     When cyto_markers are used, each cell's marker-derived cytoplasm volume is
     compared against 20% of the expected (spherical) cell volume computed from
@@ -5112,17 +5115,28 @@ def segment_cytoplasm(
             im_out = grow_labels(im_segmentation_stack['Nuclei'], cyto_factor)
             print(f"Cytoplasm grown from nuclei labels (factor={cyto_factor})")
         else:
-            im_out = im_segmentation_stack['Nuclei'] > 0
+            from scipy import ndimage as _ndi
+
+            marker_mask = np.zeros(im_in.shape[:3], dtype=bool)
             for c in progress(range(im_in.shape[3]), desc='Step 18B - Apply Cyto Markers'):
                 idx = stain_complete_df.index[c]
                 marker = stain_complete_df.loc[idx, 'Marker']
                 if marker in cyto_markers:
-                    im_out = im_out + im_in[:, :, :, c]
-            binary_mask = (im_out > 0).copy()
-            im_out = grow_markers_within_islands_limited(
-                im_segmentation_stack['Nuclei'], binary_mask, max_distance=10.0
+                    marker_mask |= (im_in[:, :, :, c] > 0)
+
+            nuc_mask = im_segmentation_stack['Nuclei'] > 0
+            combined_mask = marker_mask | nuc_mask
+            distance = _ndi.distance_transform_edt(
+                combined_mask, sampling=[r_zZ, r_zY, r_zX]
             )
-            print(f"Cytoplasm expanded using markers: {cyto_markers}")
+            im_out = watershed(
+                -distance, im_segmentation_stack['Nuclei'],
+                mask=combined_mask,
+            )
+            print(
+                f"Cytoplasm expanded using markers: {cyto_markers} "
+                "(nearest-nucleus watershed, same as CYTOPLASM-channel path)"
+            )
 
             if cell_diameter is not None:
                 nuclei_labels = im_segmentation_stack['Nuclei']
