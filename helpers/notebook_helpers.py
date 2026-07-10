@@ -800,7 +800,7 @@ def save_merged_figure(
     condition_colors,
     nucleus_id,
     seg_stack,
-    stain_table=None,
+    display_ranges=None,
     nucleus_color="blue",
     cytoplasm_color="green",
     pcm_color="magenta",
@@ -810,11 +810,7 @@ def save_merged_figure(
     """Build and save a merged RGB overview around a single nucleus."""
     del nucleus_color, cytoplasm_color, pcm_color
 
-    if stain_table is None:
-        try:
-            stain_table = _context("stain_complete_df")
-        except RuntimeError:
-            stain_table = None
+    display_ranges = display_ranges or {}
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -868,25 +864,13 @@ def save_merged_figure(
     for condition, img in crop_dict.items():
         img_small = img[:min_h, :min_w].copy()
 
-        if (
-            stain_table is not None
-            and condition in stain_table.index
-            and "Cont_min" in stain_table.columns
-        ):
+        clim = display_ranges.get(condition)
+        if clim is not None:
             try:
-                clim = (
-                    stain_table.loc[condition, "Cont_min"],
-                    stain_table.loc[condition, "Cont_max"],
-                )
-                gamma_value = (
-                    stain_table.loc[condition, "Gamma"]
-                    if "Gamma" in stain_table.columns
-                    else 1.0
-                )
                 img_display = napari_contrast_gamma_uint8(
                     img_small.astype(np.float32),
                     (float(clim[0]), float(clim[1])),
-                    float(gamma_value),
+                    1.0,
                 )
                 img_normalized = img_display.astype(float) / 255.0
             except Exception:
@@ -3044,6 +3028,28 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
     all_conditions = sorted({condition for nucleus_data in hist_data.values() for condition in nucleus_data.keys()})
     marker_conditions = [condition for condition in all_conditions if condition.lower() != "nuclei"]
 
+    marker_labels = {
+        condition: (
+            str(stain_complete_df.loc[condition, "Marker"])
+            if condition in stain_complete_df.index and "Marker" in stain_complete_df.columns
+            else condition
+        )
+        for condition in all_conditions
+    }
+
+    # 'Filtered image' already has each channel's stored Cont_min/Cont_max/Gamma
+    # baked in (applied back in run_contrast_gamma), and that is what Napari's
+    # viewer displays with no further contrast/gamma adjustment. Re-derive the
+    # display range from the actual data here instead of re-applying the stored
+    # settings, otherwise contrast/gamma gets stacked twice and the PNGs render
+    # much darker than what is shown in Napari for the same image.
+    display_ranges = {}
+    for condition in marker_conditions:
+        channel_indices = np.where(stain_complete_df.index == condition)[0]
+        if len(channel_indices):
+            channel_data = filtered_img[:, :, :, channel_indices[0]]
+            display_ranges[condition] = (float(channel_data.min()), float(channel_data.max()))
+
     # Compute column geometry from the page so images never overflow their cells.
     _cell_pad = 4
     _left_margin = _right_margin = inch
@@ -3101,14 +3107,10 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
             ) else "gray"
             if color == "WHITE":
                 color = "GRAY"
-            if condition in stain_complete_df.index and "Cont_min" in stain_complete_df.columns:
+            clim = display_ranges.get(condition)
+            if clim is not None:
                 try:
-                    clim = (
-                        stain_complete_df.loc[condition, "Cont_min"],
-                        stain_complete_df.loc[condition, "Cont_max"],
-                    )
-                    gamma_value = stain_complete_df.loc[condition, "Gamma"] if "Gamma" in stain_complete_df.columns else 1.0
-                    save_raw_png(arr, fname, contrast_limits=clim, gamma=gamma_value, color=color)
+                    save_raw_png(arr, fname, contrast_limits=clim, gamma=1.0, color=color)
                 except Exception:
                     save_raw_png(arr, fname, color=color)
             else:
@@ -3121,7 +3123,7 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
             condition_colors,
             nucleus_id,
             seg_stack=seg_stack,
-            stain_table=stain_complete_df,
+            display_ranges=display_ranges,
             nucleus_color=nucleus_color,
             cytoplasm_color="green",
             pcm_color="magenta",
@@ -3161,7 +3163,7 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
             Line2D([0], [0], color=stain_complete_df["Color"][condition] if stain_complete_df["Color"][condition] != "WHITE" else "GRAY", lw=2)
             for condition in all_conditions
         ]
-        ax.legend(legend_handles, all_conditions, loc="upper right", framealpha=0.9)
+        ax.legend(legend_handles, [marker_labels[condition] for condition in all_conditions], loc="upper right", framealpha=0.9)
         plt.tight_layout()
         density_png = f"density_png/n{nucleus_id}_density.png"
         fig.savefig(density_png, dpi=150, bbox_inches="tight")
@@ -3180,7 +3182,7 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
             spaceAfter=0,
             spaceBefore=0,
         )
-        label_row = [Paragraph(cond, label_style) for cond in marker_conditions] + [Paragraph("Merged", label_style)]
+        label_row = [Paragraph(marker_labels[cond], label_style) for cond in marker_conditions] + [Paragraph("Merged", label_style)]
         label_height = 0.18 * inch
 
         data = [
