@@ -631,16 +631,7 @@ def stardist3d_from_2d(
     voxel_size=(1.0, 0.5, 0.5),
     norm=True,
 ):
-    """Apply StarDist2D slice by slice, then link instances into 3D nuclei.
-
-    Each z-slice is segmented independently by StarDist2D, so a slice
-    where two nuclei touch is still returned as two separate instances.
-    Slices are stacked and grouped into 3D-connected clusters (nuclei
-    that touch somewhere across the stack end up in the same cluster).
-    Within each cluster, the z-slice holding the most distinct StarDist
-    instances is used to seed a local watershed, so those already-separated
-    instances are not silently re-merged into one blob before splitting.
-    """
+    """Apply StarDist2D slice by slice, then split merged objects in 3D."""
     from csbdeep.utils import normalize
     from stardist.models import StarDist2D
 
@@ -648,11 +639,10 @@ def stardist3d_from_2d(
         raise ValueError("Input must be 3D with shape (Z, Y, X)")
 
     z_spacing, y_spacing, x_spacing = voxel_size
-    xy_spacing = float(np.mean([y_spacing, x_spacing]))
 
     model = StarDist2D.from_pretrained(model_name)
 
-    raw_labels_3d = np.zeros_like(img_3d, dtype=np.int32)
+    labels_3d = np.zeros_like(img_3d, dtype=np.int32)
     current_label = 1
 
     for z_index in range(img_3d.shape[0]):
@@ -662,89 +652,34 @@ def stardist3d_from_2d(
 
         labels_2d, _ = model.predict_instances(img)
         labels_2d = np.where(labels_2d > 0, labels_2d + current_label, 0)
-        raw_labels_3d[z_index] = labels_2d
+        labels_3d[z_index] = labels_2d
         current_label = labels_2d.max() + 1
 
-    mask_3d = raw_labels_3d > 0
-    clusters, num_clusters = skimage.measure.label(
-        mask_3d, connectivity=1, return_num=True
+    labels_3d = skimage.measure.label(labels_3d > 0, connectivity=1)
+
+    distance = ndi.distance_transform_edt(labels_3d > 0, sampling=voxel_size)
+
+    footprint = np.ones(
+        (
+            max(1, int(round(z_spacing / y_spacing))),
+            max(1, int(round(nucleus_radius))),
+            max(1, int(round(nucleus_radius))),
+        ),
+        dtype=bool,
     )
 
-    distance = ndi.distance_transform_edt(mask_3d, sampling=voxel_size)
+    local_max = peak_local_max(
+        distance,
+        footprint=footprint,
+        labels=labels_3d > 0,
+        exclude_border=False,
+    )
 
-    markers = np.zeros_like(raw_labels_3d, dtype=np.int32)
-    next_marker = 1
+    markers = np.zeros_like(labels_3d, dtype=int)
+    for marker_id, coord in enumerate(local_max, start=1):
+        markers[tuple(coord)] = marker_id
 
-    cluster_bboxes = ndi.find_objects(clusters)
-    for cluster_id, bbox in enumerate(cluster_bboxes, start=1):
-        if bbox is None:
-            continue
-
-        cluster_mask = clusters[bbox] == cluster_id
-        cluster_raw = raw_labels_3d[bbox]
-        cluster_distance = distance[bbox]
-
-        # Find the z-slice (within this cluster) holding the most
-        # distinct original StarDist instances - i.e. the slice that
-        # best reveals how many separate nuclei this cluster contains.
-        best_z, best_ids = None, np.array([], dtype=raw_labels_3d.dtype)
-        for z_local in range(cluster_mask.shape[0]):
-            slice_mask = cluster_mask[z_local]
-            if not np.any(slice_mask):
-                continue
-            ids = np.unique(cluster_raw[z_local][slice_mask])
-            ids = ids[ids > 0]
-            if len(ids) > len(best_ids):
-                best_ids = ids
-                best_z = z_local
-
-        if best_z is None or len(best_ids) <= 1:
-            # Unambiguous single nucleus: one marker keeps the whole
-            # cluster as one watershed region.
-            coord = np.unravel_index(
-                np.argmax(np.where(cluster_mask, cluster_distance, -np.inf)),
-                cluster_distance.shape,
-            )
-            markers[tuple(o.start + c for o, c in zip(bbox, coord))] = next_marker
-            next_marker += 1
-            continue
-
-        for raw_id in best_ids:
-            inst_mask = cluster_raw[best_z] == raw_id
-            inst_distance = np.where(inst_mask, cluster_distance[best_z], -np.inf)
-            coord_2d = np.unravel_index(np.argmax(inst_distance), inst_distance.shape)
-            global_coord = (
-                bbox[0].start + best_z,
-                bbox[1].start + coord_2d[0],
-                bbox[2].start + coord_2d[1],
-            )
-            markers[global_coord] = next_marker
-            next_marker += 1
-
-    # Fallback (should be rare): seed any cluster that ended up with no
-    # marker from EDT peaks instead, using a properly voxel-scaled footprint.
-    seeded_clusters = set(np.unique(clusters[markers > 0])) - {0}
-    missing_clusters = set(range(1, num_clusters + 1)) - seeded_clusters
-    if missing_clusters:
-        footprint = np.ones(
-            (
-                max(1, int(round(z_spacing / xy_spacing))),
-                max(1, int(round(nucleus_radius / xy_spacing))),
-                max(1, int(round(nucleus_radius / xy_spacing))),
-            ),
-            dtype=bool,
-        )
-        for cluster_id in missing_clusters:
-            comp_mask = clusters == cluster_id
-            local_max = peak_local_max(
-                distance, footprint=footprint, labels=comp_mask.astype(int),
-                exclude_border=False,
-            )
-            for coord in local_max:
-                markers[tuple(coord)] = next_marker
-                next_marker += 1
-
-    labels_split = watershed(-distance, markers, mask=mask_3d)
+    labels_split = watershed(-distance, markers, mask=labels_3d > 0)
 
     return labels_split
 
@@ -4947,6 +4882,9 @@ def segment_nuclei(
     im_segmentation_stack : dict
         Dict with key 'Nuclei' mapping to the integer label array (Z, Y, X).
     """
+    from skimage.measure import label as skimage_label
+    from skimage import morphology
+
     if progress is None:
         def progress(x, **kw): return x
 
@@ -5007,11 +4945,16 @@ def segment_nuclei(
 
         elif trig_stardist:
             im_filt = im_final_stack['Filtered image'].copy()
-            im_out = stardist3d_from_2d(
+            transl = stardist3d_from_2d(
                 img_3d=im_filt[:, :, :, c],
                 nucleus_radius=nuclei_diameter / 2.0,
                 voxel_size=(r_zZ, r_zY, r_zX),
             )
+            im_mask = transl > 0
+            im_mask = morphology.erosion(
+                im_mask, footprint=np.ones((2, 2, 2))
+            ).astype(im_mask.dtype)
+            im_out, _ = skimage_label((transl * im_mask) > 0, return_num=True)
             print(f"Nuclei found: {int(im_out.max())}")
 
         else:
