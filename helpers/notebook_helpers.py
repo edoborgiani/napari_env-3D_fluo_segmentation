@@ -4997,6 +4997,98 @@ def detect_aggregates(im_segmentation_stack, stain_df, aggregate_grow_factor=2.0
     return im_segmentation_stack
 
 
+def _gradient_watershed_elevation(
+    intensity_imgs,
+    combined_mask,
+    spacing,
+    smooth_sigma=1.0,
+    w_distance=1.0,
+    w_intensity=1.0,
+    w_gradient=1.0,
+):
+    """Build a watershed elevation surface that splits touching cells where the
+    marker signal itself dips or drops steeply, not just where two nuclei are
+    geometrically equidistant.
+
+    Combines three normalized (0-1 within ``combined_mask``) terms, each
+    raising elevation (i.e. acting as a watershed ridge/boundary) where it
+    signals a cell edge:
+
+    - ``1 - distance``: distance-from-background (kept from the original
+      approach so flooding still follows the medial axis and stops at the
+      true mask edge).
+    - ``1 - intensity envelope``: voxels dim in *every* marker become ridges
+      even away from the mask edge (e.g. a faint saddle between two bright
+      cells). The envelope is the per-voxel max across markers — a voxel
+      counts as cytoplasm if any one marker says so.
+    - ``combined gradient magnitude``: voxels where the signal is changing
+      fast in any marker become ridges, regardless of absolute brightness.
+      When several markers are supplied this is a per-voxel quadrature sum
+      (``sqrt(sum(grad_c**2))``) of each marker's own gradient, computed
+      *before* the markers are merged. This matters: if marker A fades out
+      while marker B rises across the same cell-cell boundary (common when
+      different markers dominate different neighbor cells), their envelope
+      (max) stays flat through the handoff and hides the transition, but
+      each channel's own gradient is still large there, so summing gradients
+      in quadrature keeps the boundary visible.
+
+    Parameters
+    ----------
+    intensity_imgs : ndarray (Z, Y, X) or sequence of ndarray (Z, Y, X)
+        One or more per-channel marker intensities (e.g. 'Filtered image'
+        slices), NOT the binary threshold mask — the whole point is to use
+        the graded signal. Pass every cytoplasm-associated marker channel
+        that contributed to ``combined_mask`` so the gradient term reflects
+        all of them, not just one.
+    combined_mask : ndarray (Z, Y, X), bool
+        Region watershed is allowed to flood (thresholded signal ∪ nuclei).
+    spacing : tuple of float (Z, Y, X)
+        Physical voxel size, used for the distance transform.
+    smooth_sigma : float
+        Gaussian smoothing applied before measuring intensity/gradient, so the
+        split follows the marker's underlying trend rather than pixel noise.
+    w_distance, w_intensity, w_gradient : float
+        Relative weight of each term above. Set a weight to 0 to disable it.
+
+    Returns
+    -------
+    elevation : ndarray (Z, Y, X), float32
+    """
+    if isinstance(intensity_imgs, np.ndarray):
+        intensity_imgs = [intensity_imgs]
+
+    sigma = max(float(smooth_sigma), 1e-3)
+    distance = ndi.distance_transform_edt(combined_mask, sampling=spacing)
+
+    def _norm_in_mask(arr):
+        values = arr[combined_mask]
+        if values.size == 0:
+            return np.zeros_like(arr, dtype=np.float32)
+        lo, hi = np.percentile(values, [2, 98])
+        if hi <= lo:
+            return np.zeros_like(arr, dtype=np.float32)
+        return np.clip((arr - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+    intensity_envelope = np.zeros_like(distance, dtype=np.float32)
+    gradient_sq_sum = np.zeros_like(distance, dtype=np.float32)
+    for img in intensity_imgs:
+        img = img.astype(np.float32)
+        smoothed = ndi.gaussian_filter(img, sigma=sigma)
+        grad_mag = ndi.gaussian_gradient_magnitude(img, sigma=sigma)
+        intensity_envelope = np.maximum(intensity_envelope, _norm_in_mask(smoothed))
+        gradient_sq_sum += grad_mag ** 2
+
+    combined_gradient = np.sqrt(gradient_sq_sum)
+    gradient_norm = _norm_in_mask(combined_gradient)
+
+    elevation = (
+        w_distance * (1.0 - _norm_in_mask(distance))
+        + w_intensity * (1.0 - intensity_envelope)
+        + w_gradient * gradient_norm
+    )
+    return elevation.astype(np.float32)
+
+
 def segment_cytoplasm(
     im_final_stack,
     im_segmentation_stack,
@@ -5008,6 +5100,11 @@ def segment_cytoplasm(
     r_zxyz,
     cell_diameter=None,
     trig_cellpose_cyto=False,
+    split_by_intensity_gradient=True,
+    gradient_smooth_sigma=1.0,
+    distance_weight=1.0,
+    intensity_weight=1.0,
+    gradient_weight=1.0,
     progress=None,
 ):
     """
@@ -5028,10 +5125,20 @@ def segment_cytoplasm(
     expansion (``cyto_factor``) instead, the same way as fully unsignalled
     cells.
 
+    By default, both watershed paths (CYTOPLASM channel and cyto_markers) split
+    touching cells using ``split_by_intensity_gradient=True``: instead of
+    flooding purely by geometric distance-from-background, the watershed
+    elevation also rises where the marker signal itself is dim or drops off
+    steeply (see ``_gradient_watershed_elevation``). This lets two cells whose
+    cytoplasm signal merges into one connected "island" still be split apart
+    at the point where the marker fades between them, rather than only at the
+    geometric midpoint between their nuclei.
+
     Parameters
     ----------
     im_final_stack : dict
-        Must contain 'Threshold image'.
+        Must contain 'Threshold image' and (when
+        ``split_by_intensity_gradient`` is True) 'Filtered image'.
     im_segmentation_stack : dict
         Must contain 'Nuclei'.
     stain_df, stain_complete_df : DataFrame
@@ -5051,6 +5158,21 @@ def segment_cytoplasm(
         If True and a CYTOPLASM channel is present, shape cells with Cellpose 3D
         instead of the nuclei-seeded watershed. Lets nuclei come from one method
         (e.g. StarDist) while cell shape comes from Cellpose.
+    split_by_intensity_gradient : bool
+        If True (default), the CYTOPLASM-channel and cyto_markers watershed
+        paths split touching cells using marker intensity/gradient, not just
+        geometric distance (see above). Set False to restore the original
+        pure-distance watershed.
+    gradient_smooth_sigma : float
+        Smoothing applied before measuring intensity/gradient for the split
+        (only used when ``split_by_intensity_gradient`` is True). Increase if
+        the split follows noise instead of the marker's real trend.
+    distance_weight, intensity_weight, gradient_weight : float
+        Relative weights of the three elevation terms (geometric distance,
+        absolute dimness, and steepness of intensity drop). Only used when
+        ``split_by_intensity_gradient`` is True. Raise ``gradient_weight``
+        relative to the others to make the split more sensitive to fast
+        intensity drops between bright, closely touching cells.
     progress : callable, optional
         Progress wrapper.
 
@@ -5103,14 +5225,30 @@ def segment_cytoplasm(
                     cyto_binary = im_in[:, :, :, c] > 0
                     nuc_mask = im_segmentation_stack['Nuclei'] > 0
                     combined_mask = cyto_binary | nuc_mask
-                    distance = _ndi.distance_transform_edt(
-                        combined_mask, sampling=[r_zZ, r_zY, r_zX]
-                    )
-                    im_out = watershed(
-                        -distance, im_segmentation_stack['Nuclei'],
-                        mask=combined_mask,
-                    )
-                    print(f"Cytoplasm segmented from CYTOPLASM channel + nuclei region (watershed)")
+                    if split_by_intensity_gradient:
+                        elevation = _gradient_watershed_elevation(
+                            im_final_stack['Filtered image'][:, :, :, c],
+                            combined_mask,
+                            spacing=(r_zZ, r_zY, r_zX),
+                            smooth_sigma=gradient_smooth_sigma,
+                            w_distance=distance_weight,
+                            w_intensity=intensity_weight,
+                            w_gradient=gradient_weight,
+                        )
+                        im_out = watershed(
+                            elevation, im_segmentation_stack['Nuclei'],
+                            mask=combined_mask,
+                        )
+                        print("Cytoplasm segmented from CYTOPLASM channel + nuclei region (gradient-aware watershed)")
+                    else:
+                        distance = _ndi.distance_transform_edt(
+                            combined_mask, sampling=[r_zZ, r_zY, r_zX]
+                        )
+                        im_out = watershed(
+                            -distance, im_segmentation_stack['Nuclei'],
+                            mask=combined_mask,
+                        )
+                        print(f"Cytoplasm segmented from CYTOPLASM channel + nuclei region (watershed)")
                 break
     else:
         if len(cyto_markers) == 0:
@@ -5120,24 +5258,43 @@ def segment_cytoplasm(
             from scipy import ndimage as _ndi
 
             marker_mask = np.zeros(im_in.shape[:3], dtype=bool)
+            marker_channel_imgs = []
             for c in progress(range(im_in.shape[3]), desc='Step 18B - Apply Cyto Markers'):
                 idx = stain_complete_df.index[c]
                 marker = stain_complete_df.loc[idx, 'Marker']
                 if marker in cyto_markers:
                     marker_mask |= (im_in[:, :, :, c] > 0)
+                    if split_by_intensity_gradient:
+                        marker_channel_imgs.append(im_final_stack['Filtered image'][:, :, :, c])
 
             nuc_mask = im_segmentation_stack['Nuclei'] > 0
             combined_mask = marker_mask | nuc_mask
-            distance = _ndi.distance_transform_edt(
-                combined_mask, sampling=[r_zZ, r_zY, r_zX]
-            )
-            im_out = watershed(
-                -distance, im_segmentation_stack['Nuclei'],
-                mask=combined_mask,
-            )
+            if split_by_intensity_gradient:
+                elevation = _gradient_watershed_elevation(
+                    marker_channel_imgs,
+                    combined_mask,
+                    spacing=(r_zZ, r_zY, r_zX),
+                    smooth_sigma=gradient_smooth_sigma,
+                    w_distance=distance_weight,
+                    w_intensity=intensity_weight,
+                    w_gradient=gradient_weight,
+                )
+                im_out = watershed(
+                    elevation, im_segmentation_stack['Nuclei'],
+                    mask=combined_mask,
+                )
+            else:
+                distance = _ndi.distance_transform_edt(
+                    combined_mask, sampling=[r_zZ, r_zY, r_zX]
+                )
+                im_out = watershed(
+                    -distance, im_segmentation_stack['Nuclei'],
+                    mask=combined_mask,
+                )
             print(
                 f"Cytoplasm expanded using markers: {cyto_markers} "
-                "(nearest-nucleus watershed, same as CYTOPLASM-channel path)"
+                f"({'gradient-aware' if split_by_intensity_gradient else 'nearest-nucleus'} "
+                "watershed, same as CYTOPLASM-channel path)"
             )
 
             if cell_diameter is not None:
