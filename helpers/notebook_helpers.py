@@ -291,11 +291,17 @@ def initialize_dataset(input_file, roi_coords, big_image=True,
 def prepare_and_preview(img, meta, ROI, big_image,
                         nuclei_diameter, cell_diameter,
                         stain_dict, file_meta,
-                        napari_module, progress=None):
+                        napari_module, r_xyz=None, progress=None):
     """Prepare image stack, build stain table, and open napari preview.
 
     Combines ``prepare_image_stack``, ``build_stain_dataframe``, and
     ``view_original_channels`` into a single call.
+
+    Parameters
+    ----------
+    r_xyz : tuple of float (r_X, r_Y, r_Z), optional
+        Physical voxel sizes in micrometers, forwarded to the napari preview
+        so the displayed volume isn't stretched/squashed along Z.
 
     Returns
     -------
@@ -308,7 +314,7 @@ def prepare_and_preview(img, meta, ROI, big_image,
         prepare_image_stack(img, meta, ROI, big_image, nuclei_diameter, cell_diameter)
     )
     stain_df = build_stain_dataframe(stain_dict, file_meta)
-    viewer = view_original_channels(im_final_stack, stain_df, napari_module, progress=progress)
+    viewer = view_original_channels(im_final_stack, stain_df, napari_module, r_xyz=r_xyz, progress=progress)
     return (im_final_stack, nuclei_radius, cell_radius, nuclei_volume, cell_volume,
             stain_df, viewer)
 
@@ -1591,9 +1597,18 @@ def prepare_stain_settings(
     use_setup=True,
     settings=None,
     napari_module=None,
+    r_xyz=None,
     progress=None,
 ):
-    """Load or interactively collect contrast/gamma settings for each channel."""
+    """Load or interactively collect contrast/gamma settings for each channel.
+
+    Parameters
+    ----------
+    r_xyz : tuple of float (r_X, r_Y, r_Z), optional
+        Physical voxel sizes in micrometers. Applied as the napari layer scale
+        during interactive setup so the preview isn't stretched/squashed
+        along Z relative to XY.
+    """
     stain_df = stain_df.reset_index(drop=False)
     stain_initial_df = stain_df.copy()
     stain_initial_df.set_index(["Condition", "Marker", "Laser"], inplace=True)
@@ -1645,6 +1660,7 @@ def prepare_stain_settings(
                 name=f"{idx[0]} ({idx[1]})",
                 colormap=stain_initial_df.loc[idx]["Color"],
                 blending="additive",
+                scale=(r_xyz[2], r_xyz[1], r_xyz[0]) if r_xyz is not None else None,
             )
 
         print(
@@ -4490,7 +4506,7 @@ def build_stain_dataframe(stain_dict: dict, file_meta: dict) -> "pd.DataFrame":
 
 
 def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
-                            napari_module, progress=None) -> object:
+                            napari_module, r_xyz=None, progress=None) -> object:
     """Open a napari viewer and add each channel of the original image.
 
     Each channel is normalised to uint8 [0, 255] before display.
@@ -4503,6 +4519,11 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
         Staining table from ``build_stain_dataframe``.
     napari_module : module
         The imported ``napari`` module.
+    r_xyz : tuple of float (r_X, r_Y, r_Z), optional
+        Physical voxel sizes in micrometers. Without this, napari treats
+        every voxel as a 1x1x1 cube, which stretches or squashes the
+        displayed volume along Z whenever the Z step differs from the
+        XY pixel size.
     progress : callable, optional
         A ``tqdm``-compatible progress wrapper (e.g. ``tqdm``).
 
@@ -4512,6 +4533,8 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
     """
     if progress is None:
         def progress(x, **kw): return x
+
+    scale = (r_xyz[2], r_xyz[1], r_xyz[0]) if r_xyz is not None else None
 
     im_in = im_final_stack['Original image'].copy()
     _close_all_napari_viewers(napari_module)
@@ -4531,6 +4554,7 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
             name=f"{stain_df.index[c]} ({c_name})",
             colormap=stain_df['Color'].iloc[c],
             blending='additive',
+            scale=scale,
         )
 
     viewer.scale_bar.visible = True
@@ -5590,6 +5614,7 @@ def export_nucleus_vtk_crop(
     im_final_stack,
     stain_df,
     input_file,
+    r_zxyz=(1.0, 1.0, 1.0),
     size=90,
 ):
     """
@@ -5610,11 +5635,17 @@ def export_nucleus_vtk_crop(
         Original staining metadata.
     input_file : str or Path
         Path to the source image file (used to derive output filename).
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
+        Physical voxel sizes in micrometers on the working (post-zoom) grid.
+        Used as the ImageData spacing so the sub-volume isn't rendered as
+        unit cubes in ParaView, which stretches/squashes it along Z.
     size : int
         Side length of the cubic export volume in voxels (default 90).
     """
     import pyvista as pv
     from pathlib import Path as _Path
+
+    r_zX, r_zY, r_zZ = r_zxyz
 
     nuc_vol = im_segmentation_stack['Nuclei']
     mask = nuc_vol == nuc_label
@@ -5662,7 +5693,7 @@ def export_nucleus_vtk_crop(
     grid = pv.ImageData()
     grid.dimensions = (size, size, size)
     grid.origin = (float(x0d), float(y0d), float(z0d))
-    grid.spacing = (1.0, 1.0, 1.0)
+    grid.spacing = (float(r_zX), float(r_zY), float(r_zZ))
     grid.point_data['Nuclei_label'] = nuclei_crop.ravel()
     grid.point_data['Cytoplasm_label'] = cytoplasm_crop.ravel()
     for ch_name, crop in marker_crops.items():
@@ -5712,6 +5743,14 @@ def build_vtk_volumes(
     from IPython.display import clear_output
 
     r_X, r_Y, r_Z = r_xyz
+    # Physical size of one voxel along each array axis (Z, Y, X) on the
+    # segmentation grid — used as the mesh voxel size so the exported
+    # geometry isn't stretched/squashed along Z relative to XY.
+    mesh_voxel_size = mr.Vector3f(
+        float(r_Z / zoom_factors[0]),
+        float(r_Y / zoom_factors[1]),
+        float(r_X / zoom_factors[2]),
+    )
     nuc_max = int(np.max(im_segmentation_stack['Nuclei']))
     cyto_max = int(np.max(im_segmentation_stack['Cytoplasm']))
     pcm_max = int(np.max(im_segmentation_stack['PCM']))
@@ -5740,7 +5779,7 @@ def build_vtk_volumes(
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Nuclei'] == j))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
         _g2m_settings = mr.GridToMeshSettings()
-        _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+        _g2m_settings.voxelSize = mesh_voxel_size
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
         mr.saveMesh(mesh_stl, "part_nuclei_mesh.stl")
@@ -5748,16 +5787,16 @@ def build_vtk_volumes(
         mesh_nuclei = pv.read("part_nuclei_mesh.stl")
         if mesh_nuclei.volume > 0.0:
             mesh_nuclei.decimate(target_reduction=0.8, inplace=True)
+            # mesh_nuclei geometry is already scaled by mesh_voxel_size, so
+            # volume is in um3 and center coordinates are in um directly.
             nuc_vol[k] = mesh_nuclei.volume
             nuc_coord[k] = mesh_nuclei.center
 
             mesh_nuclei.cell_data['ID'] = np.ones(mesh_nuclei.n_cells) * (k + 1)
-            mesh_nuclei.cell_data['Nuclei volume (um3)'] = (
-                np.ones(mesh_nuclei.n_cells) * nuc_vol[k] * r_X * r_Y * r_Z / np.prod(zoom_factors)
-            )
-            mesh_nuclei.cell_data['Z nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][0] * r_Z / zoom_factors[0]
-            mesh_nuclei.cell_data['Y nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][1] * r_Y / zoom_factors[1]
-            mesh_nuclei.cell_data['X nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][2] * r_X / zoom_factors[2]
+            mesh_nuclei.cell_data['Nuclei volume (um3)'] = np.ones(mesh_nuclei.n_cells) * nuc_vol[k]
+            mesh_nuclei.cell_data['Z nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][0]
+            mesh_nuclei.cell_data['Y nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][1]
+            mesh_nuclei.cell_data['X nuclei (um)'] = np.ones(mesh_nuclei.n_cells) * nuc_coord[k][2]
             blocks_nuclei.append(mesh_nuclei)
             k += 1
 
@@ -5765,7 +5804,7 @@ def build_vtk_volumes(
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Cytoplasm'] == j))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
         _g2m_settings = mr.GridToMeshSettings()
-        _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+        _g2m_settings.voxelSize = mesh_voxel_size
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
         mr.saveMesh(mesh_stl, "part_cyto_mesh.stl")
@@ -5775,7 +5814,7 @@ def build_vtk_volumes(
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['PCM'] == j))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
         _g2m_settings = mr.GridToMeshSettings()
-        _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+        _g2m_settings.voxelSize = mesh_voxel_size
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
         mr.saveMesh(mesh_stl, "part_PCM_mesh.stl")
@@ -5785,23 +5824,23 @@ def build_vtk_volumes(
             mesh_cyto.decimate(target_reduction=0.8, inplace=True)
             mesh_PCM.decimate(target_reduction=0.8, inplace=True)
 
+            # Already in physical units (um / um3) since the mesh geometry
+            # itself was built with the correct anisotropic voxel size.
             cyto_vol[k] = mesh_cyto.volume
             cyto_coord[k] = mesh_cyto.center
             PCM_vol[k] = mesh_PCM.volume
             PCM_coord[k] = mesh_PCM.center
 
-            voxel_scale = r_X * r_Y * r_Z / np.prod(zoom_factors)
-
             mesh_cyto.cell_data['ID'] = np.ones(mesh_cyto.n_cells) * (k + 1)
             mesh_PCM.cell_data['ID'] = np.ones(mesh_PCM.n_cells) * (k + 1)
-            mesh_cyto.cell_data['Cellular volume (um3)'] = np.ones(mesh_cyto.n_cells) * cyto_vol[k] * voxel_scale
-            mesh_PCM.cell_data['PCM volume (um3)'] = np.ones(mesh_PCM.n_cells) * PCM_vol[k] * voxel_scale
-            mesh_cyto.cell_data['Z cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][0] * r_Z / zoom_factors[0]
-            mesh_cyto.cell_data['Y cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][1] * r_Y / zoom_factors[1]
-            mesh_cyto.cell_data['X cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][2] * r_X / zoom_factors[2]
-            mesh_PCM.cell_data['Z PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][0] * r_Z / zoom_factors[0]
-            mesh_PCM.cell_data['Y PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][1] * r_Y / zoom_factors[1]
-            mesh_PCM.cell_data['X PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][2] * r_X / zoom_factors[2]
+            mesh_cyto.cell_data['Cellular volume (um3)'] = np.ones(mesh_cyto.n_cells) * cyto_vol[k]
+            mesh_PCM.cell_data['PCM volume (um3)'] = np.ones(mesh_PCM.n_cells) * PCM_vol[k]
+            mesh_cyto.cell_data['Z cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][0]
+            mesh_cyto.cell_data['Y cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][1]
+            mesh_cyto.cell_data['X cell (um)'] = np.ones(mesh_cyto.n_cells) * cyto_coord[k][2]
+            mesh_PCM.cell_data['Z PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][0]
+            mesh_PCM.cell_data['Y PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][1]
+            mesh_PCM.cell_data['X PCM (um)'] = np.ones(mesh_PCM.n_cells) * PCM_coord[k][2]
 
             for i, marker in enumerate(labels_full_df.index):
                 row = labels_full_df.iloc[i]
@@ -5812,15 +5851,15 @@ def build_vtk_volumes(
                 if j in shared:
                     idx = shared.index(j)
                     vol_um3 = row['Marker size [um3]'][idx]
-                    cyto_combined = (cyto_vol[k] + PCM_vol[k]) * voxel_scale
+                    cyto_combined = cyto_vol[k] + PCM_vol[k]
                     mesh_cyto.cell_data[marker + ' volume (um3)'] = np.ones(mesh_cyto.n_cells) * vol_um3
                     mesh_PCM.cell_data[marker + ' volume (um3)'] = np.ones(mesh_PCM.n_cells) * vol_um3
                     mesh_cyto.cell_data[marker + ' volume cytoplasm (um3)'] = np.ones(mesh_cyto.n_cells) * row['Marker size cytoplasm [um3]'][idx]
                     mesh_PCM.cell_data[marker + ' volume PCM (um3)'] = np.ones(mesh_PCM.n_cells) * row['Marker size PCM [um3]'][idx]
                     mesh_cyto.cell_data[marker + ' rel. vol. (-)'] = np.ones(mesh_cyto.n_cells) * (vol_um3 / cyto_combined)
                     mesh_PCM.cell_data[marker + ' rel. vol. (-)'] = np.ones(mesh_PCM.n_cells) * (vol_um3 / cyto_combined)
-                    mesh_cyto.cell_data[marker + ' rel. vol. cytoplasm (-)'] = np.ones(mesh_cyto.n_cells) * (row['Marker size cytoplasm [um3]'][idx] / (cyto_vol[k] * voxel_scale))
-                    mesh_PCM.cell_data[marker + ' rel. vol. PCM (-)'] = np.ones(mesh_PCM.n_cells) * (row['Marker size PCM [um3]'][idx] / (PCM_vol[k] * voxel_scale))
+                    mesh_cyto.cell_data[marker + ' rel. vol. cytoplasm (-)'] = np.ones(mesh_cyto.n_cells) * (row['Marker size cytoplasm [um3]'][idx] / cyto_vol[k])
+                    mesh_PCM.cell_data[marker + ' rel. vol. PCM (-)'] = np.ones(mesh_PCM.n_cells) * (row['Marker size PCM [um3]'][idx] / PCM_vol[k])
                     mesh_cyto.cell_data[marker + ' avg. intensity (-)'] = np.ones(mesh_cyto.n_cells) * row['Avg. marker intensity'][idx]
                     mesh_PCM.cell_data[marker + ' avg. intensity (-)'] = np.ones(mesh_PCM.n_cells) * row['Avg. marker intensity'][idx]
                     mesh_cyto.cell_data[marker + ' avg. cytoplasm int. (-)'] = np.ones(mesh_cyto.n_cells) * row['Avg. marker intensity cytoplasm'][idx]
@@ -5851,6 +5890,8 @@ def export_marker_stl(
     stain_df,
     stain_complete_df,
     input_file,
+    r_xyz=(1.0, 1.0, 1.0),
+    zoom_factors=(1.0, 1.0, 1.0),
     progress=None,
 ):
     """Export per-marker binary volumes as STL mesh files.
@@ -5865,12 +5906,25 @@ def export_marker_stl(
         Complete staining DataFrame used to filter NUCLEI/CYTOPLASM/PCM.
     input_file : str or Path
         Source image path (used to derive output filenames).
+    r_xyz : tuple of float
+        Physical voxel sizes (r_X, r_Y, r_Z) in µm/px, used so the exported
+        mesh geometry reflects the real (often anisotropic) voxel spacing
+        instead of treating every voxel as a 1x1x1 cube.
+    zoom_factors : list of float
+        Zoom factors [Z, Y, X] applied during isotropic resampling.
     progress : callable or None
         tqdm-compatible wrapper.
     """
     import meshlib.mrmeshpy as mr
     import meshlib.mrmeshnumpy as mrn
     from pathlib import Path as _Path
+
+    r_X, r_Y, r_Z = r_xyz
+    mesh_voxel_size = mr.Vector3f(
+        float(r_Z / zoom_factors[0]),
+        float(r_Y / zoom_factors[1]),
+        float(r_X / zoom_factors[2]),
+    )
 
     iter_ = (
         progress(
@@ -5887,7 +5941,7 @@ def export_marker_stl(
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack[stain_df.index[c]] > 0))
         floatGrid = mr.simpleVolumeToDenseGrid(simpleVolume)
         _g2m_settings = mr.GridToMeshSettings()
-        _g2m_settings.voxelSize = mr.Vector3f(1.0, 1.0, 1.0)
+        _g2m_settings.voxelSize = mesh_voxel_size
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
         mr.saveMesh(mesh_stl, str(_Path(input_file).stem) + "_" + row['Marker'] + "_mesh.stl")
