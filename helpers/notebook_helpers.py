@@ -65,6 +65,7 @@ __all__ = [
     "load_image_and_metadata",
     "load_image_with_roi",
     "open_image_file",
+    "select_roi_interactively",
     "plot_nucleus_kdes",
     "plot_size_distributions",
     "plot_spatial_distributions",
@@ -321,6 +322,126 @@ def load_image_and_metadata(input_file, roi_coords, big_image=True):
     print(f"Date: {file_meta['date']}")
     print(f"Channels: {file_meta['channels']}")
     return meta, img, r_X, r_Y, r_Z, file_meta, ROI_print
+
+
+def select_roi_interactively(input_file, roi_coords, napari_module=None):
+    """Open a napari window on the full image so the ROI can be set by
+    dragging a rectangle instead of typing pixel coordinates.
+
+    Every channel of the *full* image is loaded lazily (via dask — the file
+    is opened independently of the main pipeline load, and no more of it is
+    read than napari actually renders) and shown as a separate layer, named
+    from the file metadata. A yellow 'ROI' rectangle seeded from
+    ``roi_coords`` is added on top; drag its edges/corners to the region you
+    want, then close the window to continue.
+
+    Only X/Y are interactively editable, since a 2D rectangle can't
+    represent a depth range — Z is passed through from ``roi_coords``
+    unchanged. Edit ROI's z0/z1 in Cell 3 directly if it needs to change.
+
+    Parameters
+    ----------
+    input_file : str
+        Path to the microscopy file.
+    roi_coords : list of 6 ints
+        [x0, x1, y0, y1, z0, z1]. Use 0 for any limit to mean "full range" —
+        this is resolved against the file's real extent before the
+        rectangle is drawn.
+    napari_module : module, optional
+        Pass the already-imported ``napari`` module (avoids re-importing).
+
+    Returns
+    -------
+    list of 6 ints
+        Updated [x0, x1, y0, y1, z0, z1]: X/Y from the final rectangle
+        position (clipped to the image extent), Z unchanged from the input.
+    """
+    if napari_module is None:
+        import napari as napari_module
+
+    meta = open_image_file(input_file)
+    file_meta = read_file_metadata(input_file, meta)
+    channel_names = file_meta.get("channels") or []
+
+    lazy = meta.get_image_dask_data("ZYXC")
+    z_size, y_size, x_size, c_size = lazy.shape
+
+    x0, x1, y0, y1, z0, z1 = roi_coords
+    x1 = x1 if x1 else x_size
+    y1 = y1 if y1 else y_size
+    z1 = z1 if z1 else z_size
+    x0 = int(np.clip(x0, 0, x_size))
+    x1 = int(np.clip(x1, 0, x_size))
+    y0 = int(np.clip(y0, 0, y_size))
+    y1 = int(np.clip(y1, 0, y_size))
+
+    # napari.run() only blocks when ipy_interactive is off *at the time the
+    # Viewer is created* — otherwise Qt is already integrated with IPython's
+    # event loop and the viewer never actually waits, so the window closes
+    # again as soon as this function keeps executing. Must be set before
+    # napari_module.Viewer(...) is constructed, not just before .run().
+    from napari.settings import get_settings
+    settings = get_settings()
+    was_ipy_interactive = settings.application.ipy_interactive
+    settings.application.ipy_interactive = False
+    try:
+        _close_all_napari_viewers(napari_module)
+        viewer = napari_module.Viewer(
+            title="Drag the ROI rectangle, then close this window to continue",
+            ndisplay=2,
+        )
+
+        default_colors = ["gray", "red", "green", "blue", "magenta", "cyan", "yellow"]
+        for c in range(c_size):
+            name = channel_names[c] if c < len(channel_names) else f"Channel {c}"
+            viewer.add_image(
+                lazy[:, :, :, c],
+                name=name,
+                colormap=default_colors[c % len(default_colors)],
+                blending="additive",
+            )
+
+        roi_rect = np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]], dtype=float)
+        shapes_layer = viewer.add_shapes(
+            [roi_rect],
+            shape_type="rectangle",
+            name="ROI",
+            edge_color="yellow",
+            face_color="transparent",
+            edge_width=max(2, round(0.004 * max(x_size, y_size))),
+        )
+        # Make the ROI shape immediately draggable/resizable — otherwise the
+        # viewer opens in pan/zoom mode with nothing selected, and the user
+        # has to click the "select shapes" tool and then click the rectangle
+        # by hand before its resize handles appear.
+        viewer.layers.selection.active = shapes_layer
+        shapes_layer.mode = "select"
+        shapes_layer.selected_data = {0}
+
+        print(
+            "Drag the corners/edges of the yellow 'ROI' rectangle to the region "
+            "you want to process, then close the napari window to continue.\n"
+            "The Z range from Cell 3 is kept as-is (not editable here)."
+        )
+        napari_module.run()
+    finally:
+        settings.application.ipy_interactive = was_ipy_interactive
+
+    if len(shapes_layer.data) == 0:
+        print("ROI rectangle was deleted — keeping the original X/Y bounds.")
+        new_x0, new_x1, new_y0, new_y1 = x0, x1, y0, y1
+    else:
+        verts = shapes_layer.data[0]
+        new_y0 = int(np.clip(round(float(np.min(verts[:, 0]))), 0, y_size))
+        new_y1 = int(np.clip(round(float(np.max(verts[:, 0]))), 0, y_size))
+        new_x0 = int(np.clip(round(float(np.min(verts[:, 1]))), 0, x_size))
+        new_x1 = int(np.clip(round(float(np.max(verts[:, 1]))), 0, x_size))
+
+    _close_all_napari_viewers(napari_module)
+
+    new_roi = [new_x0, new_x1, new_y0, new_y1, z0, z1]
+    print(f"ROI updated interactively: {new_roi}")
+    return new_roi
 
 
 def initialize_dataset(input_file, roi_coords, big_image=True,
