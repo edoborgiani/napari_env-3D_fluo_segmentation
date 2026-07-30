@@ -1,7 +1,17 @@
 # Core / visualization
 napari[all]
-numpy
-scipy
+# Pinned: napari/aicsimageio only require a lower bound on dask, but dask
+# cuts new releases very often, so leaving it unpinned makes pip's resolver
+# backtrack through hundreds of dask versions. Pinning skips that search.
+dask[array]==2026.7.1
+# Pinned: tensorflow<2.17 hard-requires numpy<2.0.0, but the *latest*
+# scipy/opencv-python releases now require numpy>=2.0 with no upper bound
+# elsewhere in this file. Left unpinned, pip has to backtrack through both
+# packages' full release histories to discover a numpy<2.0-compatible
+# version of each. These three pins are mutually compatible and skip that
+# search entirely.
+numpy==1.26.4
+scipy==1.14.1
 scikit-image
 matplotlib
 Pillow
@@ -10,8 +20,12 @@ Pillow
 jupyter
 
 # Image I/O
-opencv-python
-aicsimageio[nd2]>=4.0
+opencv-python==4.10.0.84
+# Pinned: aicsimageio 4.12.1/4.13.0 cap dask at <=2023.5.0, which conflicts
+# with the dask pin above and sent pip walking back through aicsimageio's
+# whole history (down to versions that predate the 'nd2' extra) looking for
+# an alternative. 4.14.0 has no dask ceiling and includes the nd2 extra.
+aicsimageio[nd2]==4.14.0
 nd2reader
 
 # Segmentation models

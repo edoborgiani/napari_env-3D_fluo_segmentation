@@ -1612,7 +1612,7 @@ def prepare_stain_settings(
     stain_df = stain_df.reset_index(drop=False)
     stain_initial_df = stain_df.copy()
     stain_initial_df.set_index(["Condition", "Marker", "Laser"], inplace=True)
-    stain_initial_df[["Cont_min", "Cont_max", "Gamma"]] = [0, 255, 1]
+    stain_initial_df[["Cont_min", "Cont_max", "Gamma"]] = [0, 255, 1.0]
     stain_complete_df = stain_initial_df.copy()
 
     setup_path = f"{name_setup}_setup.csv"
@@ -5348,7 +5348,7 @@ def segment_cytoplasm(
                         f"{undersized} cells (marker-derived volume < 20% of expected cell size)"
                     )
         stain_complete_df = stain_complete_df.copy()
-        stain_complete_df.loc['CYTOPLASM'] = ['', '', '', '', '', '']
+        stain_complete_df.loc['CYTOPLASM'] = ['', '', '', 0, 255, 1.0]
 
     nuclei_labels = im_segmentation_stack['Nuclei']
     max_label = int(nuclei_labels.max())
