@@ -175,6 +175,84 @@ class _ND2ReaderFallback:
         )
 
 
+class _PhysicalPixelSizesOverride:
+    """Drop-in replacement for aicsimageio's PhysicalPixelSizes namedtuple,
+    holding manually-entered values for axes the file metadata couldn't provide.
+    """
+
+    def __init__(self, x, y, z):
+        self.X = x
+        self.Y = y
+        self.Z = z
+
+
+class _MetaWithVoxelSizeOverride:
+    """Wraps an image-metadata object (AICSImage or _ND2ReaderFallback) so that
+    ``physical_pixel_sizes`` returns manually-entered values, while every other
+    attribute/method (shape, channel_names, metadata, get_image_data, ...) is
+    forwarded to the original object unchanged.
+
+    Needed because some helpers (e.g. ``resample_to_isotropic``) re-read
+    ``meta.physical_pixel_sizes`` directly rather than reusing the r_X/r_Y/r_Z
+    values returned by ``load_image_and_metadata`` — without this wrapper, a
+    manually-entered voxel size would be lost again later in the pipeline.
+    """
+
+    def __init__(self, meta, r_X, r_Y, r_Z):
+        self._wrapped_meta = meta
+        self._override = _PhysicalPixelSizesOverride(r_X, r_Y, r_Z)
+
+    @property
+    def physical_pixel_sizes(self):
+        return self._override
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped_meta, name)
+
+
+def _prompt_missing_voxel_sizes(r_X, r_Y, r_Z):
+    """Prompt for any voxel size axis the file metadata didn't provide.
+
+    aicsimageio (and the nd2reader fallback) return None for any axis whose
+    physical pixel size couldn't be read from the file. Downstream steps
+    (isotropic resampling, volume/diameter calculations, mesh export) all
+    assume real values, so ask for the missing ones here — a text box will
+    appear below the cell — instead of failing later with a cryptic
+    ``NoneType`` error.
+
+    Returns
+    -------
+    r_X, r_Y, r_Z : float
+    was_prompted : bool
+        True if any value had to be entered manually.
+    """
+    axes = {"X": r_X, "Y": r_Y, "Z": r_Z}
+    missing = [name for name, value in axes.items() if value is None]
+    if not missing:
+        return r_X, r_Y, r_Z, False
+
+    print(
+        f"Could not read the voxel size for axis/axes {missing} from the file "
+        "metadata. Enter the physical pixel size (in micrometers) for each "
+        "missing axis below."
+    )
+    for name in missing:
+        while True:
+            raw = input(f"  Voxel size for {name} (um): ").strip()
+            try:
+                value = float(raw)
+            except ValueError:
+                print(f"  '{raw}' is not a valid number, try again.")
+                continue
+            if value <= 0:
+                print("  Voxel size must be a positive number, try again.")
+                continue
+            axes[name] = value
+            break
+
+    return axes["X"], axes["Y"], axes["Z"], True
+
+
 def open_image_file(input_file: str):
     """Open a microscopy file with AICSImage, falling back to a nd2reader-based
     wrapper for legacy ND2 files that raise ``ValueError: Invalid ChunkMap signature``.
@@ -235,6 +313,9 @@ def load_image_and_metadata(input_file, roi_coords, big_image=True):
     r_X = meta.physical_pixel_sizes.X
     r_Y = meta.physical_pixel_sizes.Y
     r_Z = meta.physical_pixel_sizes.Z
+    r_X, r_Y, r_Z, was_prompted = _prompt_missing_voxel_sizes(r_X, r_Y, r_Z)
+    if was_prompted:
+        meta = _MetaWithVoxelSizeOverride(meta, r_X, r_Y, r_Z)
     file_meta = read_file_metadata(input_file, meta)
     print(f"Voxel size: [{r_X}, {r_Y}, {r_Z}] um")
     print(f"Date: {file_meta['date']}")
