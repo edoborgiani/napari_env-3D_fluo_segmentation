@@ -37,6 +37,7 @@ __all__ = [
     "contr_stretch",
     "create_row_pdf",
     "crop_nucleus_with_padding",
+    "detect_peaks_xy_intensity_aware",
     "detect_peaks_xy_with_best_z",
     "double_plateau_hist_equalization_nd",
     "export_channel_histograms",
@@ -48,6 +49,7 @@ __all__ = [
     "extract_roi_from_metadata",
     "fix_image_axes_order",
     "gamma_trans",
+    "get_cyto_split_config",
     "get_nuclei_split_config",
     "get_stain_name",
     "grow_labels",
@@ -714,6 +716,71 @@ def get_nuclei_split_config(profile="aggressive", **overrides):
         "nuclei_seed_min_fraction": 0.03,
         "nuclei_min_roundness": 0.45,
         "z_split_aggressive": False,
+        # Intensity-aware seeding/splitting: when two individually round
+        # nuclei touch with too shallow a geometric neck for erosion alone
+        # to separate, also look for two seeds in a combined distance +
+        # intensity peak map, and run the final watershed on a distance +
+        # intensity + gradient elevation surface instead of pure distance,
+        # so the split lands where the marker signal itself dips between
+        # the two nuclei. Requires `intensity_img` to be passed through to
+        # `segment_nuclei_watershed` (done automatically by `segment_nuclei`).
+        "split_by_intensity_gradient": True,
+        "nuclei_gradient_smooth_sigma": 1.0,
+        "nuclei_distance_weight": 1.0,
+        "nuclei_intensity_weight": 1.0,
+        "nuclei_gradient_weight": 1.0,
+    }
+    config.update(overrides)
+    return config
+
+
+def get_cyto_split_config(profile="balanced", **overrides):
+    """Return the recommended intensity-gradient cytoplasm splitting settings.
+
+    Parameters
+    ----------
+    profile : {"conservative", "balanced", "aggressive"}, optional
+        Preset controlling how strongly the cytoplasm watershed boundary is
+        pulled toward dips/drops in marker intensity vs. pure geometric
+        distance between touching cells.
+        - conservative -> closer to pure distance watershed (low gradient_weight)
+        - balanced     -> equal weighting of distance, intensity, and gradient
+        - aggressive   -> boundary snaps hard to intensity dips (high gradient_weight)
+    **overrides : dict
+        Any keyword arguments matching `segment_cytoplasm`'s split options
+        (split_by_intensity_gradient, gradient_smooth_sigma, distance_weight,
+        intensity_weight, gradient_weight).
+
+    Returns
+    -------
+    dict
+        A parameter dictionary ready to pass into `segment_cytoplasm(..., **config)`.
+    """
+    profiles = {
+        "conservative": 0.5,
+        "balanced": 1.0,
+        "aggressive": 2.0,
+    }
+    if profile not in profiles:
+        raise ValueError(
+            f"Unknown profile '{profile}'. Choose from {tuple(profiles)}."
+        )
+
+    config = {
+        # split_by_intensity_gradient: when two touching cells' cytoplasm merges
+        # into one connected "island", split it where the marker signal itself
+        # fades rather than only at the geometric midpoint between nuclei.
+        "split_by_intensity_gradient": True,
+        # gradient_smooth_sigma: smoothing (voxels) before measuring
+        # intensity/gradient. Raise if the split follows noise instead of the
+        # marker's real trend.
+        "gradient_smooth_sigma": 1.0,
+        # distance_weight / intensity_weight / gradient_weight: relative
+        # weights of the three elevation terms (geometric distance, absolute
+        # dimness, steepness of intensity drop).
+        "distance_weight": 1.0,
+        "intensity_weight": 1.0,
+        "gradient_weight": profiles[profile],
     }
     config.update(overrides)
     return config
@@ -1931,6 +1998,8 @@ def export_channel_histograms(
     num_plateaus=2,
     plateau_factor=0.7,
     threshold_method='otsu',
+    global_threshold_weight=0.15,
+    sauvola_weight=0.60,
     aggregate_grow_factor=2.0,
     progress=None,
 ):
@@ -1989,6 +2058,8 @@ def export_channel_histograms(
         'Num plateaus (histogram eq.)':   str(num_plateaus),
         'Plateau factor (histogram eq.)': str(plateau_factor),
         'Threshold method':               str(threshold_method),
+        'Global threshold weight':        str(global_threshold_weight),
+        'Sauvola (local) threshold weight': str(sauvola_weight),
         'Aggregate grow factor':          str(aggregate_grow_factor),
     }
 
@@ -3551,6 +3622,87 @@ def detect_peaks_xy_with_best_z(
     return peak_coords_3d
 
 
+def detect_peaks_xy_intensity_aware(
+    local_distance,
+    local_intensity,
+    peak_min_distance_xy,
+    peak_threshold_fraction,
+    distance_weight=1.0,
+    intensity_weight=1.0,
+):
+    """
+    Detect multiple nucleus seed points within one connected component using
+    both the EDT distance transform and the raw (smoothed) intensity signal.
+
+    Two touching, individually round nuclei often merge into a single
+    threshold "island" whose distance transform has no clean second maximum
+    (the neck isn't deep enough). Combining distance with intensity — most
+    nuclear stains dip in brightness right where two nuclei abut — restores
+    a local minimum/saddle at that boundary, so each nucleus's own bright,
+    bulging center still shows up as a separate maximum in the combined map.
+
+    Parameters
+    ----------
+    local_distance : ndarray, shape (Z, Y, X)
+        Distance transform (EDT), zeroed outside the connected component.
+    local_intensity : ndarray, shape (Z, Y, X)
+        Smoothed intensity image, zeroed outside the connected component.
+    peak_min_distance_xy : int
+        Minimum pixel distance between detected peaks in the XY plane.
+    peak_threshold_fraction : float
+        Fraction of the combined map's maximum used as the peak threshold.
+    distance_weight, intensity_weight : float
+        Relative weight of each (locally 0-1 normalized) term in the combined
+        seed-strength map that peaks are detected in.
+
+    Returns
+    -------
+    peak_coords_3d : list of tuples
+        (z, y, x) coordinates for detected peaks. Empty if fewer than 2
+        distinct peaks are found.
+    """
+    mask = local_distance > 0
+    if not np.any(mask):
+        return []
+
+    def _norm(arr):
+        values = arr[mask]
+        if values.size == 0:
+            return np.zeros_like(arr, dtype=np.float32)
+        lo, hi = float(values.min()), float(values.max())
+        if hi <= lo:
+            return np.zeros_like(arr, dtype=np.float32)
+        return np.clip((arr.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
+
+    combined = (
+        distance_weight * _norm(local_distance)
+        + intensity_weight * _norm(np.where(mask, local_intensity, 0))
+    )
+    combined[~mask] = 0.0
+
+    xy_combined = np.max(combined, axis=0)
+    peak_threshold = max(0.0, peak_threshold_fraction * float(xy_combined.max()))
+
+    peak_coords_xy = peak_local_max(
+        xy_combined,
+        min_distance=peak_min_distance_xy,
+        threshold_abs=peak_threshold,
+        exclude_border=False,
+    )
+
+    peak_coords_3d = []
+    for yx in peak_coords_xy:
+        y_i, x_i = int(yx[0]), int(yx[1])
+        z_line = combined[:, y_i, x_i]
+        z_max = float(np.max(z_line))
+        if z_max < peak_threshold:
+            continue
+        z_i = int(np.argmax(z_line))
+        peak_coords_3d.append((z_i, y_i, x_i))
+
+    return peak_coords_3d
+
+
 def _split_labels_by_z_consistency(label_img, min_fragment_vox=8,
                                    aggressive=False):
     """Split labels whose voxels form multiple disconnected 3D regions.
@@ -3878,44 +4030,444 @@ def _merge_labels_by_z_consistency(label_img):
     return out, total_merges
 
 
-def _filter_labels_by_roundness_xy(label_img, min_roundness):
-    """Remove 3D labels whose largest XY slice is less circular than threshold."""
+def _label_roundness_xy(mask):
+    """Circularity (4*pi*area/perimeter^2) of a 3D boolean mask's largest XY slice."""
+    z_counts = np.count_nonzero(mask, axis=(1, 2))
+    if not np.any(z_counts):
+        return 0.0
+    z_best = int(np.argmax(z_counts))
+    slice_mask = mask[z_best]
+    area = int(np.count_nonzero(slice_mask))
+    if area <= 2:
+        return 0.0
+    contours, _ = cv2.findContours(
+        slice_mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    perimeter = float(sum(cv2.arcLength(cnt, True) for cnt in contours))
+    if perimeter <= 0.0:
+        return 0.0
+    return float((4.0 * np.pi * area) / (perimeter ** 2))
+
+
+def _filter_labels_by_roundness_xy(label_img, min_roundness, protect_min_vox=None):
+    """Remove 3D labels whose largest XY slice is less circular than threshold.
+
+    Parameters
+    ----------
+    protect_min_vox : float, optional
+        Labels with at least this many voxels are never deleted here, even
+        if non-round. A label this large is implausible as a single
+        nucleus — it's an unsplit multi-nucleus cluster, and deleting it
+        would erase multiple real nuclei outright. Leaving it merged (still
+        one label) loses far less signal than removing it entirely. (See
+        ``_split_nonround_clusters_by_intensity_peaks`` /
+        ``_split_nonround_clusters_by_rethreshold``, which run first and
+        try to properly separate these instead of just protecting them.)
+
+    Returns
+    -------
+    out : ndarray
+    removed : int
+        Non-round labels below ``protect_min_vox`` that were deleted.
+    protected : int
+        Non-round labels at/above ``protect_min_vox`` that were left
+        merged instead of deleted — i.e. clusters both upstream re-split
+        strategies failed to separate. Zero means every non-round label was
+        small enough to just delete outright (or there were none at all).
+    """
     threshold = max(0.0, float(min_roundness))
     if threshold <= 0.0:
-        return label_img, 0
+        return label_img, 0, 0
 
     out = np.asarray(label_img).copy()
     max_label = int(np.max(out))
     removed = 0
+    protected = 0
 
     for label_id in range(1, max_label + 1):
         mask = out == label_id
-        if not np.any(mask):
+        voxel_count = int(np.count_nonzero(mask))
+        if voxel_count == 0:
             continue
 
-        z_counts = np.count_nonzero(mask, axis=(1, 2))
-        z_best = int(np.argmax(z_counts))
-        slice_mask = mask[z_best]
-        area = int(np.count_nonzero(slice_mask))
-
-        if area <= 2:
-            out[mask] = 0
-            removed += 1
+        if _label_roundness_xy(mask) >= threshold:
             continue
 
-        contours, _ = cv2.findContours(
-            slice_mask.astype(np.uint8),
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_NONE,
+        if protect_min_vox is not None and voxel_count >= protect_min_vox:
+            protected += 1
+            continue
+
+        out[mask] = 0
+        removed += 1
+
+    return out, removed, protected
+
+
+def _split_nonround_clusters_by_intensity_peaks(
+    label_img,
+    intensity_img,
+    spacing,
+    min_roundness,
+    expected_nucleus_vox,
+    peak_min_distance_xy,
+    peak_threshold_fraction,
+    distance_weight=1.0,
+    intensity_weight=1.0,
+    gradient_weight=1.0,
+    smooth_sigma=1.0,
+    min_piece_vox_factor=0.35,
+    max_piece_vox_factor=1.7,
+):
+    """Re-split non-round, multi-nucleus-sized labels using DAPI intensity peaks.
+
+    Geometry/distance-only watershed can leave several touching nuclei as
+    one label when the neck between them is too shallow to erode apart. For
+    any label that is both (a) non-round and (b) large enough to plausibly
+    hold more than one nucleus, this looks for distinct nucleus centers
+    directly in the (smoothed) intensity signal — round nuclei that are
+    individually distinguishable by brightness even when their combined
+    outline isn't — and re-splits along the intensity dip/gradient between
+    them (same elevation surface as the main watershed).
+
+    Each resulting piece is judged independently against the roundness
+    threshold and a plausible single-nucleus size window
+    (``min_piece_vox_factor``-``max_piece_vox_factor`` x
+    ``expected_nucleus_vox``) and only the pieces that pass are peeled off
+    as new labels — a cluster where most pieces look like real nuclei and
+    one or two don't isn't discarded wholesale; the failing voxels simply
+    stay under the original label id, available for
+    ``_split_nonround_clusters_by_rethreshold`` or another round of this
+    same function to resolve further. Nothing is kept unless at least 2
+    pieces pass (a single valid piece isn't useful — there'd be nothing
+    left to compare it against).
+
+    Parameters
+    ----------
+    label_img : ndarray (Z, Y, X), int
+        Integer label volume (0 = background).
+    intensity_img : ndarray (Z, Y, X)
+        Intensity image the labels were segmented from (e.g. 'Filtered image'
+        for the NUCLEI channel).
+    spacing : tuple of float (Z, Y, X)
+        Physical voxel size, used for the distance transform and elevation.
+    min_roundness : float
+        Same threshold used by ``_filter_labels_by_roundness_xy``; a label
+        already at or above it is left alone (nothing to fix), and every
+        candidate split piece must also meet it.
+    expected_nucleus_vox : float
+        Volume (voxels) of one typical full-diameter nucleus.
+    peak_min_distance_xy, peak_threshold_fraction : float
+        Passed to ``detect_peaks_xy_intensity_aware`` for locating nucleus
+        centers within the label. Use tighter/more permissive values than
+        the main seeding pass (e.g. half the distance, ~55% the threshold)
+        since this is specifically targeting a cluster that already failed
+        to separate at the default sensitivity.
+    distance_weight, intensity_weight, gradient_weight, smooth_sigma : float
+        Passed through to ``_gradient_watershed_elevation`` for the local
+        re-split.
+    min_piece_vox_factor, max_piece_vox_factor : float
+        A candidate split piece must fall within
+        [``min_piece_vox_factor``, ``max_piece_vox_factor``] x
+        ``expected_nucleus_vox`` to be accepted (default 0.35-1.7x) — too
+        small suggests a spurious noise peak, too large means the piece
+        still isn't a single nucleus.
+
+    Returns
+    -------
+    out : ndarray, same shape as label_img
+        Updated label volume with valid splits applied.
+    split_count : int
+        Number of labels successfully split into >= 2 valid pieces.
+    """
+    from scipy import ndimage as ndi
+    from skimage.segmentation import watershed
+
+    out = np.asarray(label_img).copy()
+    max_label = int(out.max())
+    next_label = max_label + 1
+    split_count = 0
+
+    # Absolute floor only — just enough to reject a stray noise-sized
+    # sliver. The real size check below is relative to what THIS cluster's
+    # own peak count implies, not a fixed nucleus-size assumption, since
+    # ``expected_nucleus_vox`` (derived from Cell 3's ``nuclei_diameter``)
+    # is a rough population-level estimate that individual clusters —
+    # especially unusually large or dense ones — can legitimately deviate
+    # from.
+    absolute_min_piece_vox = 0.1 * expected_nucleus_vox
+    piece_roundness_floor = max(0.0, min_roundness * 0.8)
+
+    for label_id in range(1, max_label + 1):
+        mask = out == label_id
+        voxel_count = int(np.count_nonzero(mask))
+        if voxel_count < 1.5 * expected_nucleus_vox:
+            continue
+        if _label_roundness_xy(mask) >= min_roundness:
+            continue
+
+        local_intensity = np.where(mask, intensity_img, 0.0).astype(np.float32)
+        local_distance = ndi.distance_transform_edt(mask, sampling=spacing)
+        peak_coords_3d = detect_peaks_xy_intensity_aware(
+            local_distance,
+            local_intensity,
+            peak_min_distance_xy,
+            peak_threshold_fraction,
+            distance_weight=distance_weight,
+            intensity_weight=intensity_weight,
         )
-        perimeter = float(sum(cv2.arcLength(cnt, True) for cnt in contours))
-        roundness = 0.0 if perimeter <= 0.0 else float((4.0 * np.pi * area) / (perimeter ** 2))
+        if len(peak_coords_3d) < 2:
+            print(
+                f"  [nuclei-peak-split] cluster {voxel_count} vox "
+                f"(~{voxel_count / expected_nucleus_vox:.1f}x expected nucleus), "
+                f"roundness {_label_roundness_xy(mask):.2f}: only {len(peak_coords_3d)} "
+                f"intensity peak(s) found (need >=2) — trying rethreshold pass instead."
+            )
+            continue
 
-        if roundness < threshold:
-            out[mask] = 0
-            removed += 1
+        seeds = np.zeros(mask.shape, dtype=np.int32)
+        for i, coord in enumerate(peak_coords_3d, start=1):
+            seeds[coord] = i
 
-    return out, removed
+        elevation = _gradient_watershed_elevation(
+            intensity_img,
+            mask,
+            spacing=spacing,
+            smooth_sigma=smooth_sigma,
+            w_distance=distance_weight,
+            w_intensity=intensity_weight,
+            w_gradient=gradient_weight,
+        )
+        sub_labels = watershed(elevation, seeds, mask=mask)
+
+        # Piece size is judged against the average piece size THIS split
+        # implies (cluster volume / number of peaks) rather than the
+        # global expected_nucleus_vox — so a cluster of unusually large (or
+        # small) nuclei still validates correctly as long as its own peaks
+        # divide it reasonably evenly.
+        avg_piece_vox = voxel_count / len(peak_coords_3d)
+        local_min_piece_vox = max(min_piece_vox_factor * avg_piece_vox, absolute_min_piece_vox)
+        local_max_piece_vox = max_piece_vox_factor * avg_piece_vox
+
+        # Partial accept: each watershed piece is judged independently. A
+        # cluster with e.g. 8 peaks where 7 pieces look like real nuclei and
+        # 1 is still an oversized unresolved remainder should keep those 7,
+        # not be discarded wholesale for the one bad piece.
+        valid_pieces = []
+        rejected_vox = 0
+        for sub_id in range(1, int(sub_labels.max()) + 1):
+            piece_mask = sub_labels == sub_id
+            piece_vox = int(np.count_nonzero(piece_mask))
+            if piece_vox == 0:
+                continue
+            if (local_min_piece_vox <= piece_vox <= local_max_piece_vox
+                    and _label_roundness_xy(piece_mask) >= piece_roundness_floor):
+                valid_pieces.append(piece_mask)
+            else:
+                rejected_vox += piece_vox
+
+        if len(valid_pieces) < 2:
+            print(
+                f"  [nuclei-peak-split] cluster {voxel_count} vox "
+                f"(~{voxel_count / expected_nucleus_vox:.1f}x expected nucleus): "
+                f"found {len(peak_coords_3d)} peaks (avg {avg_piece_vox:.0f} vox/piece, "
+                f"allowed [{local_min_piece_vox:.0f}, {local_max_piece_vox:.0f}]), but only "
+                f"{len(valid_pieces)} piece(s) passed validation — trying rethreshold pass instead."
+            )
+            continue
+
+        # Peel off the valid pieces only; anything left over (rejected
+        # pieces, gaps) keeps the original label id so it's still available
+        # for the rethreshold pass or a later round of this same pass.
+        for piece_mask in valid_pieces:
+            out[piece_mask] = next_label
+            next_label += 1
+        split_count += 1
+        if rejected_vox > 0:
+            print(
+                f"  [nuclei-peak-split] cluster {voxel_count} vox: peeled off "
+                f"{len(valid_pieces)} valid nucleus/nuclei (of {len(peak_coords_3d)} peaks found); "
+                f"{rejected_vox} vox left merged under the original label for another pass."
+            )
+
+    return out, split_count
+
+
+def _split_nonround_clusters_by_rethreshold(
+    label_img,
+    intensity_img,
+    spacing,
+    min_roundness,
+    expected_nucleus_vox,
+    min_piece_vox_factor=0.35,
+    max_piece_vox_factor=1.7,
+    percentiles=(55, 65, 75, 85),
+    smooth_sigma=1.0,
+    distance_weight=1.0,
+    intensity_weight=1.0,
+    gradient_weight=1.0,
+):
+    """Re-split non-round, multi-nucleus-sized labels by raising the local
+    intensity threshold until the dim bridge between touching nuclei
+    disconnects, then growing each resulting core back out to the label's
+    original extent with a gradient-aware watershed.
+
+    Complements ``_split_nonround_clusters_by_intensity_peaks``: peak
+    detection needs a resolvable local maximum per nucleus, which fails on
+    heavily blurred/merged signal where the cores still differ in
+    brightness from the connecting bridge but don't form distinct peaks.
+    Raising the threshold only requires *some* brightness margin between
+    core and bridge, which is a much lower bar — the same idea as the
+    combined-threshold recipe in Cell 15, just applied locally to one
+    cluster instead of the whole channel.
+
+    For each qualifying label, intensity percentiles *within that label*
+    (not the whole image) are tried from least to most aggressive; each
+    percentile's hard core mask (after a 1-voxel erosion, to fully sever
+    thin single-voxel bridges) is used as watershed markers, flooded back
+    out to the label's full original extent, and every resulting piece is
+    judged independently against the roundness and size checks (same
+    partial-accept logic as ``_split_nonround_clusters_by_intensity_peaks``).
+    Whichever percentile yields the most valid pieces (>= 2 required) wins;
+    those pieces are peeled off as new labels and any rejected/leftover
+    voxels stay under the original label id for another round. If no
+    percentile ever reaches 2 valid pieces, the label is left untouched.
+
+    Parameters
+    ----------
+    label_img : ndarray (Z, Y, X), int
+    intensity_img : ndarray (Z, Y, X)
+    spacing : tuple of float (Z, Y, X)
+    min_roundness : float
+    expected_nucleus_vox : float
+        Volume (voxels) of one typical full-diameter nucleus.
+    min_piece_vox_factor, max_piece_vox_factor : float
+        Accepted single-nucleus size window, as a fraction of
+        ``expected_nucleus_vox`` (default 0.35-1.7x).
+    percentiles : sequence of float
+        Intensity percentiles (within the label) tried in order, least to
+        most aggressive, until one yields a valid split.
+    smooth_sigma, distance_weight, intensity_weight, gradient_weight : float
+        Passed through to ``_gradient_watershed_elevation`` for growing the
+        cores back out to the label's original extent.
+
+    Returns
+    -------
+    out : ndarray, same shape as label_img
+    split_count : int
+        Number of labels successfully split into >= 2 valid pieces.
+    """
+    from scipy import ndimage as ndi
+    from skimage.segmentation import watershed
+
+    out = np.asarray(label_img).copy()
+    max_label = int(out.max())
+    next_label = max_label + 1
+    split_count = 0
+
+    # Absolute floor only — the real per-piece size check is relative to
+    # what each percentile's own core count implies (see avg_piece_vox
+    # below), not a fixed nucleus-size assumption. See the matching note in
+    # ``_split_nonround_clusters_by_intensity_peaks``.
+    absolute_min_piece_vox = 0.1 * expected_nucleus_vox
+    piece_roundness_floor = max(0.0, min_roundness * 0.8)
+    min_core_vox = max(4, int(0.15 * expected_nucleus_vox))
+
+    for label_id in range(1, max_label + 1):
+        mask = out == label_id
+        voxel_count = int(np.count_nonzero(mask))
+        if voxel_count < 1.5 * expected_nucleus_vox:
+            continue
+        if _label_roundness_xy(mask) >= min_roundness:
+            continue
+
+        smoothed = ndi.gaussian_filter(intensity_img.astype(np.float32), sigma=max(float(smooth_sigma), 1e-3))
+        values = smoothed[mask]
+        if values.size == 0:
+            continue
+
+        # Try every percentile (rather than stopping at the first that
+        # clears the bar) and keep whichever gives the most valid pieces —
+        # partial accept, same reasoning as the peak-based pass: a cluster
+        # where most pieces look like real nuclei and a remainder doesn't
+        # should keep the good pieces rather than be discarded wholesale.
+        attempt_log = []
+        best_valid_pieces = []
+        best_rejected_vox = 0
+
+        for pct in percentiles:
+            cutoff = float(np.percentile(values, pct))
+            core_mask = mask & (smoothed >= cutoff)
+            core_mask = ndi.binary_erosion(core_mask, iterations=1)
+            core_labels, n_cores = ndi.label(core_mask)
+
+            sizes = np.bincount(core_labels.ravel(), minlength=n_cores + 1)
+            keep_ids = [i for i in range(1, n_cores + 1) if sizes[i] >= min_core_vox]
+            if len(keep_ids) < 2:
+                attempt_log.append(f"pct={pct}: only {len(keep_ids)} core(s) >= {min_core_vox} vox")
+                continue
+
+            seeds = np.zeros_like(core_labels)
+            for new_id, old_id in enumerate(keep_ids, start=1):
+                seeds[core_labels == old_id] = new_id
+
+            elevation = _gradient_watershed_elevation(
+                intensity_img,
+                mask,
+                spacing=spacing,
+                smooth_sigma=smooth_sigma,
+                w_distance=distance_weight,
+                w_intensity=intensity_weight,
+                w_gradient=gradient_weight,
+            )
+            sub_labels = watershed(elevation, seeds, mask=mask)
+
+            avg_piece_vox = voxel_count / len(keep_ids)
+            local_min_piece_vox = max(min_piece_vox_factor * avg_piece_vox, absolute_min_piece_vox)
+            local_max_piece_vox = max_piece_vox_factor * avg_piece_vox
+
+            valid_pieces = []
+            rejected_vox = 0
+            for sub_id in range(1, int(sub_labels.max()) + 1):
+                piece_mask = sub_labels == sub_id
+                piece_vox = int(np.count_nonzero(piece_mask))
+                if piece_vox == 0:
+                    continue
+                if (local_min_piece_vox <= piece_vox <= local_max_piece_vox
+                        and _label_roundness_xy(piece_mask) >= piece_roundness_floor):
+                    valid_pieces.append(piece_mask)
+                else:
+                    rejected_vox += piece_vox
+
+            attempt_log.append(
+                f"pct={pct}: {len(keep_ids)} core(s) (avg {avg_piece_vox:.0f} vox/piece) -> "
+                f"{len(valid_pieces)} valid piece(s), {rejected_vox} vox rejected"
+            )
+            if len(valid_pieces) > len(best_valid_pieces):
+                best_valid_pieces = valid_pieces
+                best_rejected_vox = rejected_vox
+
+        if len(best_valid_pieces) >= 2:
+            for piece_mask in best_valid_pieces:
+                out[piece_mask] = next_label
+                next_label += 1
+            split_count += 1
+            print(
+                f"  [nuclei-rethreshold-split] cluster {voxel_count} vox: peeled off "
+                f"{len(best_valid_pieces)} valid nucleus/nuclei; {best_rejected_vox} vox left "
+                f"merged under the original label for another pass."
+            )
+        else:
+            print(
+                f"  [nuclei-rethreshold-split] cluster {voxel_count} vox "
+                f"(~{voxel_count / expected_nucleus_vox:.1f}x expected nucleus), "
+                f"roundness {_label_roundness_xy(mask):.2f}: no valid split found, left merged. "
+                f"Attempts: " + "; ".join(attempt_log)
+            )
+
+    return out, split_count
+
 
 def segment_nuclei_watershed(
     binary_mask,
@@ -3931,77 +4483,182 @@ def segment_nuclei_watershed(
     nuclei_seed_min_fraction=0.03,
     nuclei_min_roundness=0.45,
     z_split_aggressive=False,
+    intensity_img=None,
+    intensity_img_raw=None,
+    split_by_intensity_gradient=True,
+    nuclei_gradient_smooth_sigma=1.0,
+    nuclei_distance_weight=1.0,
+    nuclei_intensity_weight=1.0,
+    nuclei_gradient_weight=1.0,
 ):
     """
     Segment nuclei using watershed with multi-scale erosion and EDT peak fallback.
-    
+
     Implements a robust watershed-based segmentation algorithm that:
     1. Handles Z-anisotropy by adjusting erosion depths
     2. Uses multi-scale erosion to create multiple seed points for dumbbell/multi-lobed nuclei
-    3. Falls back to EDT peak detection when erosion fails to split nuclei
+    3. Falls back to EDT-peak detection, blended with intensity when available
+       (see ``split_by_intensity_gradient``), when erosion fails to split nuclei
     4. Detects boundary-touching components to apply gentler erosion
     5. Preserves isolated single-nuclei labels during cleanup
-    
+
     Parameters
     ----------
     binary_mask : ndarray, shape (Z, Y, X), dtype bool
         Binary mask of foreground (nuclear) regions.
-    
+
     r_zX, r_zY, r_zZ : float
         Voxel physical spacing in micrometers along X, Y, Z axes.
-    
+
     nuclei_diameter : float
         Approximate nucleus diameter in micrometers (used for erosion scaling).
-    
+
     nuclei_z_anisotropy_factor : float, optional
         Scaling factor for Z-axis weighting (default=1.0).
         Values > 1 reduce Z erosion; < 1 increase it.
-    
+
     nuclei_bridge_shrink_factor : float, optional
         Fraction of nucleus diameter to erode for bridge-breaking (default=0.28).
         Range [0.1, 0.5]; higher values = more aggressive erosion.
-    
+
     nuclei_split_diameter_min_factor : float, optional
         Minimum erosion scale as fraction of diameter (default=0.5).
-    
+
     nuclei_split_diameter_max_factor : float, optional
         Maximum erosion scale as fraction of diameter (default=1.5).
-    
+
     nuclei_split_diameter_scales : int, optional
         Number of erosion scales to evaluate (default=3).
-    
+
     nuclei_seed_min_fraction : float, optional
         Minimum seed size as fraction of expected nucleus volume (default=0.03).
 
     nuclei_min_roundness : float, optional
         Minimum circularity on the largest XY slice for a nucleus to be kept (default=0.45).
         Uses circularity = 4*pi*area/perimeter^2. Typical range is [0.0, 1.0].
-    
+        Two (or more) touching round nuclei that fail to be split apart form
+        one irregular blob; if that blob's volume is still nucleus-sized
+        (< ~1.5x one expected nucleus) it gets removed entirely by this
+        filter. The ``split_by_intensity_gradient`` seeding/watershed below
+        exists to catch these cases upstream, before roundness is even
+        checked. Larger unsplit clusters are never deleted by this filter at
+        all — see the note under ``split_by_intensity_gradient``.
+
+    intensity_img : ndarray, shape (Z, Y, X), optional
+        Filtered/smoothed intensity image (same channel the mask was
+        thresholded from — typically 'Filtered image'), used when
+        ``split_by_intensity_gradient`` is True to find nucleus centers by
+        their actual brightness peaks (not just mask shape) and to bias the
+        main watershed boundary toward where the signal itself dips between
+        two touching nuclei. If None, behaves exactly like the original
+        shape/distance-only algorithm.
+
+    intensity_img_raw : ndarray, shape (Z, Y, X), optional
+        Same channel as ``intensity_img`` but from an earlier pipeline
+        stage that hasn't been through the per-channel contrast/gamma clip
+        (e.g. 'Denoised image', pre-Cell-12) — used instead of
+        ``intensity_img`` for the two post-watershed cluster re-split
+        strategies below. Dense, unusually bright clusters are exactly the
+        regions most likely to have been clipped to the display ceiling by
+        contrast limits chosen for normal-brightness nuclei, which ties
+        many voxels to the identical max value and makes any percentile- or
+        peak-based re-split blind to real internal structure that's still
+        present in the less-processed data. Falls back to ``intensity_img``
+        if not given.
+
+    split_by_intensity_gradient : bool, optional
+        If True (default) and ``intensity_img`` is given, intensity is used
+        at three points instead of shape/distance alone: (1) when erosion
+        leaves a connected component with only one seed, also search for
+        seeds using a combined distance+intensity peak map, so two
+        individually round, touching nuclei with only a shallow geometric
+        neck but a real intensity dip between them still get two seeds; (2)
+        run the watershed on a distance+intensity+gradient elevation
+        surface (see ``_gradient_watershed_elevation``) instead of pure
+        ``-distance``, so the split boundary snaps to where the marker
+        signal actually fades between nuclei; (3) after that watershed and
+        cleanup, any label that's still both non-round and clearly too big
+        to be one nucleus (>= ~1.5x the expected single-nucleus volume) is
+        run back through two dedicated local re-split attempts, in order:
+        ``_split_nonround_clusters_by_intensity_peaks`` (a more permissive
+        peak search than step 1), then, for whatever that still can't
+        resolve, ``_split_nonround_clusters_by_rethreshold`` — which raises
+        the *local* intensity threshold within just that label until the
+        dim bridge connecting the nuclei disconnects into separate bright
+        cores, then grows each core back out to the label's original
+        extent. The re-threshold strategy only needs a brightness margin
+        between core and bridge, not a resolvable peak, so it can succeed
+        on heavily blurred/merged signal where peak detection can't. Both
+        strategies use partial accept: each resulting piece is judged
+        independently, so a cluster of e.g. 8 sub-nuclei where 7 pieces
+        come out valid and 1 doesn't still keeps those 7, instead of the
+        whole split being discarded for one bad piece — the failing
+        remainder simply keeps the original label id. This pair of
+        attempts is repeated for up to 3 rounds so a remainder that's still
+        too big to be one nucleus gets picked up again, peeling off more
+        nuclei each round until nothing further can be resolved. As a
+        last-resort safety net, ``nuclei_min_roundness`` never deletes a
+        component that's still >= ~1.5x one expected nucleus after all
+        rounds — whatever's left merged is kept as one label covering
+        several nuclei rather than erased outright, since losing it loses
+        more real signal than keeping it merged does.
+
+    nuclei_gradient_smooth_sigma : float, optional
+        Smoothing (voxels) applied to ``intensity_img`` before measuring
+        intensity/gradient for seeding and the final elevation surface
+        (default=1.0). Only used when ``split_by_intensity_gradient`` is True.
+
+    nuclei_distance_weight, nuclei_intensity_weight, nuclei_gradient_weight : float, optional
+        Relative weights of the three elevation/seeding terms — geometric
+        distance, absolute dimness, and steepness of intensity drop — each
+        default 1.0. Only used when ``split_by_intensity_gradient`` is True.
+        Raise ``nuclei_gradient_weight`` to make splitting more sensitive to
+        a fast intensity drop between two closely touching, bright nuclei.
+
     Returns
     -------
     im_out : ndarray, shape (Z, Y, X), dtype int32
         Labeled nucleus segmentation (label value per voxel). Label 0 = background.
-    
+
     debug_info : dict
         Debugging information with keys:
         - 'z_anisotropy': Computed Z anisotropy factor
         - 'z_split_weight': Effective Z-weighting applied to erosion
         - 'scales_with_seeds': Number of erosion scales that produced markers
-        - 'added_peak_seed_count': Number of seeds added via EDT peak detection
+        - 'added_peak_seed_count': Number of seeds added via EDT/intensity peak detection
         - 'added_seed_count': Number of fallback seeds added
         - 'erosion_triplets': List of (z, y, x) erosion radii attempted
         - 'boundary_components': Number of boundary-touching components
         - 'restored_isolated_count': Voxels restored after cleanup
         - 'dmin', 'dmax', 'n_scales': Diameter scaling parameters
         - 'min_seed_vox': Minimum seed size threshold in voxels
-    
+        - 'expected_nucleus_vox': Volume (voxels) of one typical full-diameter nucleus
+        - 'multi_nucleus_vox_thresh': Volume (voxels) above which a component is
+          treated as an unsplit multi-nucleus cluster (triggers the two re-split
+          strategies below and is protected from roundness deletion if both fail)
+        - 'peak_cluster_splits': Number of non-round, multi-nucleus-sized labels
+          re-split by ``_split_nonround_clusters_by_intensity_peaks``
+        - 'rethreshold_cluster_splits': Number of non-round, multi-nucleus-sized
+          labels re-split by ``_split_nonround_clusters_by_rethreshold`` (tried
+          on whatever the peak-based pass above couldn't resolve)
+        - 'nonround_cluster_splits': Sum of the two counts above
+        - 'removed_by_roundness': Number of (small) non-round labels dropped entirely
+        - 'protected_nonround_clusters': Number of non-round, multi-nucleus-sized
+          labels that BOTH re-split strategies failed to separate, so were left
+          merged instead of deleted. If this is 0 and 'nonround_cluster_splits'
+          is also 0, there simply were no non-round multi-nucleus-sized labels
+          left at this point — nothing needed fixing.
+        - 'used_intensity_gradient': Whether intensity-aware seeding/splitting ran
+
     Notes
     -----
     - Modifies parameter r_zZ by computing effective_r_zZ for Z-anisotropy handling
-    - Uses peak_local_max from skimage.feature for EDT-based fallback
-    - Applies watershed transform with negative distance map to favor markers
+    - Uses peak_local_max from skimage.feature for EDT/intensity-based fallback seeding
+    - Applies watershed transform with negative distance map (or, when
+      ``split_by_intensity_gradient`` is active, a distance+intensity+gradient
+      elevation surface) to favor markers
     - Removes small island labels but preserves those touching image boundaries
-    
+
     Example
     -------
     >>> binary = im_threshold > 0  # Binary foreground mask
@@ -4010,12 +4667,20 @@ def segment_nuclei_watershed(
     ...     r_zX=0.1, r_zY=0.1, r_zZ=0.2,
     ...     nuclei_diameter=30.0,
     ...     nuclei_bridge_shrink_factor=0.28,
+    ...     intensity_img=filtered_nuclei_channel,
     ... )
     >>> print(f"Nuclei found: {int(nuclei.max())}, Peak-based seeds: {debug['added_peak_seed_count']}")
     """
     from skimage import morphology
     from scipy import ndimage as ndi
     from skimage.segmentation import watershed, relabel_sequential
+
+    use_intensity = split_by_intensity_gradient and intensity_img is not None
+    smoothed_intensity = None
+    if use_intensity:
+        smoothed_intensity = ndi.gaussian_filter(
+            intensity_img.astype(np.float32), sigma=max(float(nuclei_gradient_smooth_sigma), 1e-3)
+        )
 
     # Derive Z weighting from the actual voxel anisotropy so depth
     # separation follows the measured Z versus XY resolution.
@@ -4056,6 +4721,16 @@ def segment_nuclei_watershed(
     min_expected_nucleus_vox = max(1, int(min_nucleus_volume_um3 / voxel_um3))
     min_seed_vox = max(8, int(min_expected_nucleus_vox * nuclei_seed_min_fraction))
     min_seed_vox_boundary = max(4, int(min_seed_vox * 0.6))
+
+    # Volume of one typical (full-diameter) nucleus, in voxels. Connected
+    # components well above this are almost certainly multiple nuclei
+    # merged together, not one oddly-shaped nucleus — used below both to
+    # retry seeding more aggressively on stuck clusters and to stop the
+    # roundness cleanup filter from deleting them outright if splitting
+    # still fails.
+    full_nucleus_vol_um3 = (4.0 * np.pi * ((nuclei_diameter / 2.0) ** 3)) / 3.0
+    expected_nucleus_vox = max(1.0, full_nucleus_vol_um3 / voxel_um3)
+    multi_nucleus_vox_thresh = 1.5 * expected_nucleus_vox
 
     markers = np.zeros_like(binary_mask, dtype=np.int32)
     next_marker = 0
@@ -4170,15 +4845,31 @@ def segment_nuclei_watershed(
         cc_marker_ids = cc_marker_ids[cc_marker_ids > 0]
         local_distance = np.where(cc_mask, distance, 0.0)
 
-        # Recovery for dumbbell-like nuclei: if erosion still leaves only
-        # one seed, try to split the component using multiple EDT peaks.
-        # Uses 2D XY projection to prevent over-splitting across Z.
+        # Recovery for dumbbell-like nuclei, or two touching-but-individually-
+        # round nuclei with too shallow a geometric neck for erosion to
+        # split: if erosion still leaves only one seed, try to split the
+        # component using multiple peaks. When intensity is available, the
+        # peaks are found in a combined distance+intensity map so a real
+        # brightness dip between two nuclei (not just a mask constriction)
+        # is enough to place two seeds; otherwise falls back to EDT-only
+        # peaks. Uses 2D XY projection to prevent over-splitting across Z.
         if cc_marker_ids.size <= 1 and np.any(cc_mask):
-            peak_coords_3d = detect_peaks_xy_with_best_z(
-                local_distance,
-                peak_min_distance_xy,
-                peak_threshold_fraction,
-            )
+            if use_intensity:
+                local_intensity = np.where(cc_mask, smoothed_intensity, 0.0)
+                peak_coords_3d = detect_peaks_xy_intensity_aware(
+                    local_distance,
+                    local_intensity,
+                    peak_min_distance_xy,
+                    peak_threshold_fraction,
+                    distance_weight=nuclei_distance_weight,
+                    intensity_weight=nuclei_intensity_weight,
+                )
+            else:
+                peak_coords_3d = detect_peaks_xy_with_best_z(
+                    local_distance,
+                    peak_min_distance_xy,
+                    peak_threshold_fraction,
+                )
 
             if len(peak_coords_3d) >= 2:
                 if cc_marker_ids.size == 1:
@@ -4198,7 +4889,19 @@ def segment_nuclei_watershed(
             markers[seed_pos] = next_marker
             added_seed_count += 1
 
-    im_out = watershed(-distance, markers, mask=binary_mask)
+    if use_intensity:
+        elevation = _gradient_watershed_elevation(
+            intensity_img,
+            binary_mask,
+            spacing=(effective_r_zZ, r_zY, r_zX),
+            smooth_sigma=nuclei_gradient_smooth_sigma,
+            w_distance=nuclei_distance_weight,
+            w_intensity=nuclei_intensity_weight,
+            w_gradient=nuclei_gradient_weight,
+        )
+        im_out = watershed(elevation, markers, mask=binary_mask)
+    else:
+        im_out = watershed(-distance, markers, mask=binary_mask)
 
     preserve_labels = set()
     for cc_id in range(1, num_cc + 1):
@@ -4210,7 +4913,6 @@ def segment_nuclei_watershed(
             for val in cc_vals:
                 preserve_labels.add(int(val))
 
-    full_nucleus_vol_um3 = (4.0 * np.pi * ((nuclei_diameter / 2.0) ** 3)) / 3.0
     min_cell_vox = max(8, int(0.3 * full_nucleus_vol_um3 / voxel_um3))
 
     im_out_before_cleanup = im_out.copy()
@@ -4226,9 +4928,68 @@ def segment_nuclei_watershed(
         restored_isolated_count = int(np.count_nonzero(restore_mask))
         im_out[restore_mask] = im_out_before_cleanup[restore_mask]
 
-    im_out, removed_by_roundness = _filter_labels_by_roundness_xy(
+    # Before falling back to "just don't delete it", actively try to
+    # separate any label that's both non-round and large enough to
+    # plausibly be several merged nuclei. Two strategies are tried in turn:
+    # (1) find distinct DAPI intensity peaks per nucleus; (2) if that fails
+    # (common on heavily blurred/merged signal with no resolvable peak),
+    # raise the local intensity threshold until the dim bridge connecting
+    # the nuclei disconnects into separate bright cores, then grow each
+    # core back out to the label's original extent. Both use partial
+    # accept — valid pieces are peeled off immediately and any oversized
+    # remainder keeps its original label id — so this is repeated for a
+    # few rounds: a remainder that's still too big to be one nucleus gets
+    # picked up again next round, peeling off more nuclei each time until
+    # nothing further can be resolved.
+    peak_cluster_splits = 0
+    rethreshold_cluster_splits = 0
+    if use_intensity:
+        # Prefer the pre-contrast-clip source for these two local re-split
+        # strategies: a dense, unusually bright cluster is exactly the kind
+        # of region likely to have been clipped to the display ceiling by
+        # Cell 12's contrast limits, which ties many voxels to the same max
+        # value and hides real internal structure that's still present
+        # before that clip was applied.
+        split_intensity_img = intensity_img_raw if intensity_img_raw is not None else intensity_img
+        for _round in range(3):
+            im_out, round_peak_splits = _split_nonround_clusters_by_intensity_peaks(
+                im_out,
+                split_intensity_img,
+                spacing=(effective_r_zZ, r_zY, r_zX),
+                min_roundness=nuclei_min_roundness,
+                expected_nucleus_vox=expected_nucleus_vox,
+                peak_min_distance_xy=max(1, peak_min_distance_xy // 2),
+                peak_threshold_fraction=peak_threshold_fraction * 0.55,
+                distance_weight=nuclei_distance_weight,
+                intensity_weight=nuclei_intensity_weight,
+                gradient_weight=nuclei_gradient_weight,
+                smooth_sigma=nuclei_gradient_smooth_sigma,
+            )
+            im_out, round_rethreshold_splits = _split_nonround_clusters_by_rethreshold(
+                im_out,
+                split_intensity_img,
+                spacing=(effective_r_zZ, r_zY, r_zX),
+                min_roundness=nuclei_min_roundness,
+                expected_nucleus_vox=expected_nucleus_vox,
+                distance_weight=nuclei_distance_weight,
+                intensity_weight=nuclei_intensity_weight,
+                gradient_weight=nuclei_gradient_weight,
+                smooth_sigma=nuclei_gradient_smooth_sigma,
+            )
+            peak_cluster_splits += round_peak_splits
+            rethreshold_cluster_splits += round_rethreshold_splits
+            if round_peak_splits == 0 and round_rethreshold_splits == 0:
+                break
+    nonround_cluster_splits = peak_cluster_splits + rethreshold_cluster_splits
+
+    # Any cluster that still couldn't be split (e.g. no distinct peaks and
+    # no clean brightness margin even after both attempts above) is
+    # protected here rather than deleted: losing the whole cluster loses
+    # far more real signal than leaving it merged as one label.
+    im_out, removed_by_roundness, protected_nonround_clusters = _filter_labels_by_roundness_xy(
         im_out,
         nuclei_min_roundness,
+        protect_min_vox=multi_nucleus_vox_thresh,
     )
 
     im_out, z_consistency_splits = _split_labels_by_z_consistency(
@@ -4245,6 +5006,9 @@ def segment_nuclei_watershed(
         'z_split_weight': z_split_weight,
         'scales_with_seeds': scales_with_seeds,
         'added_peak_seed_count': added_peak_seed_count,
+        'peak_cluster_splits': peak_cluster_splits,
+        'rethreshold_cluster_splits': rethreshold_cluster_splits,
+        'nonround_cluster_splits': nonround_cluster_splits,
         'added_seed_count': added_seed_count,
         'erosion_triplets': erosion_triplets,
         'boundary_components': boundary_components,
@@ -4254,10 +5018,14 @@ def segment_nuclei_watershed(
         'n_scales': n_scales,
         'min_seed_vox': min_seed_vox,
         'min_cell_vox': min_cell_vox,
+        'expected_nucleus_vox': expected_nucleus_vox,
+        'multi_nucleus_vox_thresh': multi_nucleus_vox_thresh,
         'nuclei_min_roundness': float(max(0.0, nuclei_min_roundness)),
         'removed_by_roundness': removed_by_roundness,
+        'protected_nonround_clusters': protected_nonround_clusters,
         'z_consistency_splits': z_consistency_splits,
         'z_consistency_merges': z_consistency_merges,
+        'used_intensity_gradient': use_intensity,
     }
 
     return im_out, debug_info
@@ -4347,17 +5115,26 @@ def run_threshold(im_final_stack, stain_complete_df,
                   nuclei_diameter, cell_diameter,
                   r_zX, r_zY, r_zZ,
                   threshold_method='otsu',
+                  global_threshold_weight=0.15,
+                  sauvola_weight=0.60,
                   progress=None):
     """Apply combined thresholding and store the result in im_final_stack.
 
     Parameters
     ----------
     threshold_method : str
-        Global thresholding algorithm used as one component (15%) of the
+        Global thresholding algorithm used as one component of the
         combined threshold (the rest is Sauvola local + statistical background).
         - ``'otsu'``   : maximises inter-class variance (default; bimodal data).
         - ``'median'`` : threshold at median non-zero intensity (sparse signal).
         - ``'huang'``  : fuzzy entropy method (dim or diffuse signal).
+    global_threshold_weight : float
+        Weight (0-1) of the global threshold in the combined threshold
+        (default 0.15).
+    sauvola_weight : float
+        Weight (0-1) of the Sauvola local threshold in the combined threshold
+        (default 0.60). The remainder (``1 - global_threshold_weight -
+        sauvola_weight``) is given to the statistical background threshold.
     """
     im_final_stack["Threshold image"] = apply_threshold_per_channel(
         im_final_stack["Equalized image"],
@@ -4366,6 +5143,8 @@ def run_threshold(im_final_stack, stain_complete_df,
         cell_diameter=cell_diameter,
         r_zxyz=(r_zX, r_zY, r_zZ),
         threshold_method=threshold_method,
+        global_threshold_weight=global_threshold_weight,
+        sauvola_weight=sauvola_weight,
         progress=progress,
     )
     return im_final_stack
@@ -4773,12 +5552,23 @@ def _compute_channel_threshold_stats(
     threshold_method,
     marker_name="",
     verbose=True,
+    global_weight=0.15,
+    sauvola_weight=0.60,
 ):
     """Compute the global, statistical, and combined threshold values for one channel.
 
     Shared by `apply_threshold_per_channel` (Cell 15, which also builds the
     binary mask) and `run_equalize`'s threshold preview (Cell 14, which only
     needs the scalar values to draw histogram markers).
+
+    Parameters
+    ----------
+    global_weight : float
+        Weight of the global threshold in the combined threshold (default 0.15).
+    sauvola_weight : float
+        Weight of the Sauvola local threshold in the combined threshold
+        (default 0.60). The remaining weight (``1 - global_weight -
+        sauvola_weight``) is assigned to the statistical background threshold.
 
     Returns
     -------
@@ -4851,10 +5641,11 @@ def _compute_channel_threshold_stats(
     sauvola_clipped = np.minimum(sauvola_value, max_sauvola)
 
     # Combined threshold map
+    statistical_weight = 1.0 - global_weight - sauvola_weight
     final_thr = (
-        0.60 * sauvola_clipped +
-        0.25 * statistical_thr +
-        0.15 * global_thr_value
+        sauvola_weight * sauvola_clipped +
+        statistical_weight * statistical_thr +
+        global_weight * global_thr_value
     )
 
     # Oversaturation correction: when many voxels are near the max
@@ -4887,6 +5678,8 @@ def apply_threshold_per_channel(
     cell_diameter,
     r_zxyz,
     threshold_method='otsu',
+    global_threshold_weight=0.15,
+    sauvola_weight=0.60,
     progress=None,
 ):
     """
@@ -4909,6 +5702,17 @@ def apply_threshold_per_channel(
         Global threshold algorithm used as one component of the combined threshold.
         One of 'otsu' (default), 'median', or 'huang'. The Sauvola local threshold
         and statistical background component are always applied regardless of this choice.
+    global_threshold_weight : float, optional
+        Weight (0-1) given to the global threshold in the combined threshold
+        (default 0.15).
+    sauvola_weight : float, optional
+        Weight (0-1) given to the Sauvola local threshold in the combined
+        threshold (default 0.60). The remaining weight
+        (``1 - global_threshold_weight - sauvola_weight``) goes to the
+        statistical background threshold. Raising ``sauvola_weight`` (more
+        local adaptivity) helps recover nuclei buried inside bright
+        aggregates, where the global/statistical components tend to push the
+        threshold too high.
     progress : callable, optional
         Progress wrapper (e.g. tqdm).
 
@@ -4921,6 +5725,13 @@ def apply_threshold_per_channel(
     if threshold_method not in _valid_methods:
         raise ValueError(f"threshold_method must be one of {_valid_methods}, got '{threshold_method}'")
 
+    if global_threshold_weight < 0 or sauvola_weight < 0 or global_threshold_weight + sauvola_weight > 1.0:
+        raise ValueError(
+            "global_threshold_weight and sauvola_weight must each be >= 0 and "
+            f"sum to <= 1.0, got global_threshold_weight={global_threshold_weight}, "
+            f"sauvola_weight={sauvola_weight}"
+        )
+
     if progress is None:
         def progress(x, **kw): return x
 
@@ -4929,6 +5740,7 @@ def apply_threshold_per_channel(
     nuclei_size = int(nuclei_diameter / (np.mean([r_zX, r_zY])))
     cell_size = int(cell_diameter / (np.mean([r_zX, r_zY])))
 
+    statistical_weight = 1.0 - global_threshold_weight - sauvola_weight
     global_thresholds = []
     combined_thresholds = []
 
@@ -4940,15 +5752,17 @@ def apply_threshold_per_channel(
         global_thr_value, final_thr, statistical_thr, gain_ass, bg_mean = _compute_channel_threshold_stats(
             arr, is_nuclei, nuclei_size, cell_size, threshold_method,
             marker_name=marker_name, verbose=True,
+            global_weight=global_threshold_weight, sauvola_weight=sauvola_weight,
         )
         combined_thr_value = float(np.mean(final_thr))
         global_thresholds.append(global_thr_value)
         combined_thresholds.append(combined_thr_value)
 
         print(
-            f"  [{marker_name}] threshold chosen: global ({threshold_method}) = "
-            f"{global_thr_value:.1f}, combined (mean of Sauvola + statistical + "
-            f"global) = {combined_thr_value:.1f}"
+            f"  [{marker_name}] threshold chosen: global ({threshold_method}, "
+            f"w={global_threshold_weight:.2f}) = {global_thr_value:.1f}, combined "
+            f"(Sauvola w={sauvola_weight:.2f} + statistical w={statistical_weight:.2f} "
+            f"+ global) = {combined_thr_value:.1f}"
         )
 
         # Gain-based primary mask and rescue
@@ -5084,10 +5898,24 @@ def segment_nuclei(
     """
     Segment nuclei from the image using watershed, StarDist, or Cellpose.
 
+    The watershed path passes the 'Filtered image' NUCLEI-channel intensity
+    (or the max-projection across channels in LD mode) into
+    `segment_nuclei_watershed` as `intensity_img`, so touching-but-round
+    nuclei that a pure shape/distance watershed would leave as one
+    non-round (and therefore roundness-filtered) blob get split using the
+    actual brightness dip/gradient between them — see
+    `split_by_intensity_gradient` in `get_nuclei_split_config()`. It also
+    passes the same channel from 'Denoised image' (pre-contrast/gamma-clip)
+    as `intensity_img_raw`, used only by the post-watershed cluster
+    re-split strategies — dense/bright clusters are the regions most likely
+    to have been clipped to the display ceiling by Cell 12, which erases
+    exactly the internal brightness variation those strategies need.
+
     Parameters
     ----------
     im_final_stack : dict
-        Must contain 'Threshold image' and 'Filtered image' arrays (Z, Y, X, C).
+        Must contain 'Threshold image', 'Filtered image', and 'Denoised
+        image' arrays (Z, Y, X, C).
     stain_df, stain_complete_df : DataFrame
         Staining metadata.
     nuclei_split_config : dict
@@ -5138,16 +5966,25 @@ def segment_nuclei(
             im_thresh = im_thresh | (im_in[:, :, :, c] > 0)
 
         split_cfg = dict(nuclei_split_config)
-        im_out, _ = segment_nuclei_watershed(
+        intensity_img = np.max(im_final_stack['Filtered image'], axis=-1)
+        intensity_img_raw = np.max(im_final_stack['Denoised image'], axis=-1)
+        im_out, debug_info = segment_nuclei_watershed(
             binary_mask=im_thresh,
             r_zX=r_zX,
             r_zY=r_zY,
             r_zZ=r_zZ,
             nuclei_diameter=nuclei_diameter,
+            intensity_img=intensity_img,
+            intensity_img_raw=intensity_img_raw,
             **split_cfg,
         )
 
-        print(f"Nuclei found: {int(im_out.max())}")
+        print(
+            f"Nuclei found: {int(im_out.max())} "
+            f"(removed by roundness filter: {debug_info['removed_by_roundness']}, "
+            f"non-round clusters re-split: {debug_info['nonround_cluster_splits']}, "
+            f"still-merged non-round clusters: {debug_info['protected_nonround_clusters']})"
+        )
 
         im_segmentation_stack['Nuclei'] = im_out
         im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
@@ -5185,16 +6022,25 @@ def segment_nuclei(
 
         else:
             binary_mask = im_in[:, :, :, c].astype(bool)
-            im_out, _ = segment_nuclei_watershed(
+            im_filt = im_final_stack['Filtered image']
+            im_denoised = im_final_stack['Denoised image']
+            im_out, debug_info = segment_nuclei_watershed(
                 binary_mask=binary_mask,
                 r_zX=r_zX,
                 r_zY=r_zY,
                 r_zZ=r_zZ,
                 nuclei_diameter=nuclei_diameter,
+                intensity_img=im_filt[:, :, :, c],
+                intensity_img_raw=im_denoised[:, :, :, c],
                 **split_cfg,
             )
 
-            print(f"Nuclei found: {int(im_out.max())}")
+            print(
+                f"Nuclei found: {int(im_out.max())} "
+                f"(removed by roundness filter: {debug_info['removed_by_roundness']}, "
+                f"non-round clusters re-split: {debug_info['nonround_cluster_splits']}, "
+                f"still-merged non-round clusters: {debug_info['protected_nonround_clusters']})"
+            )
 
         im_segmentation_stack['Nuclei'] = im_out
 
@@ -5693,7 +6539,9 @@ def view_processing_results(
     Open two napari viewers showing processing pipeline layers and segmentation results.
 
     Viewer 0 shows per-channel images at each pipeline stage (original, zoomed,
-    denoised, corrected, filtered, equalized).
+    denoised, corrected, filtered, equalized), plus a per-channel "Thresh
+    islands" labels layer (connected components of the threshold mask) so
+    nuclei/marker regions missed or fragmented by thresholding are visible.
     Viewer 1 (only when NUCLEI or CYTOPLASM is present) shows label overlays for
     nuclei, cytoplasm, PCM, and marker channels.
 
@@ -5751,6 +6599,18 @@ def view_processing_results(
                 name=f'{stage_prefix} {idx} ({marker})', colormap=color,
                 blending='additive', scale=scale,
             )
+
+    # Connected-component "islands" of the per-channel threshold mask, so
+    # under-segmented/missed nuclei (broken-up or absent islands) are easy to
+    # spot against the intensity layers above.
+    for c in progress(range(im_thr.shape[3]), desc='Step 22A2 - Add Threshold Islands To Viewer 0'):
+        idx = stain_complete_df.index[c]
+        marker = stain_complete_df.loc[idx, 'Marker']
+        islands, _ = ndi.label(im_thr[:, :, :, c] > 0)
+        viewer_0.add_labels(
+            islands.astype(np.int32),
+            name=f'Thresh islands {idx} ({marker})', blending='additive', scale=scale_zoom,
+        )
     viewer_0.scale_bar.visible = True
     for layer in viewer_0.layers:
         layer.units = ('um', 'um', 'um')
@@ -5941,6 +6801,8 @@ def build_vtk_volumes(
     import pyvista as pv
     import meshlib.mrmeshpy as mr
     import meshlib.mrmeshnumpy as mrn
+    import tempfile
+    import shutil
     from pathlib import Path as _Path
     from IPython.display import clear_output
 
@@ -5953,6 +6815,16 @@ def build_vtk_volumes(
         float(r_Y / zoom_factors[1]),
         float(r_X / zoom_factors[2]),
     )
+
+    # Per-nucleus meshes are written to disk (meshlib requires a file path)
+    # and immediately re-read; they are scratch files, not pipeline output,
+    # so they live in a temp dir that gets removed once the loop is done
+    # instead of littering the project directory as part_*.stl.
+    _stl_tmpdir = tempfile.mkdtemp(prefix="napari_seg_stl_")
+    _nuclei_stl_path = str(_Path(_stl_tmpdir) / "part_nuclei_mesh.stl")
+    _cyto_stl_path = str(_Path(_stl_tmpdir) / "part_cyto_mesh.stl")
+    _pcm_stl_path = str(_Path(_stl_tmpdir) / "part_PCM_mesh.stl")
+
     nuc_max = int(np.max(im_segmentation_stack['Nuclei']))
     cyto_max = int(np.max(im_segmentation_stack['Cytoplasm']))
     pcm_max = int(np.max(im_segmentation_stack['PCM']))
@@ -5984,9 +6856,9 @@ def build_vtk_volumes(
         _g2m_settings.voxelSize = mesh_voxel_size
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
-        mr.saveMesh(mesh_stl, "part_nuclei_mesh.stl")
+        mr.saveMesh(mesh_stl, _nuclei_stl_path)
 
-        mesh_nuclei = pv.read("part_nuclei_mesh.stl")
+        mesh_nuclei = pv.read(_nuclei_stl_path)
         if mesh_nuclei.volume > 0.0:
             mesh_nuclei.decimate(target_reduction=0.8, inplace=True)
             # mesh_nuclei geometry is already scaled by mesh_voxel_size, so
@@ -6009,8 +6881,8 @@ def build_vtk_volumes(
         _g2m_settings.voxelSize = mesh_voxel_size
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
-        mr.saveMesh(mesh_stl, "part_cyto_mesh.stl")
-        mesh_cyto = pv.read("part_cyto_mesh.stl")
+        mr.saveMesh(mesh_stl, _cyto_stl_path)
+        mesh_cyto = pv.read(_cyto_stl_path)
 
         # --- PCM ---
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['PCM'] == j))
@@ -6019,8 +6891,8 @@ def build_vtk_volumes(
         _g2m_settings.voxelSize = mesh_voxel_size
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
-        mr.saveMesh(mesh_stl, "part_PCM_mesh.stl")
-        mesh_PCM = pv.read("part_PCM_mesh.stl")
+        mr.saveMesh(mesh_stl, _pcm_stl_path)
+        mesh_PCM = pv.read(_pcm_stl_path)
 
         if mesh_cyto.volume > 0.0:
             mesh_cyto.decimate(target_reduction=0.8, inplace=True)
@@ -6085,6 +6957,8 @@ def build_vtk_volumes(
     _to_surface(blocks_nuclei).save(stem + '_NUCLEI_labelled.vtk')
     _to_surface(blocks_cyto).save(stem + '_CYTOPLASM_labelled.vtk')
     _to_surface(blocks_PCM).save(stem + '_PCM_labelled.vtk')
+
+    shutil.rmtree(_stl_tmpdir, ignore_errors=True)
 
 
 def export_marker_stl(
