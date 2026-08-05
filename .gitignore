@@ -8,6 +8,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.docx
 
 # Jupyter temporary files
 .ipynb_checkpoints/
@@ -28,3 +29,6 @@ Thumbs.db
 
 #old versions
 old_v/
+
+# Temporary per-nucleus mesh files (should no longer be created, kept as a safety net)
+part_*.stl
