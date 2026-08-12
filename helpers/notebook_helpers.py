@@ -1,4 +1,5 @@
 from collections import defaultdict
+import gc
 import os
 
 import cv2
@@ -280,21 +281,27 @@ def open_image_file(input_file: str):
             raise
         print(
             f"[open_image_file] AICSImage raised '{exc}'.\n"
-            "Falling back to nd2reader for legacy ND2 file — note: the full "
-            "image will be loaded into memory even when big_image=True."
+            "Falling back to nd2reader for legacy ND2 file — note: this "
+            "fallback always loads the full image into memory, regardless "
+            "of the automatic lazy-loading decision made for other formats."
         )
         return _ND2ReaderFallback(input_file)
 
 
-def load_image_with_roi(input_file: str, roi_coords, big_image=True):
-    """Open a microscopy file and load the requested ROI in ZYXC order."""
+def load_image_with_roi(input_file: str, roi_coords):
+    """Open a microscopy file and load the requested ROI in ZYXC order.
+
+    Automatically loads lazily (dask, ROI-only) or eagerly depending on the
+    file's full size — see ``extract_roi_from_metadata``.
+    """
     meta = open_image_file(input_file)
-    image, _ = extract_roi_from_metadata(meta, roi_coords, big_image=big_image)
+    image, _, used_lazy_loading = extract_roi_from_metadata(meta, roi_coords)
     print(f"ROI of the image (Z, Y, X, C): {image.shape}")
-    return meta, image
+    print(f"Lazy (chunked) loading used: {used_lazy_loading}")
+    return meta, image, used_lazy_loading
 
 
-def load_image_and_metadata(input_file, roi_coords, big_image=True):
+def load_image_and_metadata(input_file, roi_coords):
     """Load image with ROI, read voxel sizes and file metadata.
 
     Combines ``load_image_with_roi`` and ``read_file_metadata`` into a
@@ -310,9 +317,11 @@ def load_image_and_metadata(input_file, roi_coords, big_image=True):
         Keys ``'date'`` and ``'channels'``.
     ROI_print : list
         Copy of the ROI coordinates for display in reports.
+    used_lazy_loading : bool
+        Whether the dask/chunked read path was used.
     """
     ROI_print = list(roi_coords)
-    meta, img = load_image_with_roi(input_file, roi_coords, big_image=big_image)
+    meta, img, used_lazy_loading = load_image_with_roi(input_file, roi_coords)
     r_X = meta.physical_pixel_sizes.X
     r_Y = meta.physical_pixel_sizes.Y
     r_Z = meta.physical_pixel_sizes.Z
@@ -323,7 +332,7 @@ def load_image_and_metadata(input_file, roi_coords, big_image=True):
     print(f"Voxel size: [{r_X}, {r_Y}, {r_Z}] um")
     print(f"Date: {file_meta['date']}")
     print(f"Channels: {file_meta['channels']}")
-    return meta, img, r_X, r_Y, r_Z, file_meta, ROI_print
+    return meta, img, r_X, r_Y, r_Z, file_meta, ROI_print, used_lazy_loading
 
 
 def select_roi_interactively(input_file, roi_coords, napari_module=None):
@@ -446,13 +455,15 @@ def select_roi_interactively(input_file, roi_coords, napari_module=None):
     return new_roi
 
 
-def initialize_dataset(input_file, roi_coords, big_image=True,
+def initialize_dataset(input_file, roi_coords,
                        nuclei_diameter=10.0, cell_diameter=30.0,
                        scale_factor=1.0, zoom_factors=None):
     """Load image, read metadata, and compute derived parameters.
 
     Wraps ``load_image_and_metadata`` and adds expansion-factor and
-    zoom-factor computation so the notebook cell is a single call.
+    zoom-factor computation so the notebook cell is a single call. Whether
+    the file is read lazily (dask, ROI-only) or eagerly is decided
+    automatically from its full size — see ``extract_roi_from_metadata``.
 
     Parameters
     ----------
@@ -460,8 +471,6 @@ def initialize_dataset(input_file, roi_coords, big_image=True,
         Path to the microscopy file.
     roi_coords : list of 6 ints
         [x0, x1, y0, y1, z0, z1].
-    big_image : bool
-        If True, use lazy/dask loading with ROI.
     nuclei_diameter, cell_diameter : float
         Approximate diameters in micrometers.
     scale_factor : float
@@ -472,13 +481,13 @@ def initialize_dataset(input_file, roi_coords, big_image=True,
     Returns
     -------
     meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
-    cyto_factor, PCM_factor, zoom_factors
+    cyto_factor, PCM_factor, zoom_factors, used_lazy_loading
     """
     if zoom_factors is None:
         zoom_factors = [1.0, 1.0, 1.0]
 
-    meta, img, r_X, r_Y, r_Z, file_meta, ROI_print = load_image_and_metadata(
-        input_file, roi_coords, big_image=big_image,
+    meta, img, r_X, r_Y, r_Z, file_meta, ROI_print, used_lazy_loading = (
+        load_image_and_metadata(input_file, roi_coords)
     )
 
     cyto_factor = int(np.round(cell_diameter / nuclei_diameter))
@@ -489,11 +498,10 @@ def initialize_dataset(input_file, roi_coords, big_image=True,
     zoom_factors = [x * scale_factor for x in zoom_factors]
 
     return (meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
-            cyto_factor, PCM_factor, zoom_factors)
+            cyto_factor, PCM_factor, zoom_factors, used_lazy_loading)
 
 
-def prepare_and_preview(img, meta, ROI, big_image,
-                        nuclei_diameter, cell_diameter,
+def prepare_and_preview(img, nuclei_diameter, cell_diameter,
                         stain_dict, file_meta,
                         napari_module, r_xyz=None, progress=None):
     """Prepare image stack, build stain table, and open napari preview.
@@ -515,7 +523,7 @@ def prepare_and_preview(img, meta, ROI, big_image,
     viewer : napari.Viewer
     """
     im_final_stack, nuclei_radius, cell_radius, nuclei_volume, cell_volume = (
-        prepare_image_stack(img, meta, ROI, big_image, nuclei_diameter, cell_diameter)
+        prepare_image_stack(img, nuclei_diameter, cell_diameter)
     )
     stain_df = build_stain_dataframe(stain_dict, file_meta)
     viewer = view_original_channels(im_final_stack, stain_df, napari_module, r_xyz=r_xyz, progress=progress)
@@ -1980,7 +1988,7 @@ def export_channel_histograms(
     stain_complete_df,
     input_file,
     ROI_print=None,
-    big_image=True,
+    lazy_loading_used=None,
     name_setup='',
     nuclei_diameter=None,
     cell_diameter=None,
@@ -2040,7 +2048,7 @@ def export_channel_histograms(
     processing_params = {
         'Input file':                     str(input_file),
         'ROI [x0,x1,y0,y1,z0,z1]':        str(ROI_print),
-        'Big image mode':                 str(big_image),
+        'Lazy (chunked) loading used':    str(lazy_loading_used),
         'Experiment name':                str(name_setup),
         'Nuclei diameter (um)':           str(nuclei_diameter),
         'Cell diameter (um)':             str(cell_diameter),
@@ -4218,12 +4226,6 @@ def _split_nonround_clusters_by_intensity_peaks(
             intensity_weight=intensity_weight,
         )
         if len(peak_coords_3d) < 2:
-            print(
-                f"  [nuclei-peak-split] cluster {voxel_count} vox "
-                f"(~{voxel_count / expected_nucleus_vox:.1f}x expected nucleus), "
-                f"roundness {_label_roundness_xy(mask):.2f}: only {len(peak_coords_3d)} "
-                f"intensity peak(s) found (need >=2) — trying rethreshold pass instead."
-            )
             continue
 
         seeds = np.zeros(mask.shape, dtype=np.int32)
@@ -4255,7 +4257,6 @@ def _split_nonround_clusters_by_intensity_peaks(
         # 1 is still an oversized unresolved remainder should keep those 7,
         # not be discarded wholesale for the one bad piece.
         valid_pieces = []
-        rejected_vox = 0
         for sub_id in range(1, int(sub_labels.max()) + 1):
             piece_mask = sub_labels == sub_id
             piece_vox = int(np.count_nonzero(piece_mask))
@@ -4264,17 +4265,8 @@ def _split_nonround_clusters_by_intensity_peaks(
             if (local_min_piece_vox <= piece_vox <= local_max_piece_vox
                     and _label_roundness_xy(piece_mask) >= piece_roundness_floor):
                 valid_pieces.append(piece_mask)
-            else:
-                rejected_vox += piece_vox
 
         if len(valid_pieces) < 2:
-            print(
-                f"  [nuclei-peak-split] cluster {voxel_count} vox "
-                f"(~{voxel_count / expected_nucleus_vox:.1f}x expected nucleus): "
-                f"found {len(peak_coords_3d)} peaks (avg {avg_piece_vox:.0f} vox/piece, "
-                f"allowed [{local_min_piece_vox:.0f}, {local_max_piece_vox:.0f}]), but only "
-                f"{len(valid_pieces)} piece(s) passed validation — trying rethreshold pass instead."
-            )
             continue
 
         # Peel off the valid pieces only; anything left over (rejected
@@ -4284,12 +4276,6 @@ def _split_nonround_clusters_by_intensity_peaks(
             out[piece_mask] = next_label
             next_label += 1
         split_count += 1
-        if rejected_vox > 0:
-            print(
-                f"  [nuclei-peak-split] cluster {voxel_count} vox: peeled off "
-                f"{len(valid_pieces)} valid nucleus/nuclei (of {len(peak_coords_3d)} peaks found); "
-                f"{rejected_vox} vox left merged under the original label for another pass."
-            )
 
     return out, split_count
 
@@ -4392,9 +4378,7 @@ def _split_nonround_clusters_by_rethreshold(
         # partial accept, same reasoning as the peak-based pass: a cluster
         # where most pieces look like real nuclei and a remainder doesn't
         # should keep the good pieces rather than be discarded wholesale.
-        attempt_log = []
         best_valid_pieces = []
-        best_rejected_vox = 0
 
         for pct in percentiles:
             cutoff = float(np.percentile(values, pct))
@@ -4405,7 +4389,6 @@ def _split_nonround_clusters_by_rethreshold(
             sizes = np.bincount(core_labels.ravel(), minlength=n_cores + 1)
             keep_ids = [i for i in range(1, n_cores + 1) if sizes[i] >= min_core_vox]
             if len(keep_ids) < 2:
-                attempt_log.append(f"pct={pct}: only {len(keep_ids)} core(s) >= {min_core_vox} vox")
                 continue
 
             seeds = np.zeros_like(core_labels)
@@ -4428,7 +4411,6 @@ def _split_nonround_clusters_by_rethreshold(
             local_max_piece_vox = max_piece_vox_factor * avg_piece_vox
 
             valid_pieces = []
-            rejected_vox = 0
             for sub_id in range(1, int(sub_labels.max()) + 1):
                 piece_mask = sub_labels == sub_id
                 piece_vox = int(np.count_nonzero(piece_mask))
@@ -4437,34 +4419,15 @@ def _split_nonround_clusters_by_rethreshold(
                 if (local_min_piece_vox <= piece_vox <= local_max_piece_vox
                         and _label_roundness_xy(piece_mask) >= piece_roundness_floor):
                     valid_pieces.append(piece_mask)
-                else:
-                    rejected_vox += piece_vox
 
-            attempt_log.append(
-                f"pct={pct}: {len(keep_ids)} core(s) (avg {avg_piece_vox:.0f} vox/piece) -> "
-                f"{len(valid_pieces)} valid piece(s), {rejected_vox} vox rejected"
-            )
             if len(valid_pieces) > len(best_valid_pieces):
                 best_valid_pieces = valid_pieces
-                best_rejected_vox = rejected_vox
 
         if len(best_valid_pieces) >= 2:
             for piece_mask in best_valid_pieces:
                 out[piece_mask] = next_label
                 next_label += 1
             split_count += 1
-            print(
-                f"  [nuclei-rethreshold-split] cluster {voxel_count} vox: peeled off "
-                f"{len(best_valid_pieces)} valid nucleus/nuclei; {best_rejected_vox} vox left "
-                f"merged under the original label for another pass."
-            )
-        else:
-            print(
-                f"  [nuclei-rethreshold-split] cluster {voxel_count} vox "
-                f"(~{voxel_count / expected_nucleus_vox:.1f}x expected nucleus), "
-                f"roundness {_label_roundness_xy(mask):.2f}: no valid split found, left merged. "
-                f"Attempts: " + "; ".join(attempt_log)
-            )
 
     return out, split_count
 
@@ -5054,6 +5017,10 @@ def run_resample(im_final_stack, stain_complete_df, zoom_factors, meta):
     im_final_stack['Zoomed image'], r_zX, r_zY, r_zZ = resample_to_isotropic(
         im_final_stack['Normalized image'], zoom_factors, meta=meta
     )
+    # 'Normalized image' is not used past this point; drop it to free RAM
+    # before the (larger, isotropic) downstream stages accumulate.
+    del im_final_stack['Normalized image']
+    gc.collect()
     hist_plot(im_final_stack['Zoomed image'], stain_complete_df)
     return im_final_stack, r_zX, r_zY, r_zZ
 
@@ -5305,33 +5272,50 @@ def resample_to_isotropic(image_stack, zoom_factors, meta=None):
     return im_out
 
 
-def extract_roi_from_metadata(meta, roi_coords, big_image=True):
+# Above this size, the file's full pixel array is read lazily via dask, with
+# only the requested ROI ever computed into memory, instead of reading the
+# whole file eagerly first. Kept conservative since later pipeline stages
+# (Cells 9-15) each hold their own full-size copy of the array alongside it.
+_LAZY_LOAD_THRESHOLD_BYTES = 2 * 1024 ** 3  # 2 GiB
+
+
+def _estimate_full_image_bytes(meta):
+    """Estimate the in-memory size (bytes) of the file's full pixel array."""
+    n_voxels = int(np.prod(meta.shape))
+    itemsize = np.dtype(getattr(meta, 'dtype', np.uint16)).itemsize
+    return n_voxels * itemsize
+
+
+def extract_roi_from_metadata(meta, roi_coords):
     """
-    Extract a region of interest from an ND2 file.
-    
+    Extract a region of interest from a microscopy file.
+
+    Automatically chooses how to read the data: files whose full pixel array
+    would exceed ``_LAZY_LOAD_THRESHOLD_BYTES`` are read lazily via dask, so
+    only the requested ROI is ever computed into memory; smaller files are
+    read directly since the dask overhead isn't worth it.
+
     Parameters
     ----------
     meta : AICSImage
         Metadata object from bioio.AICSImage.
-    
+
     roi_coords : list of 6 ints
         [x0, x1, y0, y1, z0, z1] coordinates. Use 0 to keep full range.
-    
-    big_image : bool
-        If True, uses dask for lazy loading. If False, loads full image.
-    
+
     Returns
     -------
     image : ndarray, shape (Z, Y, X, C)
         Extracted image in ZYX order.
-    
+
     roi_used : list
         Actual ROI coordinates used (with 0s replaced by full ranges).
+
+    used_lazy_loading : bool
+        Whether the dask/chunked read path was used.
     """
-    from aicsimageio import AICSImage
-    
     x0, x1, y0, y1, z0, z1 = roi_coords
-    
+
     # Replace 0s with full range
     if x1 == 0:
         x1 = meta.shape[4]
@@ -5339,15 +5323,16 @@ def extract_roi_from_metadata(meta, roi_coords, big_image=True):
         y1 = meta.shape[3]
     if z1 == 0:
         z1 = meta.shape[2]
-    
-    if big_image:
+
+    used_lazy_loading = _estimate_full_image_bytes(meta) > _LAZY_LOAD_THRESHOLD_BYTES
+    if used_lazy_loading:
         lazy = meta.get_image_dask_data("ZYXC")
         sub = lazy[z0:z1, y0:y1, x0:x1, :]
         image = sub.compute()
     else:
-        image = meta.get_image_data("ZYXC", T=0)
-    
-    return image, [x0, x1, y0, y1, z0, z1]
+        image = meta.get_image_data("ZYXC", T=0)[z0:z1, y0:y1, x0:x1, :]
+
+    return image, [x0, x1, y0, y1, z0, z1], used_lazy_loading
 
 
 def fix_image_axes_order(original_image):
@@ -5384,24 +5369,19 @@ def fix_image_axes_order(original_image):
     return orig
 
 
-def prepare_image_stack(img, meta, ROI, big_image, nuclei_diameter, cell_diameter):
+def prepare_image_stack(img, nuclei_diameter, cell_diameter):
     """Compute geometry parameters and build the initial image stack.
 
-    Derives nuclei/cell radii and volumes from diameter inputs, applies ROI
-    cropping for the non-big-image case, casts to float32, and fixes axes
-    order so the result is always (Z, Y, X, C).
+    Derives nuclei/cell radii and volumes from diameter inputs, casts the
+    (already ROI-cropped) image to float32, and fixes axes order so the
+    result is always (Z, Y, X, C).
 
     Parameters
     ----------
     img : ndarray
-        Image array already loaded into memory (shape Z, Y, X, C or similar).
-    meta : AICSImage
-        Opened AICSImage object.
-    ROI : list of 6 ints
-        [x0, x1, y0, y1, z0, z1]. Zero values are replaced by the image extent.
-    big_image : bool
-        If True the full img is used as-is; if False a sub-region is read
-        from meta and cropped according to ROI.
+        ROI-cropped image array already loaded into memory, as returned by
+        ``initialize_dataset``/``load_image_and_metadata`` (shape Z, Y, X, C
+        or similar).
     nuclei_diameter : float
         Approximate nucleus diameter in µm.
     cell_diameter : float
@@ -5421,23 +5401,8 @@ def prepare_image_stack(img, meta, ROI, big_image, nuclei_diameter, cell_diamete
     nuclei_volume = np.ceil(4.0 * (nuclei_radius ** 3.0) * np.pi / 3.0)
     cell_volume = np.ceil(4.0 * (cell_radius ** 3.0) * np.pi / 3.0)
 
-    x0, x1, y0, y1, z0, z1 = ROI
-    if x1 == 0:
-        x1 = img.shape[0]
-    if y1 == 0:
-        y1 = img.shape[1]
-    if z1 == 0:
-        z1 = img.shape[2]
-
-    if big_image:
-        im_original = img.astype('float32')
-        im_original_ROI = im_original.copy()
-    else:
-        im_original = meta.get_image_data("ZYXC", S=0, T=0).astype('float32')
-        im_original_ROI = im_original[z0:z1, y0:y1, x0:x1, :]
-
     # Fix axes order: ensure (Z, Y, X, C), drop singleton T axis if present
-    orig = im_original_ROI
+    orig = img.astype('float32')
     if len(orig.shape) == 5 and orig.shape[4] == 1:
         orig = orig[..., 0]
     if len(orig.shape) == 4 and orig.shape[-1] > 50:
@@ -5544,6 +5509,56 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
     return viewer
 
 
+def _threshold_sauvola_chunked(arr, window_size, memory_budget_bytes=1_000_000_000):
+    """Memory-scoped equivalent of ``skimage.filters.threshold_sauvola`` for
+    3D arrays.
+
+    ``threshold_sauvola`` internally pads the whole volume and builds a
+    float64 integral image over it, which can need several times the input
+    array's size in one allocation (this is what raised ``MemoryError`` on
+    large single-channel volumes). This processes the volume in Z-slabs,
+    each padded with a halo of real neighbouring slices (matching
+    ``skimage``'s own ``window_size // 2 + 1`` / ``window_size // 2`` pad
+    widths) so every slab's result is identical to running the full-volume
+    computation, but only one slab's padded copy/integral image is resident
+    in memory at a time.
+
+    Parameters
+    ----------
+    arr : ndarray, shape (Z, Y, X)
+    window_size : int
+        Odd window size, as passed to ``threshold_sauvola``.
+    memory_budget_bytes : int
+        Approximate cap on the float64 integral image for a single slab;
+        the Z-chunk size is derived from this and the array's Y/X extent.
+
+    Returns
+    -------
+    ndarray, same shape as ``arr``
+    """
+    from skimage.filters import threshold_sauvola
+
+    z_dim, y_dim, x_dim = arr.shape
+    half_before = window_size // 2 + 1
+    half_after = window_size // 2
+
+    per_slice_bytes = 8 * y_dim * x_dim  # dominant cost: float64 integral image
+    chunk_z = max(1, int(memory_budget_bytes / per_slice_bytes))
+
+    if chunk_z >= z_dim:
+        return threshold_sauvola(arr, window_size=window_size)
+
+    out = np.empty(arr.shape, dtype=np.result_type(arr.dtype, np.float32))
+    for start in range(0, z_dim, chunk_z):
+        stop = min(start + chunk_z, z_dim)
+        pad_start = max(0, start - half_before)
+        pad_stop = min(z_dim, stop + half_after)
+        slab_thr = threshold_sauvola(arr[pad_start:pad_stop], window_size=window_size)
+        out[start:stop] = slab_thr[start - pad_start: start - pad_start + (stop - start)]
+        del slab_thr
+    return out
+
+
 def _compute_channel_threshold_stats(
     arr,
     is_nuclei,
@@ -5581,7 +5596,6 @@ def _compute_channel_threshold_stats(
     bg_mean : float
     """
     import SimpleITK as sitk
-    from skimage.filters import threshold_sauvola
 
     img = sitk.GetImageFromArray(arr)
 
@@ -5611,8 +5625,9 @@ def _compute_channel_threshold_stats(
     if int(window_size) % 2 == 0:
         window_size += 1
 
-    # Sauvola threshold map
-    sauvola_value = threshold_sauvola(arr, window_size=int(window_size))
+    # Sauvola threshold map (processed in Z-slabs to cap peak memory — see
+    # _threshold_sauvola_chunked docstring)
+    sauvola_value = _threshold_sauvola_chunked(arr, window_size=int(window_size))
 
     # Global statistical background, excluding zeros
     non_zero = arr[arr > 0]
@@ -5818,7 +5833,7 @@ def segment_nuclei_cellpose(image_3d, nuclei_diameter, voxel_size, model_type='n
         channels=[0, 0],
     )
 
-    print(f"Nuclei found: {int(labels.max())}")
+    print(f"Total nuclei found: {int(labels.max())}")
     return labels.astype(np.int32)
 
 
@@ -5882,6 +5897,26 @@ def segment_cytoplasm_cellpose(image_3d, cell_diameter, voxel_size, nuclei_label
         f"anisotropy={anisotropy:.2f})"
     )
     return labels
+
+
+def _display_nuclei_roundness_size_table(debug_info):
+    """Display a one-row summary table of the roundness/size-based keep-or-discard
+    decisions made by `segment_nuclei_watershed`, in place of verbose per-cluster text.
+    """
+    stats_df = pd.DataFrame([{
+        'Roundness threshold': debug_info['nuclei_min_roundness'],
+        'Removed (too small/non-round)': debug_info['removed_by_roundness'],
+        'Non-round clusters re-split': debug_info['nonround_cluster_splits'],
+        'Still-merged clusters (kept)': debug_info['protected_nonround_clusters'],
+        'Expected nucleus size (voxels)': int(round(debug_info['expected_nucleus_vox'])),
+        'Multi-nucleus size threshold (voxels)': int(round(debug_info['multi_nucleus_vox_thresh'])),
+    }])
+    try:
+        from IPython.display import display as _display
+        _display(stats_df)
+    except Exception:
+        pass
+    return stats_df
 
 
 def segment_nuclei(
@@ -5979,12 +6014,8 @@ def segment_nuclei(
             **split_cfg,
         )
 
-        print(
-            f"Nuclei found: {int(im_out.max())} "
-            f"(removed by roundness filter: {debug_info['removed_by_roundness']}, "
-            f"non-round clusters re-split: {debug_info['nonround_cluster_splits']}, "
-            f"still-merged non-round clusters: {debug_info['protected_nonround_clusters']})"
-        )
+        print(f"Total nuclei found: {int(im_out.max())}")
+        _display_nuclei_roundness_size_table(debug_info)
 
         im_segmentation_stack['Nuclei'] = im_out
         im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
@@ -6018,7 +6049,7 @@ def segment_nuclei(
                 im_mask, footprint=np.ones((2, 2, 2))
             ).astype(im_mask.dtype)
             im_out, _ = skimage_label((transl * im_mask) > 0, return_num=True)
-            print(f"Nuclei found: {int(im_out.max())}")
+            print(f"Total nuclei found: {int(im_out.max())}")
 
         else:
             binary_mask = im_in[:, :, :, c].astype(bool)
@@ -6035,12 +6066,8 @@ def segment_nuclei(
                 **split_cfg,
             )
 
-            print(
-                f"Nuclei found: {int(im_out.max())} "
-                f"(removed by roundness filter: {debug_info['removed_by_roundness']}, "
-                f"non-round clusters re-split: {debug_info['nonround_cluster_splits']}, "
-                f"still-merged non-round clusters: {debug_info['protected_nonround_clusters']})"
-            )
+            print(f"Total nuclei found: {int(im_out.max())}")
+            _display_nuclei_roundness_size_table(debug_info)
 
         im_segmentation_stack['Nuclei'] = im_out
 
@@ -6589,6 +6616,11 @@ def view_processing_results(
         ('Filtered image',  'FILTERED',  scale_zoom),
         ('Equalized image', 'EQ',        scale_zoom),
     ]
+    # Stages not read by any cell after this one (Original/Zoomed/Denoised/
+    # Adjusted) are dropped from im_final_stack right after their layers are
+    # added — napari keeps its own reference, so nothing disappears from the
+    # viewer, but the dict stops double-holding these large arrays.
+    _stages_freed_after_view = ('Original image', 'Zoomed image', 'Denoised image', 'Adjusted image')
     for stage_key, stage_prefix, scale in progress(stages, desc='Step 22A - Add Layers To Viewer 0'):
         for c in range(im_thr.shape[3]):
             idx = stain_complete_df.index[c]
@@ -6599,6 +6631,9 @@ def view_processing_results(
                 name=f'{stage_prefix} {idx} ({marker})', colormap=color,
                 blending='additive', scale=scale,
             )
+        if stage_key in _stages_freed_after_view:
+            del im_final_stack[stage_key]
+            gc.collect()
 
     # Connected-component "islands" of the per-channel threshold mask, so
     # under-segmented/missed nuclei (broken-up or absent islands) are easy to
@@ -6611,6 +6646,11 @@ def view_processing_results(
             islands.astype(np.int32),
             name=f'Thresh islands {idx} ({marker})', blending='additive', scale=scale_zoom,
         )
+    # 'Threshold image' is also not read by any later cell; free it (and the
+    # local `im_thr` reference used above) the same way.
+    del im_final_stack['Threshold image']
+    del im_thr
+    gc.collect()
     viewer_0.scale_bar.visible = True
     for layer in viewer_0.layers:
         layer.units = ('um', 'um', 'um')
