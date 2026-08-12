@@ -5,7 +5,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 > **Disclaimer:** This repository is freely available for use. The associated pipeline is currently being prepared for publication — please contact [Edoardo Borgiani](https://github.com/edoborgiani) for more information on how to use the pipeline or for collaboration enquiries.
 
 ## Features
-- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.5.1`, latest) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.2`, latest) — each also keeps its immediately preceding version at the top level as a stable fallback.
+- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.6`, latest) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.2`, latest). Earlier versions are kept locally in `old_v/` (not tracked in version control).
 - **Shared helper library** (`helpers/`): processing, quantification, visualization, and report-export functions shared across notebooks.
 - **Profile-aware imports** (`helpers/notebook_setup_helpers.py`): `load_nuclei_notebook_setup()` and `load_ld_notebook_setup()` load only the dependencies each workflow needs, avoiding unnecessary overhead.
 - **3D Image Processing**: normalization, resampling to isotropic voxel size, denoising, thresholding, and watershed / StarDist / Cellpose 3D segmentation.
@@ -17,10 +17,8 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 ## Repository Structure
 ```
 .
-├── Fluo_3D_nuc_seg_v1.5.1.ipynb    # Nuclei segmentation — latest recommended version
-├── Fluo_3D_nuc_seg_v1.5.ipynb      # Nuclei segmentation — previous stable version
+├── Fluo_3D_nuc_seg_v1.6.ipynb      # Nuclei segmentation — latest recommended version
 ├── Fluo_3D_LD_seg_v1.2.ipynb       # Live/Dead segmentation — latest recommended version
-├── Fluo_3D_LD_seg_v1.1.ipynb       # Live/Dead segmentation — previous stable version
 ├── requirements.txt                # Python dependencies
 ├── README.md                       # This file
 └── helpers/
@@ -29,7 +27,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
     └── notebook_setup_helpers.py   # Package installation and profile-aware import loader
 ```
 
-> **Note:** The `old_v/` folder (containing earlier notebook versions v1.0–v1.4.2) and Python `__pycache__` directories are excluded from version control and exist only locally.
+> **Note:** The `old_v/` folder (containing earlier notebook versions) and Python `__pycache__` directories are excluded from version control and exist only locally.
 
 ## Getting Started
 
@@ -74,7 +72,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```powershell
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.5.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 ---
 
@@ -101,7 +99,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```bash
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.5.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 > **Note (Apple Silicon — M1/M2/M3):** If step 3 fails with build errors for packages like `tetgen` or `meshlib`, your Mac's ARM architecture is likely the cause. In that case, skip steps 2–3 above and use [Miniforge](https://github.com/conda-forge/miniforge) to create a conda environment instead:
 > ```bash
@@ -138,7 +136,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```bash
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.5.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 > **Note (Headless servers only):** If you are running on a remote Linux server without a physical display (e.g. an HPC cluster accessed via SSH), Napari's Qt backend will fail to open. Run the following commands **before step 4** to start a virtual framebuffer:
 > ```bash
@@ -155,7 +153,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 - Use Napari for interactive visualization and manual corrections at any step.
 - All shared processing logic lives in `helpers/notebook_helpers.py` — customize functions there rather than duplicating code across notebooks.
 
-## Detailed Workflow: `Fluo_3D_nuc_seg_v1.5.1.ipynb`
+## Detailed Workflow: `Fluo_3D_nuc_seg_v1.6.ipynb`
 
 ### 1. Environment Setup
 Cell 1 loads all required imports in one step via `load_nuclei_notebook_setup()`. Cell 2 calls `reload_helpers()` to reload `helpers/notebook_helpers.py` without restarting the kernel.
@@ -163,7 +161,7 @@ Cell 1 loads all required imports in one step via `load_nuclei_notebook_setup()`
 ### 2. Inputs & Setup
 - Set `input_file` to your `.nd2` or `.tif` file path, plus `ROI`, `name_setup`, `nuclei_diameter`/`cell_diameter`, `scale_factor`, the segmentation method flags (`trig_cellpose`, `trig_stardist`, `trig_cellpose_cyto`), and `nuclei_split_config`.
 - Set `interactive_roi = True` to pick the ROI visually instead of typing coordinates — `select_roi_interactively()` opens a napari window with a draggable rectangle over the full image (X/Y only; Z stays as set in `ROI`).
-- `initialize_dataset()` loads the image, reads physical pixel sizes from metadata, and computes derived parameters for correct spatial scaling.
+- `initialize_dataset()` loads the image — automatically choosing lazy (chunked, dask-based) or eager reading depending on the file's size, with no setting to configure — reads physical pixel sizes from metadata, and computes derived parameters for correct spatial scaling.
 
 ### 3. Define Sample & Staining Information
 - Configure `stain_dict` to map channel names — which must match the metadata printed after loading — to biological markers and display colors.
@@ -181,7 +179,7 @@ Cell 1 loads all required imports in one step via `load_nuclei_notebook_setup()`
 - **Histogram export**: per-channel histograms and a Parameters sheet saved to Excel via `export_channel_histograms()`.
 
 ### 6. Thresholding
-- `run_threshold()` combines a selectable global method (Otsu / median / Huang via `threshold_method`), local Sauvola thresholding, and a statistical-background component into a combined binary mask; the resulting histogram marks where the global and combined thresholds landed.
+- `run_threshold()` combines a selectable global method (Otsu / median / Huang via `threshold_method`), local Sauvola thresholding, and a statistical-background component into a combined binary mask (the blend weights between the three components are fixed internally, not user-tunable); the resulting histogram marks where the global and combined thresholds landed.
 
 ### 7. Segmentation
 - **Nuclei**: 3D watershed (default, tunable via `nuclei_split_config`), StarDist2D slice-by-slice with 3D merging (`trig_stardist=True`), or Cellpose 3D (`trig_cellpose=True`) — all via `segment_nuclei()`.
@@ -224,7 +222,7 @@ Cell 1 loads all required imports in one step via `load_ld_notebook_setup()`, wh
 
 ### 2. Load Image Data
 - Set `input_file` to your `.nd2` or `.tif` file path.
-- `initialize_dataset()` loads the image, reads physical pixel sizes from metadata, and computes derived parameters for correct spatial scaling.
+- `initialize_dataset()` loads the image — automatically choosing lazy (chunked, dask-based) or eager reading depending on the file's size, with no setting to configure — reads physical pixel sizes from metadata, and computes derived parameters for correct spatial scaling.
 
 ### 3. Define Sample & Staining Information
 - Configure `stain_dict` with `LIVE` / `DEAD` channel entries — do **not** add a NUCLEI entry, since all channels are merged for segmentation.
@@ -246,7 +244,7 @@ Cell 1 loads all required imports in one step via `load_ld_notebook_setup()`, wh
 - **Histogram export**: per-channel histograms and a Parameters sheet saved to Excel via `export_channel_histograms()`.
 
 ### 7. Thresholding
-- `run_threshold()` combines a selectable global method (Otsu / median / Huang via `threshold_method`), local Sauvola thresholding, and a statistical-background component into a combined binary mask.
+- `run_threshold()` combines a selectable global method (Otsu / median / Huang via `threshold_method`), local Sauvola thresholding, and a statistical-background component into a combined binary mask (the blend weights between the three components are fixed internally, not user-tunable).
 
 ### 8. Segmentation
 - **Cells**: `segment_nuclei()` — watershed (default), Cellpose 3D (`trig_cellpose=True`), or StarDist (`trig_stardist=True`) — applied to the union of all threshold channels merged via bitwise OR, with connected-component labeling identifying individual cells.
