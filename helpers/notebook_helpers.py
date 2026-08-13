@@ -56,6 +56,7 @@ __all__ = [
     "grow_labels",
     "grow_markers_within_islands_limited",
     "hist_plot",
+    "hist_plot_with_thresholds",
     "ImageProcessing",
     "labels_dict_to_dataframe",
     "make_anisotropic_footprint",
@@ -1267,6 +1268,52 @@ def _find_label_neighbors(marker_labels, connectivity):
     return neighbors
 
 
+def _merge_small_touching_regions(marker_labels, connectivity, size_ratio_thresh, min_size):
+    """Merge each label smaller than ``min_size`` voxels — or smaller than
+    ``size_ratio_thresh`` times its largest touching neighbor — into that
+    neighbor. Shared by ``shrink_to_markers``'s ``merge_small_touching``
+    option and ``remove_small_island_labels``.
+
+    Returns
+    -------
+    relabeled : ndarray
+        ``marker_labels`` with small labels reassigned to their neighbor's
+        id (original id space, may contain gaps where a label vanished).
+    final_labels : ndarray
+        ``relabeled > 0`` re-run through connected-component labeling
+        (sequential ids, no gaps).
+    """
+    labels, counts = np.unique(marker_labels, return_counts=True)
+    sizes = dict(zip(labels.tolist(), counts.tolist()))
+    sizes.pop(0, None)
+    neighbors = _find_label_neighbors(marker_labels, connectivity)
+
+    new_label = {label: label for label in sizes}
+    for label, label_neighbors in neighbors.items():
+        if not label_neighbors:
+            continue
+
+        size_label = sizes[label]
+        biggest_neighbor = max(label_neighbors, key=lambda item: sizes.get(item, 0))
+        size_biggest = sizes.get(biggest_neighbor, 0)
+        if size_biggest <= 0:
+            continue
+
+        if size_label <= size_ratio_thresh * size_biggest or size_label < min_size:
+            new_label[label] = biggest_neighbor
+
+    relabeled = marker_labels.copy()
+    for label, target in new_label.items():
+        if label != target:
+            relabeled[marker_labels == label] = target
+
+    final_labels, _ = ndi.label(
+        relabeled > 0,
+        structure=ndi.generate_binary_structure(3, connectivity),
+    )
+    return relabeled, final_labels
+
+
 def shrink_to_markers(
     binary_3d,
     connectivity=2,
@@ -1304,31 +1351,9 @@ def shrink_to_markers(
     if not merge_small_touching or n_markers <= 1:
         return marker_image, marker_labels
 
-    labels, counts = np.unique(marker_labels, return_counts=True)
-    sizes = dict(zip(labels.tolist(), counts.tolist()))
-    sizes.pop(0, None)
-    neighbors = _find_label_neighbors(marker_labels, connectivity)
-
-    new_label = {label: label for label in sizes}
-    for label, label_neighbors in neighbors.items():
-        if not label_neighbors:
-            continue
-
-        size_label = sizes[label]
-        biggest_neighbor = max(label_neighbors, key=lambda item: sizes.get(item, 0))
-        size_biggest = sizes.get(biggest_neighbor, 0)
-        if size_biggest <= 0:
-            continue
-
-        if size_label <= size_ratio_thresh * size_biggest or size_label < 20.0:
-            new_label[label] = biggest_neighbor
-
-    relabeled = marker_labels.copy()
-    for label, target in new_label.items():
-        if label != target:
-            relabeled[marker_labels == label] = target
-
-    final_labels, _ = ndi.label(relabeled > 0, structure=structure)
+    _, final_labels = _merge_small_touching_regions(
+        marker_labels, connectivity, size_ratio_thresh, min_size=20.0,
+    )
     return final_labels > 0, final_labels
 
 
@@ -1352,33 +1377,8 @@ def remove_small_island_labels(
     min_cell_size=5.0,
 ):
     """Merge tiny touching label islands into their larger neighbors."""
-    labels, counts = np.unique(marker_labels, return_counts=True)
-    sizes = dict(zip(labels.tolist(), counts.tolist()))
-    sizes.pop(0, None)
-    neighbors = _find_label_neighbors(marker_labels, connectivity)
-
-    new_label = {label: label for label in sizes}
-    for label, label_neighbors in neighbors.items():
-        if not label_neighbors:
-            continue
-
-        size_label = sizes[label]
-        biggest_neighbor = max(label_neighbors, key=lambda item: sizes.get(item, 0))
-        size_biggest = sizes.get(biggest_neighbor, 0)
-        if size_biggest <= 0:
-            continue
-
-        if size_label <= size_ratio_thresh * size_biggest or size_label < min_cell_size:
-            new_label[label] = biggest_neighbor
-
-    relabeled = marker_labels.copy()
-    for label, target in new_label.items():
-        if label != target:
-            relabeled[marker_labels == label] = target
-
-    final_labels, _ = ndi.label(
-        relabeled > 0,
-        structure=ndi.generate_binary_structure(3, connectivity),
+    relabeled, final_labels = _merge_small_touching_regions(
+        marker_labels, connectivity, size_ratio_thresh, min_size=min_cell_size,
     )
     return final_labels > 0, relabeled
 
@@ -1571,12 +1571,26 @@ def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms):
     return nucleus_positions, nucleus_sizes, cytoplasm_positions, cytoplasm_sizes
 
 
-def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, zooms):
-    """Compute marker measurements per nucleus for one marker channel."""
-    stain_complete_df = _context("stain_complete_df")
-    stain_df = _context("stain_df")
+def _compute_marker_stats_core(
+    marker_idx,
+    seg_stack,
+    filtered_img,
+    r_xyz,
+    stain_complete_df,
+    seg_key,
+    fallback_to_marker_when_missing=False,
+):
+    """Shared implementation for compute_marker_stats_for_marker and
+    compute_full_marker_stats_for_marker.
+
+    ``fallback_to_marker_when_missing`` controls what happens when a
+    per-compartment override image (``seg_key + "_cyto"`` / ``"_PCM"``) is
+    absent from ``seg_stack``: False reports zeros for that compartment
+    (compute_marker_stats_for_marker's behaviour), True falls back to the
+    main marker mask intersected with the compartment
+    (compute_full_marker_stats_for_marker's behaviour).
+    """
     condition = stain_complete_df.index[marker_idx]
-    seg_key = stain_df.index[marker_idx]
 
     marker_img = seg_stack.get(seg_key)
     marker_img_cyto = seg_stack.get(seg_key + "_cyto")
@@ -1623,6 +1637,11 @@ def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, 
 
         if marker_img_cyto is not None:
             cytoplasm_marker_mask = (marker_img_cyto > 0) & cytoplasm_mask
+        elif fallback_to_marker_when_missing:
+            cytoplasm_marker_mask = (marker_img > 0) & cytoplasm_mask
+        else:
+            cytoplasm_marker_mask = None
+        if cytoplasm_marker_mask is not None:
             voxels_cyto = np.where(cytoplasm_marker_mask)
             marker_cyto_sizes.append(voxels_cyto[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
             if channel_idx is not None and voxels_cyto[0].size > 0:
@@ -1639,6 +1658,11 @@ def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, 
 
         if marker_img_pcm is not None:
             pcm_marker_mask = (marker_img_pcm > 0) & pcm_mask
+        elif fallback_to_marker_when_missing:
+            pcm_marker_mask = (marker_img > 0) & pcm_mask
+        else:
+            pcm_marker_mask = None
+        if pcm_marker_mask is not None:
             voxels_pcm = np.where(pcm_marker_mask)
             marker_pcm_sizes.append(voxels_pcm[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
             if channel_idx is not None and voxels_pcm[0].size > 0:
@@ -1667,6 +1691,17 @@ def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, 
     )
 
 
+def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, zooms):
+    """Compute marker measurements per nucleus for one marker channel."""
+    stain_complete_df = _context("stain_complete_df")
+    stain_df = _context("stain_df")
+    seg_key = stain_df.index[marker_idx]
+    return _compute_marker_stats_core(
+        marker_idx, seg_stack, filtered_img, r_xyz, stain_complete_df, seg_key,
+        fallback_to_marker_when_missing=False,
+    )
+
+
 def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filtered_img, r_xyz, zooms):
     """Compute full marker measurements from the filtered image channel.
 
@@ -1675,92 +1710,11 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
     original-resolution filtered_img for higher accuracy.
     """
     stain_complete_df = _context("stain_complete_df")
-    stain_df          = _context("stain_df")
-    condition = stain_complete_df.index[marker_idx]
-    seg_key   = stain_df.index[marker_idx] if stain_df is not None else condition
-
-    marker_img     = seg_stack.get(seg_key)
-    marker_img_cyto = seg_stack.get(seg_key + "_cyto")
-    marker_img_pcm  = seg_stack.get(seg_key + "_PCM")
-    if marker_img is None:
-        return [], [], [], [], [], [], [], [], [], []
-
-    channel_idx = None
-    for idx, name in enumerate(stain_complete_df.index):
-        if name == condition:
-            channel_idx = idx
-            break
-
-    shared_labels = []
-    marker_sizes = []
-    avg_marker = []
-    std_marker = []
-    marker_cyto_sizes = []
-    avg_cyto_marker = []
-    std_cyto_marker = []
-    marker_pcm_sizes = []
-    avg_pcm_marker = []
-    std_pcm_marker = []
-
-    max_label = int(np.max(seg_stack["Nuclei"]))
-    for label_id in range(1, max_label + 1):
-        nucleus_mask = seg_stack["Nuclei"] == label_id
-        cytoplasm_mask = seg_stack["Cytoplasm"] == label_id
-        pcm_mask = seg_stack["PCM"] == label_id
-        marker_mask = ((nucleus_mask + cytoplasm_mask + pcm_mask) > 0) & (marker_img > 0)
-        if not np.any(marker_mask):
-            continue
-
-        shared_labels.append(label_id)
-        voxels = np.where(marker_mask)
-        marker_sizes.append(voxels[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
-        if channel_idx is not None:
-            values = filtered_img[voxels[0], voxels[1], voxels[2], channel_idx]
-            avg_marker.append(float(np.mean(values)) if values.size > 0 else 0.0)
-            std_marker.append(float(np.std(values)) if values.size > 0 else 0.0)
-        else:
-            avg_marker.append(0.0)
-            std_marker.append(0.0)
-
-        if marker_img_cyto is not None:
-            cytoplasm_marker_mask = (marker_img_cyto > 0) & cytoplasm_mask
-        else:
-            cytoplasm_marker_mask = (marker_img > 0) & cytoplasm_mask
-        voxels_cyto = np.where(cytoplasm_marker_mask)
-        marker_cyto_sizes.append(voxels_cyto[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
-        if channel_idx is not None and voxels_cyto[0].size > 0:
-            values_cyto = filtered_img[voxels_cyto[0], voxels_cyto[1], voxels_cyto[2], channel_idx]
-            avg_cyto_marker.append(float(np.mean(values_cyto)))
-            std_cyto_marker.append(float(np.std(values_cyto)))
-        else:
-            avg_cyto_marker.append(0.0)
-            std_cyto_marker.append(0.0)
-
-        if marker_img_pcm is not None:
-            pcm_marker_mask = (marker_img_pcm > 0) & pcm_mask
-        else:
-            pcm_marker_mask = (marker_img > 0) & pcm_mask
-        voxels_pcm = np.where(pcm_marker_mask)
-        marker_pcm_sizes.append(voxels_pcm[0].size * r_xyz[0] * r_xyz[1] * r_xyz[2])
-        if channel_idx is not None and voxels_pcm[0].size > 0:
-            values_pcm = filtered_img[voxels_pcm[0], voxels_pcm[1], voxels_pcm[2], channel_idx]
-            avg_pcm_marker.append(float(np.mean(values_pcm)))
-            std_pcm_marker.append(float(np.std(values_pcm)))
-        else:
-            avg_pcm_marker.append(0.0)
-            std_pcm_marker.append(0.0)
-
-    return (
-        shared_labels,
-        marker_sizes,
-        avg_marker,
-        std_marker,
-        marker_cyto_sizes,
-        avg_cyto_marker,
-        std_cyto_marker,
-        marker_pcm_sizes,
-        avg_pcm_marker,
-        std_pcm_marker,
+    stain_df = _context("stain_df")
+    seg_key = stain_df.index[marker_idx] if stain_df is not None else stain_complete_df.index[marker_idx]
+    return _compute_marker_stats_core(
+        marker_idx, seg_stack, filtered_img, r_xyz, stain_complete_df, seg_key,
+        fallback_to_marker_when_missing=True,
     )
 
 
@@ -1867,6 +1821,37 @@ def _condition_color(condition, stain_complete_df, stain_df=None):
     return (r_final, g_final, b_final)
 
 
+def _normalize_channel_to_uint8_view(im_channel):
+    """Per-channel min-max stretch to uint8 [0, 255], for preview and auto-contrast."""
+    imin = float(im_channel.min())
+    imax = float(im_channel.max())
+    if imax <= imin:
+        return np.zeros_like(im_channel, dtype=np.uint8)
+    return ((im_channel - imin) / (imax - imin) * 255).clip(0, 255).astype(np.uint8)
+
+
+def _compute_automatic_contrast_limits(im_view):
+    """Pick (Cont_min, Cont_max) for one channel from its intensity histogram.
+
+    ``im_view`` is the same per-channel min-max stretch to [0, 255] used for
+    the interactive napari preview, so the result lands on the same scale
+    ``Cont_min``/``Cont_max`` are interpreted against downstream (napari
+    contrast limits, then ``run_normalize()`` + ``apply_contrast_gamma_per_channel``).
+
+    - Cont_min: one above the histogram peak (the background/noise floor in
+      a typical fluorescence image), to exclude background.
+    - Cont_max: the intensity below which 99% of pixels fall, so the top 1%
+      brightest (often saturated/outlier) pixels don't wash out the contrast.
+    """
+    hist_counts = np.bincount(im_view.ravel(), minlength=256)
+    peak_value = int(np.argmax(hist_counts))
+    cont_min = min(255, peak_value + 1)
+    cont_max = int(np.percentile(im_view, 99))
+    if cont_max <= cont_min:
+        cont_max = min(255, cont_min + 1)
+    return cont_min, cont_max
+
+
 def prepare_stain_settings(
     im_in,
     stain_df,
@@ -1875,6 +1860,7 @@ def prepare_stain_settings(
     settings=None,
     napari_module=None,
     r_xyz=None,
+    automatic_contrast=False,
     progress=None,
 ):
     """Load or interactively collect contrast/gamma settings for each channel.
@@ -1885,6 +1871,15 @@ def prepare_stain_settings(
         Physical voxel sizes in micrometers. Applied as the napari layer scale
         during interactive setup so the preview isn't stretched/squashed
         along Z relative to XY.
+    automatic_contrast : bool, optional
+        If False (default), behaviour is unchanged: a napari viewer opens for
+        interactive contrast/gamma adjustment whenever no reusable setup CSV
+        is found. If True, that viewer is skipped and ``Cont_min``/``Cont_max``
+        are instead picked automatically per channel from the intensity
+        histogram (see ``_compute_automatic_contrast_limits``); ``Gamma``
+        stays at the default 1.0. Has no effect when a setup CSV is reused
+        (``use_setup=True`` and the file exists) — that path never opens a
+        viewer to begin with.
     """
     stain_df = stain_df.reset_index(drop=False)
     stain_initial_df = stain_df.copy()
@@ -1907,61 +1902,76 @@ def prepare_stain_settings(
                 break
 
     if not use_setup or not setup_exists:
-        if settings is None:
-            from napari.settings import get_settings
-            settings = get_settings()
-        if napari_module is None:
-            import napari as napari_module
-
         stain_complete_df = stain_initial_df.copy()
-        _close_all_napari_viewers(napari_module)
-        settings.application.ipy_interactive = False
-        viewer = napari_module.Viewer(title="Channels setup - adjust contrast and gamma, then close viewer to continue", ndisplay=3)
 
-        for _, idx in _progress_iter(
-            enumerate(stain_complete_df.index),
-            progress,
-            desc="Step 07B - Prepare Setup Viewer",
-            total=len(stain_complete_df.index),
-            leave=False,
-        ):
-            im_channel = im_in[:, :, :, _]
-            imin = float(im_channel.min())
-            imax = float(im_channel.max())
-            if imax <= imin:
-                im_view = np.zeros_like(im_channel, dtype=np.uint8)
-            else:
-                im_view = ((im_channel - imin) / (imax - imin) * 255).clip(0, 255).astype(np.uint8)
-            viewer.add_image(
-                im_view,
-                name=f"{idx[0]} ({idx[1]})",
-                colormap=stain_initial_df.loc[idx]["Color"],
-                blending="additive",
-                scale=(r_xyz[2], r_xyz[1], r_xyz[0]) if r_xyz is not None else None,
+        if automatic_contrast:
+            for _, idx in _progress_iter(
+                enumerate(stain_complete_df.index),
+                progress,
+                desc="Step 07B - Automatic Contrast",
+                total=len(stain_complete_df.index),
+                leave=False,
+            ):
+                im_view = _normalize_channel_to_uint8_view(im_in[:, :, :, _])
+                cont_min, cont_max = _compute_automatic_contrast_limits(im_view)
+                stain_complete_df.loc[idx, "Cont_min"] = cont_min
+                stain_complete_df.loc[idx, "Cont_max"] = cont_max
+                stain_complete_df.loc[idx, "Gamma"] = 1.0
+
+            print(
+                "automatic_contrast is True — skipped the napari viewer and picked "
+                "Cont_min/Cont_max per channel automatically (histogram peak + 1 to "
+                "the 99th percentile intensity); Gamma left at 1.0."
             )
+        else:
+            if settings is None:
+                from napari.settings import get_settings
+                settings = get_settings()
+            if napari_module is None:
+                import napari as napari_module
 
-        print(
-            "A napari window has opened — check it, adjust the contrast and gamma "
-            "for each channel, then close the window to continue."
-        )
-        napari_module.run()
-        settings.application.ipy_interactive = True
-        image_layers = [layer for layer in viewer.layers if isinstance(layer, napari_module.layers.Image)]
-        contrast_limits = {layer.name: layer.contrast_limits for layer in image_layers}
-        gamma_values = {layer.name: layer.gamma for layer in image_layers}
+            _close_all_napari_viewers(napari_module)
+            settings.application.ipy_interactive = False
+            viewer = napari_module.Viewer(title="Channels setup - adjust contrast and gamma, then close viewer to continue", ndisplay=3)
 
-        stain_complete_df.sort_index(inplace=True)
-        for _, idx in _progress_iter(
-            enumerate(stain_complete_df.index),
-            progress,
-            desc="Step 07C - Collect Setup Values",
-            total=len(stain_complete_df.index),
-            leave=False,
-        ):
-            name = f"{idx[0]} ({idx[1]})"
-            stain_complete_df.loc[idx, "Cont_min"] = int(contrast_limits[name][0])
-            stain_complete_df.loc[idx, "Cont_max"] = int(contrast_limits[name][1])
-            stain_complete_df.loc[idx, "Gamma"] = gamma_values[name]
+            for _, idx in _progress_iter(
+                enumerate(stain_complete_df.index),
+                progress,
+                desc="Step 07B - Prepare Setup Viewer",
+                total=len(stain_complete_df.index),
+                leave=False,
+            ):
+                im_view = _normalize_channel_to_uint8_view(im_in[:, :, :, _])
+                viewer.add_image(
+                    im_view,
+                    name=f"{idx[0]} ({idx[1]})",
+                    colormap=stain_initial_df.loc[idx]["Color"],
+                    blending="additive",
+                    scale=(r_xyz[2], r_xyz[1], r_xyz[0]) if r_xyz is not None else None,
+                )
+
+            print(
+                "A napari window has opened — check it, adjust the contrast and gamma "
+                "for each channel, then close the window to continue."
+            )
+            napari_module.run()
+            settings.application.ipy_interactive = True
+            image_layers = [layer for layer in viewer.layers if isinstance(layer, napari_module.layers.Image)]
+            contrast_limits = {layer.name: layer.contrast_limits for layer in image_layers}
+            gamma_values = {layer.name: layer.gamma for layer in image_layers}
+
+            stain_complete_df.sort_index(inplace=True)
+            for _, idx in _progress_iter(
+                enumerate(stain_complete_df.index),
+                progress,
+                desc="Step 07C - Collect Setup Values",
+                total=len(stain_complete_df.index),
+                leave=False,
+            ):
+                name = f"{idx[0]} ({idx[1]})"
+                stain_complete_df.loc[idx, "Cont_min"] = int(contrast_limits[name][0])
+                stain_complete_df.loc[idx, "Cont_max"] = int(contrast_limits[name][1])
+                stain_complete_df.loc[idx, "Gamma"] = gamma_values[name]
 
         if setup_exists:
             stain_setup_df = pd.read_csv(setup_path)
@@ -2579,40 +2589,14 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
         perc = 100.0 * count / total_cells
         print(f"\n {condition} ({marker})  —  {count} cells  ({perc:.1f} %)")
 
-        # Nucleus compartment
-        nuc_s = np.array(row["Nuclei size [um3]"], dtype=float)
-        avg_i = np.array(row["Avg. marker intensity"], dtype=float)
-        std_i = np.array(row["STD marker intensity"], dtype=float)
-        if nuc_s.size > 0:
-            nuc_line = f"   Nucleus size:        {np.mean(nuc_s):.2f} ± {np.std(nuc_s):.2f} um\u00b3"
-            if avg_i.size > 0:
-                nuc_line += f"   |  intensity: {np.mean(avg_i):.2f} ± {np.mean(std_i):.2f} a.u."
-            print(nuc_line)
-        elif avg_i.size > 0:
-            print(f"   Nucleus intensity:    {np.mean(avg_i):.2f} ± {np.mean(std_i):.2f} a.u.")
-
-        # Cytoplasm compartment
+        # Only marker intensity is printed per condition -- nucleus/cytoplasm
+        # SIZE belongs to the segmentation, not to any one marker, and is
+        # already reported once above under NUCLEI SIZE / CYTOPLASM SIZE.
         if "CYTOPLASM" in stain_df.index:
-            cyto_s = np.array(row["Cytoplasm size [um3]"], dtype=float)
-            cyto_avg = np.array(row["Avg. marker intensity cytoplasm"], dtype=float)
-            cyto_std = np.array(row["STD marker intensity cytoplasm"], dtype=float)
-            if cyto_s.size > 0:
-                cyto_line = f"   Cytoplasm size:      {np.mean(cyto_s):.2f} ± {np.std(cyto_s):.2f} um\u00b3"
-                if cyto_avg.size > 0:
-                    cyto_line += f"   |  intensity: {np.mean(cyto_avg):.2f} ± {np.mean(cyto_std):.2f} a.u."
-                print(cyto_line)
-            elif cyto_avg.size > 0:
-                print(f"   Cytoplasm intensity:  {np.mean(cyto_avg):.2f} ± {np.mean(cyto_std):.2f} a.u.")
+            _size_stats_line(row["Avg. marker intensity cytoplasm"], "   Cytoplasm intensity", unit="a.u.")
 
-        # Marker/aggregate size and intensity
-        msize = np.array(row["Marker size [um3]"], dtype=float)
-        avg_mi = np.array(row["Avg. marker intensity"], dtype=float)
-        std_mi = np.array(row["STD marker intensity"], dtype=float)
-        if msize.size > 0:
-            marker_line = f"   Marker size:          {np.mean(msize):.2f} ± {np.std(msize):.2f} um\u00b3"
-            if avg_mi.size > 0:
-                marker_line += f"   |  intensity: {np.mean(avg_mi):.2f} ± {np.mean(std_mi):.2f} a.u."
-            print(marker_line)
+        # Marker intensity (mean/median/min/max across cells)
+        _size_stats_line(row["Avg. marker intensity"], "   Marker intensity", unit="a.u.")
 
     print("_" * 80)
 
@@ -3768,8 +3752,6 @@ def _split_z_topology(label_img, min_fragment_vox, min_z_overlap=2):
         Minimum number of overlapping pixels between components in
         adjacent z-slices to consider them connected (default 2).
     """
-    from scipy import ndimage as ndi
-
     out = np.asarray(label_img).copy()
     current_labels = np.unique(out)
     current_labels = current_labels[current_labels > 0]
@@ -3859,7 +3841,6 @@ def _split_z_topology(label_img, min_fragment_vox, min_z_overlap=2):
 def _split_z_watershed(label_img, min_fragment_vox):
     """Watershed-reinforced z-split: any z with multiple significant 2D
     components seeds a local watershed that carves the full 3D label."""
-    from scipy import ndimage as ndi
     from skimage.segmentation import watershed
 
     out = np.asarray(label_img).copy()
@@ -3952,8 +3933,6 @@ def _merge_labels_by_z_consistency(label_img):
     total_merges : int
         Number of merges performed.
     """
-    from scipy import ndimage as ndi
-
     out = np.asarray(label_img).copy()
     struct_2d = np.ones((3, 3), dtype=int)
 
@@ -4189,7 +4168,6 @@ def _split_nonround_clusters_by_intensity_peaks(
     split_count : int
         Number of labels successfully split into >= 2 valid pieces.
     """
-    from scipy import ndimage as ndi
     from skimage.segmentation import watershed
 
     out = np.asarray(label_img).copy()
@@ -4344,7 +4322,6 @@ def _split_nonround_clusters_by_rethreshold(
     split_count : int
         Number of labels successfully split into >= 2 valid pieces.
     """
-    from scipy import ndimage as ndi
     from skimage.segmentation import watershed
 
     out = np.asarray(label_img).copy()
@@ -4635,7 +4612,6 @@ def segment_nuclei_watershed(
     >>> print(f"Nuclei found: {int(nuclei.max())}, Peak-based seeds: {debug['added_peak_seed_count']}")
     """
     from skimage import morphology
-    from scipy import ndimage as ndi
     from skimage.segmentation import watershed, relabel_sequential
 
     use_intensity = split_by_intensity_gradient and intensity_img is not None
@@ -5164,7 +5140,6 @@ def apply_per_channel_filter(image_stack, filter_func):
 
 def apply_median_denoise(image_stack):
     """Apply median filter to each channel independently."""
-    from scipy import ndimage as ndi
     from skimage import filters
     return apply_per_channel_filter(image_stack, lambda ch: filters.median(ch))
 
@@ -5401,14 +5376,7 @@ def prepare_image_stack(img, nuclei_diameter, cell_diameter):
     nuclei_volume = np.ceil(4.0 * (nuclei_radius ** 3.0) * np.pi / 3.0)
     cell_volume = np.ceil(4.0 * (cell_radius ** 3.0) * np.pi / 3.0)
 
-    # Fix axes order: ensure (Z, Y, X, C), drop singleton T axis if present
-    orig = img.astype('float32')
-    if len(orig.shape) == 5 and orig.shape[4] == 1:
-        orig = orig[..., 0]
-    if len(orig.shape) == 4 and orig.shape[-1] > 50:
-        chan_axis = next((i for i, s in enumerate(orig.shape) if s < 50), None)
-        if chan_axis is not None and chan_axis != 3:
-            orig = np.moveaxis(orig, chan_axis, -1)
+    orig = fix_image_axes_order(img.astype('float32'))
 
     print("Image stack ready.")
     return {'Original image': orig}, nuclei_radius, cell_radius, nuclei_volume, cell_volume
@@ -5477,19 +5445,17 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
     -------
     viewer : napari.Viewer
     """
-    if progress is None:
-        def progress(x, **kw): return x
-
     scale = (r_xyz[2], r_xyz[1], r_xyz[0]) if r_xyz is not None else None
 
     im_in = im_final_stack['Original image'].copy()
     _close_all_napari_viewers(napari_module)
     viewer = napari_module.Viewer(title="Original Image Channels")
 
-    for c, c_name in progress(
+    for c, c_name in _progress_iter(
         enumerate(stain_df['Marker']),
-        total=len(stain_df['Marker']),
+        progress,
         desc='Step 06 - Visualize Channels',
+        total=len(stain_df['Marker']),
         leave=False,
     ):
         im_channel = im_in[:, :, :, c]
@@ -5747,9 +5713,6 @@ def apply_threshold_per_channel(
             f"sauvola_weight={sauvola_weight}"
         )
 
-    if progress is None:
-        def progress(x, **kw): return x
-
     r_zX, r_zY, _ = r_zxyz
     im_out = image_stack.copy()
     nuclei_size = int(nuclei_diameter / (np.mean([r_zX, r_zY])))
@@ -5759,7 +5722,7 @@ def apply_threshold_per_channel(
     global_thresholds = []
     combined_thresholds = []
 
-    for c in progress(range(image_stack.shape[3]), desc='Step 15 - Threshold Channels'):
+    for c in _progress_iter(range(image_stack.shape[3]), progress, desc='Step 15 - Threshold Channels'):
         marker_name = stain_complete_df.loc[stain_complete_df.index[c], 'Marker']
         is_nuclei = stain_complete_df.index[c] == "NUCLEI"
         arr = image_stack[:, :, :, c]
@@ -5974,9 +5937,6 @@ def segment_nuclei(
     from skimage.measure import label as skimage_label
     from skimage import morphology
 
-    if progress is None:
-        def progress(x, **kw): return x
-
     r_zX, r_zY, r_zZ = r_zxyz
     im_segmentation_stack = {}
 
@@ -6025,7 +5985,7 @@ def segment_nuclei(
     im_in = im_final_stack['Threshold image'].copy()
     split_cfg = dict(nuclei_split_config)
 
-    for c in progress(range(im_in.shape[3]), desc='Step 17 - Segment Nuclei'):
+    for c in _progress_iter(range(im_in.shape[3]), progress, desc='Step 17 - Segment Nuclei'):
         if stain_complete_df.index[c] != 'NUCLEI':
             continue
 
@@ -6284,9 +6244,6 @@ def segment_cytoplasm(
     """
     from skimage.measure import label as skimage_label
 
-    if progress is None:
-        def progress(x, **kw): return x
-
     r_zX, r_zY, r_zZ = r_zxyz
 
     if 'Nuclei' not in im_segmentation_stack:
@@ -6304,7 +6261,7 @@ def segment_cytoplasm(
     has_cyto_channel = 'CYTOPLASM' in stain_df.index
 
     if has_cyto_channel:
-        for c in progress(range(im_in.shape[3]), desc='Step 18A - Segment Cytoplasm'):
+        for c in _progress_iter(range(im_in.shape[3]), progress, desc='Step 18A - Segment Cytoplasm'):
             if stain_df.index[c] == 'CYTOPLASM':
                 if trig_cellpose_cyto:
                     if cell_diameter is None:
@@ -6320,7 +6277,6 @@ def segment_cytoplasm(
                     )
                     print("Cytoplasm shaped from CYTOPLASM channel via Cellpose 3D")
                 else:
-                    from scipy import ndimage as _ndi
                     cyto_binary = im_in[:, :, :, c] > 0
                     nuc_mask = im_segmentation_stack['Nuclei'] > 0
                     combined_mask = cyto_binary | nuc_mask
@@ -6340,7 +6296,7 @@ def segment_cytoplasm(
                         )
                         print("Cytoplasm segmented from CYTOPLASM channel + nuclei region (gradient-aware watershed)")
                     else:
-                        distance = _ndi.distance_transform_edt(
+                        distance = ndi.distance_transform_edt(
                             combined_mask, sampling=[r_zZ, r_zY, r_zX]
                         )
                         im_out = watershed(
@@ -6354,11 +6310,9 @@ def segment_cytoplasm(
             im_out = grow_labels(im_segmentation_stack['Nuclei'], cyto_factor)
             print(f"Cytoplasm grown from nuclei labels (factor={cyto_factor})")
         else:
-            from scipy import ndimage as _ndi
-
             marker_mask = np.zeros(im_in.shape[:3], dtype=bool)
             marker_channel_imgs = []
-            for c in progress(range(im_in.shape[3]), desc='Step 18B - Apply Cyto Markers'):
+            for c in _progress_iter(range(im_in.shape[3]), progress, desc='Step 18B - Apply Cyto Markers'):
                 idx = stain_complete_df.index[c]
                 marker = stain_complete_df.loc[idx, 'Marker']
                 if marker in cyto_markers:
@@ -6383,7 +6337,7 @@ def segment_cytoplasm(
                     mask=combined_mask,
                 )
             else:
-                distance = _ndi.distance_transform_edt(
+                distance = ndi.distance_transform_edt(
                     combined_mask, sampling=[r_zZ, r_zY, r_zX]
                 )
                 im_out = watershed(
@@ -6524,15 +6478,12 @@ def assign_channel_labels(
     im_segmentation_stack : dict
         Updated dict with per-marker keys added.
     """
-    if progress is None:
-        def progress(x, **kw): return x
-
     if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index)):
         # LD mode: label each channel by masking the Nuclei label array with
         # the per-channel threshold so LIVE and DEAD cells are separately identified.
         im_in = im_final_stack['Threshold image'].copy()
         im_segmentation_stack = dict(im_segmentation_stack)
-        for c in progress(range(im_in.shape[3]), desc='Step 20 - Assign Labels To Channels'):
+        for c in _progress_iter(range(im_in.shape[3]), progress, desc='Step 20 - Assign Labels To Channels'):
             cond = stain_df.index[c]
             im_segmentation_stack[cond] = (im_in[:, :, :, c] > 0) * im_segmentation_stack['Nuclei']
         return im_segmentation_stack
@@ -6540,7 +6491,7 @@ def assign_channel_labels(
     im_in = im_final_stack['Threshold image'].copy()
     im_segmentation_stack = dict(im_segmentation_stack)
 
-    for c in progress(range(im_in.shape[3]), desc='Step 20 - Assign Labels To Channels'):
+    for c in _progress_iter(range(im_in.shape[3]), progress, desc='Step 20 - Assign Labels To Channels'):
         cond = stain_df.index[c]
         if cond in ('NUCLEI', 'CYTOPLASM', 'PCM'):
             continue
@@ -6598,9 +6549,6 @@ def view_processing_results(
     viewer_1 : napari.Viewer or None
         Segmentation viewer (None if no NUCLEI/CYTOPLASM channel).
     """
-    if progress is None:
-        def progress(x, **kw): return x
-
     r_X, r_Y, r_Z = r_xyz
     r_zX, r_zY, r_zZ = r_zxyz
     scale_zoom = (r_zZ, r_zY, r_zX)
@@ -6621,7 +6569,7 @@ def view_processing_results(
     # added — napari keeps its own reference, so nothing disappears from the
     # viewer, but the dict stops double-holding these large arrays.
     _stages_freed_after_view = ('Original image', 'Zoomed image', 'Denoised image', 'Adjusted image')
-    for stage_key, stage_prefix, scale in progress(stages, desc='Step 22A - Add Layers To Viewer 0'):
+    for stage_key, stage_prefix, scale in _progress_iter(stages, progress, desc='Step 22A - Add Layers To Viewer 0'):
         for c in range(im_thr.shape[3]):
             idx = stain_complete_df.index[c]
             marker = stain_complete_df.loc[idx, 'Marker']
@@ -6638,7 +6586,7 @@ def view_processing_results(
     # Connected-component "islands" of the per-channel threshold mask, so
     # under-segmented/missed nuclei (broken-up or absent islands) are easy to
     # spot against the intensity layers above.
-    for c in progress(range(im_thr.shape[3]), desc='Step 22A2 - Add Threshold Islands To Viewer 0'):
+    for c in _progress_iter(range(im_thr.shape[3]), progress, desc='Step 22A2 - Add Threshold Islands To Viewer 0'):
         idx = stain_complete_df.index[c]
         marker = stain_complete_df.loc[idx, 'Marker']
         islands, _ = ndi.label(im_thr[:, :, :, c] > 0)
@@ -6668,7 +6616,7 @@ def view_processing_results(
                 name=f'EQ {idx} ({marker})', colormap=color,
                 blending='additive', scale=scale_zoom,
             )
-        for c in progress(range(len(stain_complete_df.index)), desc='Step 22B - Add Labels To Viewer 1'):
+        for c in _progress_iter(range(len(stain_complete_df.index)), progress, desc='Step 22B - Add Labels To Viewer 1'):
             idx = stain_complete_df.index[c]
             marker = stain_complete_df.loc[idx, 'Marker']
             if idx == 'NUCLEI' and 'NUCLEI' not in stain_df.index:
@@ -6880,12 +6828,8 @@ def build_vtk_volumes(
     PCM_vol = np.zeros((pcm_max + 1,))
     PCM_coord = np.zeros((pcm_max + 1, 3))
 
-    iter_ = (
-        progress(range(1, nuc_max + 1), desc='Step 30 - Build VTK Volumes')
-        if progress else range(1, nuc_max + 1)
-    )
     k = 0
-    for j in iter_:
+    for j in _progress_iter(range(1, nuc_max + 1), progress, desc='Step 30 - Build VTK Volumes'):
         clear_output(wait=True)
         print(f'NUCLEI {j} / {nuc_max}')
 
@@ -7042,15 +6986,12 @@ def export_marker_stl(
         float(r_X / zoom_factors[2]),
     )
 
-    iter_ = (
-        progress(
-            enumerate(stain_complete_df.index),
-            total=len(stain_complete_df.index),
-            desc='Step 31 - Export Marker STL',
-        )
-        if progress else enumerate(stain_complete_df.index)
-    )
-    for c, _marker in iter_:
+    for c, _marker in _progress_iter(
+        enumerate(stain_complete_df.index),
+        progress,
+        desc='Step 31 - Export Marker STL',
+        total=len(stain_complete_df.index),
+    ):
         if stain_complete_df.index[c] in ('NUCLEI', 'CYTOPLASM', 'PCM'):
             continue
         row = stain_complete_df.iloc[c]
@@ -7123,11 +7064,9 @@ def export_fea_mesh(
     # --- Step 2: assign elements to nucleus labels ---
     cell_elements = {c: [] for c in range(1, nuc_max + 1)}
 
-    iter_ = (
-        progress(enumerate(elems), total=len(elems), desc='Step 33B - Assign Elements To Cells')
-        if progress else enumerate(elems)
-    )
-    for ce, x in iter_:
+    for ce, x in _progress_iter(
+        enumerate(elems), progress, desc='Step 33B - Assign Elements To Cells', total=len(elems)
+    ):
         coord = np.int16(np.round(np.mean(nodes[x], 0), 0))
         step = 0
         taken = False
@@ -7150,10 +7089,7 @@ def export_fea_mesh(
 
     # --- Step 3: write element sets and finalise .inp ---
     with open("FE_segmentation.inp", "a") as f:
-        for c in (
-            progress(range(1, nuc_max + 1), desc='Step 33C - Write Element Sets')
-            if progress else range(1, nuc_max + 1)
-        ):
+        for c in _progress_iter(range(1, nuc_max + 1), progress, desc='Step 33C - Write Element Sets'):
             f.write(f"*Elset, elset=cell{c}\n")
             j = 1
             for t in range(1, len(cell_elements[c])):
@@ -7169,10 +7105,7 @@ def export_fea_mesh(
 
     out_path = str(_Path(input_file).stem) + "_FEA.inp"
     with open(out_path, "w") as f:
-        for line in (
-            progress(lines, desc='Step 33D - Write Final INP')
-            if progress else lines
-        ):
+        for line in _progress_iter(lines, progress, desc='Step 33D - Write Final INP'):
             if line == "*NODE\n":
                 f.write("*PART, name=Part-1\n")
             f.write(line)

@@ -10,6 +10,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 - **Profile-aware imports** (`helpers/notebook_setup_helpers.py`): `load_nuclei_notebook_setup()` and `load_ld_notebook_setup()` load only the dependencies each workflow needs, avoiding unnecessary overhead.
 - **3D Image Processing**: normalization, resampling to isotropic voxel size, denoising, thresholding, and watershed / StarDist / Cellpose 3D segmentation.
 - **Interactive ROI selection** (nuclei workflow): set `interactive_roi = True` to drag a rectangle in a napari window instead of typing pixel coordinates.
+- **Automatic contrast**: set `automatic_contrast = True` to skip the interactive napari contrast/gamma viewer and pick `Cont_min`/`Cont_max` per channel automatically from the histogram (one above the peak, up to the 99th percentile intensity).
 - **LD union labeling**: when no dedicated NUCLEI channel is present, `segment_nuclei()` automatically falls back to merging all threshold channels via bitwise OR and running connected-component labeling to identify individual cells; the same watershed / Cellpose / StarDist method choice as the nuclei workflow applies to the merged mask.
 - **Napari Integration**: interactive visualization and manual correction at each processing step.
 - **Quantification & Export**: per-cell marker statistics, spatial distributions, Excel reports, 3D mesh export (VTK/STL/INP), and — nuclei workflow only — per-nucleus KDE distribution plots and a PDF report.
@@ -168,7 +169,7 @@ Cell 1 loads all required imports in one step via `load_nuclei_notebook_setup()`
 - `prepare_and_preview()` builds the image stack and the `stain_df` working table, and opens a napari viewer for channel inspection.
 
 ### 4. Setup & Per-Channel Contrast/Gamma
-- `prepare_stain_settings()` loads or creates a CSV of per-channel contrast/gamma settings — reused automatically if a matching file exists for `name_setup`, otherwise set interactively in napari.
+- `prepare_stain_settings()` loads or creates a CSV of per-channel contrast/gamma settings — reused automatically if a matching file exists for `name_setup`, otherwise set interactively in napari, or picked automatically per channel from the histogram (peak+1 to the 99th percentile, no viewer) if `automatic_contrast = True`.
 
 ### 5. Image Preprocessing
 - **Normalization**: channels normalized to [0, 255] via `run_normalize()`.
@@ -233,7 +234,7 @@ Cell 1 loads all required imports in one step via `load_ld_notebook_setup()`, wh
 - Adjust `ROI` and `scale_factor` to crop or downsample for faster iteration. (Interactive ROI selection is currently a nuclei-workflow-only feature.)
 
 ### 5. Setup & Per-Channel Contrast/Gamma
-- `prepare_stain_settings()` loads or creates a CSV of per-channel contrast/gamma settings — reused automatically if a matching file exists for `name_setup`, otherwise set interactively in napari.
+- `prepare_stain_settings()` loads or creates a CSV of per-channel contrast/gamma settings — reused automatically if a matching file exists for `name_setup`, otherwise set interactively in napari, or picked automatically per channel from the histogram (peak+1 to the 99th percentile, no viewer) if `automatic_contrast = True`.
 
 ### 6. Image Preprocessing
 - **Normalization**: channels normalized to [0, 255] via `run_normalize()`.
