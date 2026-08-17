@@ -6665,6 +6665,7 @@ def export_nucleus_vtk_crop(
     stain_df,
     input_file,
     r_zxyz=(1.0, 1.0, 1.0),
+    zoom_factors=(1.0, 1.0, 1.0),
     size=90,
 ):
     """
@@ -6689,13 +6690,23 @@ def export_nucleus_vtk_crop(
         Physical voxel sizes in micrometers on the working (post-zoom) grid.
         Used as the ImageData spacing so the sub-volume isn't rendered as
         unit cubes in ParaView, which stretches/squashes it along Z.
+    zoom_factors : tuple of float [Z, Y, X]
+        Zoom factors applied when resampling to the working grid (includes
+        `scale_factor`, see Cell 3). `size` is defined in voxels at
+        zoom_factors=[1,1,1]; the per-axis crop is scaled by zoom_factors so
+        the exported sub-volume always covers the same physical region
+        regardless of scale_factor, instead of shrinking/growing with it.
     size : int
-        Side length of the cubic export volume in voxels (default 90).
+        Side length of the export volume in voxels at zoom_factors=[1,1,1]
+        (default 90).
     """
     import pyvista as pv
     from pathlib import Path as _Path
 
     r_zX, r_zY, r_zZ = r_zxyz
+    size_z = max(1, int(round(size * zoom_factors[0])))
+    size_y = max(1, int(round(size * zoom_factors[1])))
+    size_x = max(1, int(round(size * zoom_factors[2])))
 
     nuc_vol = im_segmentation_stack['Nuclei']
     mask = nuc_vol == nuc_label
@@ -6709,11 +6720,11 @@ def export_nucleus_vtk_crop(
     cz, cy, cx = np.round(coords.mean(axis=0)).astype(int)
     print(f"Nucleus {nuc_label} - centroid  Z={cz}  Y={cy}  X={cx}")
 
-    half = size // 2
+    half_z, half_y, half_x = size_z // 2, size_y // 2, size_x // 2
     Zmax, Ymax, Xmax = nuc_vol.shape
-    z0d, z1d = cz - half, cz + half
-    y0d, y1d = cy - half, cy + half
-    x0d, x1d = cx - half, cx + half
+    z0d, z1d = cz - half_z, cz - half_z + size_z
+    y0d, y1d = cy - half_y, cy - half_y + size_y
+    x0d, x1d = cx - half_x, cx - half_x + size_x
 
     z0c, z1c = max(0, z0d), min(Zmax, z1d)
     y0c, y1c = max(0, y0d), min(Ymax, y1d)
@@ -6724,7 +6735,7 @@ def export_nucleus_vtk_crop(
     xp0, xp1 = x0c - x0d, x0c - x0d + (x1c - x0c)
 
     def _crop3d(vol):
-        out = np.zeros((size, size, size), dtype=vol.dtype)
+        out = np.zeros((size_z, size_y, size_x), dtype=vol.dtype)
         out[zp0:zp1, yp0:yp1, xp0:xp1] = vol[z0c:z1c, y0c:y1c, x0c:x1c]
         return out
 
@@ -6741,7 +6752,7 @@ def export_nucleus_vtk_crop(
             marker_crops[ch_name] = _crop3d(eq_img[:, :, :, c_idx]).astype(np.float32)
 
     grid = pv.ImageData()
-    grid.dimensions = (size, size, size)
+    grid.dimensions = (size_x, size_y, size_z)
     grid.origin = (float(x0d), float(y0d), float(z0d))
     grid.spacing = (float(r_zX), float(r_zY), float(r_zZ))
     grid.point_data['Nuclei_label'] = nuclei_crop.ravel()
@@ -6751,7 +6762,7 @@ def export_nucleus_vtk_crop(
 
     out_path = str(_Path(input_file).stem + f"_nuc{nuc_label}_3Dcrop.vtk")
     grid.save(out_path)
-    print(f"Saved: {out_path}  ({size}^3 voxels, {2 + len(marker_crops)} channels)")
+    print(f"Saved: {out_path}  ({size_z}x{size_y}x{size_x} voxels, {2 + len(marker_crops)} channels)")
 
 
 # ---------------------------------------------------------------------------
