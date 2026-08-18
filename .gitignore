@@ -8,7 +8,6 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.docx
 .git*
 .claude/
 
