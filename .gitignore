@@ -9,6 +9,8 @@ __pycache__/
 *.pyo
 *.pyd
 *.docx
+.git*
+.claude/
 
 # Jupyter temporary files
 .ipynb_checkpoints/
