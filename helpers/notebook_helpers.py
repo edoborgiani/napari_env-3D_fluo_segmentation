@@ -510,6 +510,13 @@ def prepare_and_preview(img, nuclei_diameter, cell_diameter,
     Combines ``prepare_image_stack``, ``build_stain_dataframe``, and
     ``view_original_channels`` into a single call.
 
+    Any real image channel with no corresponding entry in *stain_dict* is
+    dropped from ``im_final_stack['Original image']`` here (and therefore
+    from every stage derived from it later in the pipeline), and the
+    remaining channels are reordered to match *stain_df*'s row order. This
+    keeps the invariant, relied on throughout the rest of the pipeline, that
+    channel ``c`` of the image corresponds to row ``c`` of ``stain_df``.
+
     Parameters
     ----------
     r_xyz : tuple of float (r_X, r_Y, r_Z), optional
@@ -527,6 +534,18 @@ def prepare_and_preview(img, nuclei_diameter, cell_diameter,
         prepare_image_stack(img, nuclei_diameter, cell_diameter)
     )
     stain_df = build_stain_dataframe(stain_dict, file_meta)
+
+    channel_indices = stain_df['Channel_index'].to_numpy()
+    n_raw_channels = im_final_stack['Original image'].shape[3]
+    if len(channel_indices) != n_raw_channels:
+        laser_order = file_meta.get("channels") or []
+        dropped = [i for i in range(n_raw_channels) if i not in channel_indices]
+        dropped_names = [laser_order[i] if i < len(laser_order) else i for i in dropped]
+        print(f"[prepare_and_preview] Channel(s) not listed in stain_dict, "
+              f"dropped from analysis: {dropped_names}")
+    im_final_stack['Original image'] = im_final_stack['Original image'][..., channel_indices]
+
+    stain_df = stain_df.drop(columns='Channel_index')
     viewer = view_original_channels(im_final_stack, stain_df, napari_module, r_xyz=r_xyz, progress=progress)
     return (im_final_stack, nuclei_radius, cell_radius, nuclei_volume, cell_volume,
             stain_df, viewer)
@@ -5389,6 +5408,14 @@ def build_stain_dataframe(stain_dict: dict, file_meta: dict) -> "pd.DataFrame":
     a DataFrame with columns ``['Marker', 'Laser', 'Color']``, then sorts rows
     to match the channel order reported by *file_meta*.
 
+    A ``'Channel_index'`` column is kept (rather than dropped) holding each
+    condition's real position in *file_meta*'s channel list, so callers can
+    align the raw image's channel axis to this table's row order — including
+    dropping any real channel that has no entry in *stain_dict*. If a
+    ``Laser`` value doesn't match any channel name in *file_meta*, that is a
+    typo/misconfiguration (not a "missing channel") and raises rather than
+    silently mis-sorting the row.
+
     Parameters
     ----------
     stain_dict : dict
@@ -5399,7 +5426,8 @@ def build_stain_dataframe(stain_dict: dict, file_meta: dict) -> "pd.DataFrame":
     Returns
     -------
     stain_df : pd.DataFrame
-        Sorted staining table indexed by condition name.
+        Sorted staining table indexed by condition name, with a
+        ``'Channel_index'`` column giving each row's real channel position.
     """
     norm = {
         k.upper(): [item.upper() if isinstance(item, str) else item for item in v]
@@ -5410,8 +5438,18 @@ def build_stain_dataframe(stain_dict: dict, file_meta: dict) -> "pd.DataFrame":
 
     laser_order = file_meta.get("channels") or []
     order_map = {name.strip().upper(): i for i, name in enumerate(laser_order)}
-    stain_df['order'] = stain_df['Laser'].map(order_map)
-    stain_df = stain_df.sort_values('order').drop(columns='order')
+    stain_df['Channel_index'] = stain_df['Laser'].map(order_map)
+
+    unmatched = stain_df[stain_df['Channel_index'].isna()]
+    if not unmatched.empty:
+        raise ValueError(
+            "stain_dict has Laser/channel name(s) that don't match any channel "
+            f"reported by the file: {dict(zip(unmatched.index, unmatched['Laser']))}. "
+            f"Available channels: {laser_order}"
+        )
+
+    stain_df['Channel_index'] = stain_df['Channel_index'].astype(int)
+    stain_df = stain_df.sort_values('Channel_index')
 
     if 'NUCLEI' not in stain_df.index:
         print('[build_stain_dataframe] Warning: no NUCLEI condition found!')
@@ -6889,7 +6927,7 @@ def build_vtk_volumes(
         mr.saveMesh(mesh_stl, _pcm_stl_path)
         mesh_PCM = pv.read(_pcm_stl_path)
 
-        if mesh_cyto.volume > 0.0:
+        if mesh_cyto.volume > 0.0 and mesh_PCM.volume > 0.0:
             mesh_cyto.decimate(target_reduction=0.8, inplace=True)
             mesh_PCM.decimate(target_reduction=0.8, inplace=True)
 
