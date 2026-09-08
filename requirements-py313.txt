@@ -11,9 +11,17 @@
 # - tensorflow: 2.16.x only ships wheels up to Python 3.12; the first release
 #   with cp313 wheels is 2.20.0, so the pin moves to tensorflow>=2.20.
 #
-# Everything else in this file (scipy, opencv-python, aicsimageio, tetgen,
-# meshlib, simpleitk, etc.) already publishes Python 3.13 wheels at the
-# versions/floors requirements.txt pins, so no other changes were needed.
+# Everything else in this file (scipy, opencv-python, tetgen, meshlib,
+# simpleitk, etc.) already publishes Python 3.13 wheels at the
+# versions/floors requirements.txt pins, so no other changes were needed --
+# EXCEPT one transitive pin: aicsimageio==4.14.0 unconditionally requires
+# lxml<5, and lxml<5 has no Python 3.13 wheels (it fails to build from
+# source on Windows without a full MSVC toolchain). Install this file with
+# the companion overrides-py313.txt to fix that -- see that file for why
+# the override is safe:
+#   uv pip install -r requirements-py313.txt --override overrides-py313.txt
+# (plain pip has no equivalent override mechanism -- this requires uv)
+#
 # This variant has not been run end-to-end -- please report issues.
 
 # Core / visualization
