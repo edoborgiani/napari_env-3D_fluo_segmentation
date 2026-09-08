@@ -34,15 +34,13 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 
 ### Prerequisites
 
-- **Python 3.10 or 3.11.** `tensorflow>=2.16,<2.17` and the `numpy==1.26.4` / `scipy==1.14.1` pins in `requirements.txt` do not support Python 3.13+, and 3.12 support is inconsistent across the pinned versions — 3.10/3.11 is the tested range (the `tetgen` pin in `requirements.txt` and the Apple Silicon `conda` example below both key off Python 3.10). Check your version with `python --version` (Windows/macOS) or `python3 --version` (macOS/Linux).
-- **Git**, to clone the repository.
+- **Python 3.10, 3.11, or 3.13.** `requirements.txt` pins `numpy`/`tensorflow`/`lxml` per Python version via markers, so one file covers all three (3.10/3.11 is the most tested range; 3.12 support is inconsistent across the pinned versions; **3.13 is the newest supported — avoid 3.14+, which this repo hasn't been updated for**). Check your version with `python --version` (Windows/macOS) or `python3 --version` (macOS/Linux). Don't have it? Download from [python.org/downloads](https://www.python.org/downloads/).
+- **Git**, to clone the repository. Don't have it? Download from [git-scm.com/downloads](https://git-scm.com/downloads).
+- **[`uv`](https://github.com/astral-sh/uv)**, used in every "Install dependencies" step below instead of plain `pip`. Two independent reasons:
+  - **Speed:** `requirements.txt` pulls in several large, dependency-heavy packages (napari, TensorFlow, PyTorch-based Cellpose, VTK/PyVista, SimpleITK). Plain `pip` can take a long time to resolve and download all of them; `uv` resolves and installs the same packages dramatically faster.
+  - **Correctness on Python 3.13:** `aicsimageio==4.14.0` unconditionally pins `lxml<5`, which has no Python 3.13 wheels. `requirements.txt` raises that floor for 3.13, but only `uv`'s `--override` flag can force it past aicsimageio's declared cap (plain `pip` has no equivalent — it would try to build old `lxml` from source and fail without a full C++ toolchain).
 
-> **Tip — faster installs:** `requirements.txt` pulls in several large, dependency-heavy packages (napari, TensorFlow, PyTorch-based Cellpose, VTK/PyVista, SimpleITK). Plain `pip` can take a long time to resolve and download all of them. Installing [`uv`](https://github.com/astral-sh/uv) first and using it in place of `pip install` (same `requirements.txt`, no other changes needed) resolves and installs the same packages dramatically faster:
-> ```
-> pip install uv
-> uv pip install -r requirements.txt
-> ```
-> The plain `pip install -r requirements.txt` commands below still work exactly the same if you'd rather not add `uv`.
+  Install it once with `pip install uv`. On Python 3.10/3.11/3.12 the `--override` flag used below is a no-op (nothing to override), so the exact same command works unchanged on every supported Python version.
 
 ### Windows
 
@@ -60,13 +58,14 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    .venv\Scripts\Activate.ps1
    ```
 
-   If PowerShell reports that `python` is not recognized, use the [Python Launcher](https://docs.python.org/3/using/windows.html#launcher) instead — it ships with the official python.org installer even when `python` isn't on `PATH`: `py -3.11 -m venv .venv`.
+   If PowerShell reports that `python` is not recognized, use the [Python Launcher](https://docs.python.org/3/using/windows.html#launcher) instead — it ships with the official python.org installer even when `python` isn't on `PATH`: `py -3.11 -m venv .venv` (or `py -3.13 -m venv .venv`).
 
    > If activation fails with a message about running scripts being disabled on this system, PowerShell's execution policy is blocking it. Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once (in the same PowerShell window), confirm with `Y`, then re-run the activation command above.
 
 3. **Install dependencies**
    ```powershell
-   pip install -r requirements.txt
+   pip install uv
+   uv pip install -r requirements.txt --override requirements.txt
    ```
 
 4. **Launch Jupyter**
@@ -93,7 +92,8 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 
 3. **Install dependencies**
    ```bash
-   pip install -r requirements.txt
+   pip install uv
+   uv pip install -r requirements.txt --override requirements.txt
    ```
 
 4. **Launch Jupyter**
@@ -106,7 +106,8 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 > ```bash
 > conda create -n napari-fluo python=3.10
 > conda activate napari-fluo
-> pip install -r requirements.txt
+> pip install uv
+> uv pip install -r requirements.txt --override requirements.txt
 > ```
 > Then proceed directly to step 4.
 
@@ -130,7 +131,8 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 
 3. **Install dependencies**
    ```bash
-   pip install -r requirements.txt
+   pip install uv
+   uv pip install -r requirements.txt --override requirements.txt
    ```
 
 4. **Launch Jupyter**

@@ -1,16 +1,22 @@
+# Works for Python 3.10-3.13: numpy/tensorflow/lxml below are pinned
+# per Python version via markers, since their older pins have no Python
+# 3.13 wheels. Install with (uv required -- see the lxml note below for why):
+#   uv pip install -r requirements.txt --override requirements.txt
+#
 # Core / visualization
 napari[all]
 # Pinned: napari/aicsimageio only require a lower bound on dask, but dask
 # cuts new releases very often, so leaving it unpinned makes pip's resolver
 # backtrack through hundreds of dask versions. Pinning skips that search.
 dask[array]==2026.7.1
-# Pinned: tensorflow<2.17 hard-requires numpy<2.0.0, but the *latest*
-# scipy/opencv-python releases now require numpy>=2.0 with no upper bound
-# elsewhere in this file. Left unpinned, pip has to backtrack through both
-# packages' full release histories to discover a numpy<2.0-compatible
-# version of each. These three pins are mutually compatible and skip that
-# search entirely.
-numpy==1.26.4
+# Python <3.13: tensorflow<2.17 hard-requires numpy<2.0.0, and pinning
+# numpy==1.26.4 here (rather than leaving it unpinned) skips pip having to
+# backtrack through scipy/opencv-python's full release histories to find a
+# numpy<2.0-compatible version of each.
+# Python >=3.13: numpy<2.1 and tensorflow<2.20 ship no Python 3.13 wheels at
+# all, so both floors move up together instead.
+numpy==1.26.4; python_version < "3.13"
+numpy>=2.1; python_version >= "3.13"
 scipy==1.14.1
 scikit-image
 matplotlib
@@ -27,9 +33,19 @@ opencv-python==4.10.0.84
 # an alternative. 4.14.0 has no dask ceiling and includes the nd2 extra.
 aicsimageio[nd2]==4.14.0
 nd2reader
+# aicsimageio==4.14.0 unconditionally requires lxml<5, but lxml<5 has no
+# Python 3.13 wheels and fails to build from source on Windows without a
+# full MSVC toolchain. ome-types -- aicsimageio's own lxml consumer --
+# declares lxml>=5.3 as correct for Python 3.13, so raising the floor here
+# is safe; it's aicsimageio's cap that's stale, not a real incompatibility.
+# This line must be passed as BOTH -r and --override (see the command at the
+# top of this file) so it takes precedence over that cap on 3.13.
+lxml<5,>=4.6; python_version < "3.13"
+lxml>=5.3; python_version >= "3.13"
 
 # Segmentation models
-tensorflow>=2.16,<2.17
+tensorflow>=2.16,<2.17; python_version < "3.13"
+tensorflow>=2.20; python_version >= "3.13"
 csbdeep
 stardist
 cellpose>=3.0
