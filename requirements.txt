@@ -1,6 +1,8 @@
-# Works for Python 3.10-3.13: numpy/tensorflow/lxml below are pinned
-# per Python version via markers, since their older pins have no Python
-# 3.13 wheels. Install with (uv required -- see the lxml note below for why):
+# Works for Python 3.10-3.13 (3.10/3.11 most tested; 3.12 and 3.13 verified
+# against current PyPI wheel availability but less exercised in practice):
+# numpy/tensorflow/lxml below are pinned per Python version via markers,
+# since their <3.13 pins have no Python 3.13 wheels. Install with (uv
+# required -- see the lxml note below for why):
 #   uv pip install -r requirements.txt --override requirements.txt
 #
 # Core / visualization

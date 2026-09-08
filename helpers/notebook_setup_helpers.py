@@ -19,6 +19,24 @@ DEFAULT_PIP_PACKAGES = [
     "reportlab",
 ]
 
+# Kept in sync with the python_version markers in requirements.txt.
+SUPPORTED_PYTHON_VERSIONS = {(3, 10), (3, 11), (3, 12), (3, 13)}
+
+
+def check_python_version() -> None:
+    """Print whether the active interpreter matches a version requirements.txt is pinned for."""
+    version = sys.version_info[:2]
+    version_str = f"{version[0]}.{version[1]}"
+    if version in SUPPORTED_PYTHON_VERSIONS:
+        print(f"Python {version_str} detected -- supported by requirements.txt.")
+    else:
+        supported_str = ", ".join(f"{major}.{minor}" for major, minor in sorted(SUPPORTED_PYTHON_VERSIONS))
+        print(
+            f"Warning: Python {version_str} detected. requirements.txt is pinned for "
+            f"{supported_str} -- other versions may fail to install or behave "
+            "unexpectedly. See README.md Prerequisites."
+        )
+
 
 def get_tetgen_requirement() -> str:
     """Return a tetgen requirement compatible with the current Python version."""
@@ -151,6 +169,7 @@ def load_common_imports(
 
 def load_ld_notebook_setup(enable_napari_interactive: bool = True) -> dict[str, Any]:
     """Load the LD notebook imports in one step."""
+    check_python_version()
     try:
         from IPython import get_ipython
 
@@ -175,6 +194,7 @@ def load_ld_notebook_setup(enable_napari_interactive: bool = True) -> dict[str, 
 
 def load_nuclei_notebook_setup(enable_napari_interactive: bool = True) -> dict[str, Any]:
     """Load the nuclei notebook imports in one step."""
+    check_python_version()
     try:
         from IPython import get_ipython
 

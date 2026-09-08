@@ -34,7 +34,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 
 ### Prerequisites
 
-- **Python 3.10, 3.11, or 3.13.** `requirements.txt` pins `numpy`/`tensorflow`/`lxml` per Python version via markers, so one file covers all three (3.10/3.11 is the most tested range; 3.12 support is inconsistent across the pinned versions; **3.13 is the newest supported — avoid 3.14+, which this repo hasn't been updated for**). Check your version with `python --version` (Windows/macOS) or `python3 --version` (macOS/Linux). Don't have it? Download from [python.org/downloads](https://www.python.org/downloads/).
+- **Python 3.10, 3.11, 3.12, or 3.13.** `requirements.txt` pins `numpy`/`tensorflow`/`lxml` per Python version via markers, so one file covers all four (3.10/3.11 is the most tested range; 3.12/3.13 have been checked against current PyPI wheel availability but are less exercised in practice; **3.13 is the newest supported — avoid 3.14+, which this repo hasn't been updated for**). Check your version with `python --version` (Windows/macOS) or `python3 --version` (macOS/Linux). Don't have it? Download from [python.org/downloads](https://www.python.org/downloads/).
 - **Git**, to clone the repository. Don't have it? Download from [git-scm.com/downloads](https://git-scm.com/downloads).
 - **[`uv`](https://github.com/astral-sh/uv)**, used in every "Install dependencies" step below instead of plain `pip`. Two independent reasons:
   - **Speed:** `requirements.txt` pulls in several large, dependency-heavy packages (napari, TensorFlow, PyTorch-based Cellpose, VTK/PyVista, SimpleITK). Plain `pip` can take a long time to resolve and download all of them; `uv` resolves and installs the same packages dramatically faster.
