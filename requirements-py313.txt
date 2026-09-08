@@ -1,0 +1,62 @@
+# Python 3.13 variant of requirements.txt, for use with
+# Fluo_3D_nuc_seg_v1.6_py313.ipynb. Everything below is identical to
+# requirements.txt except the two pins called out here:
+#
+# - numpy: 1.26.4 has no Python 3.13 wheels (numpy only ships cp313 wheels
+#   from 2.1.0 onward), so it is bumped to numpy>=2.1. Its floor of <2.0 in
+#   requirements.txt existed solely because tensorflow<2.17 hard-requires
+#   numpy<2.0 -- moot here since tensorflow itself has to move for 3.13 (see
+#   below), and scipy==1.14.1 / opencv-python==4.10.0.84 / aicsimageio==4.14.0
+#   all already accept numpy>=2 with no upper bound.
+# - tensorflow: 2.16.x only ships wheels up to Python 3.12; the first release
+#   with cp313 wheels is 2.20.0, so the pin moves to tensorflow>=2.20.
+#
+# Everything else in this file (scipy, opencv-python, aicsimageio, tetgen,
+# meshlib, simpleitk, etc.) already publishes Python 3.13 wheels at the
+# versions/floors requirements.txt pins, so no other changes were needed.
+# This variant has not been run end-to-end -- please report issues.
+
+# Core / visualization
+napari[all]
+# Pinned: napari/aicsimageio only require a lower bound on dask, but dask
+# cuts new releases very often, so leaving it unpinned makes pip's resolver
+# backtrack through hundreds of dask versions. Pinning skips that search.
+dask[array]==2026.7.1
+# Bumped for Python 3.13 wheel availability -- see header comment above.
+numpy>=2.1
+scipy==1.14.1
+scikit-image
+matplotlib
+Pillow
+
+# Notebook environment
+jupyter
+
+# Image I/O
+opencv-python==4.10.0.84
+# Pinned: aicsimageio 4.12.1/4.13.0 cap dask at <=2023.5.0, which conflicts
+# with the dask pin above and sent pip walking back through aicsimageio's
+# whole history (down to versions that predate the 'nd2' extra) looking for
+# an alternative. 4.14.0 has no dask ceiling and includes the nd2 extra.
+aicsimageio[nd2]==4.14.0
+nd2reader
+
+# Segmentation models
+# Bumped for Python 3.13 wheel availability -- see header comment above.
+tensorflow>=2.20
+csbdeep
+stardist
+cellpose>=3.0
+
+# 3D processing / meshing
+simpleitk
+pyvista>=0.43
+meshio
+tetgen<0.7; python_version < "3.10"
+tetgen>=0.7; python_version >= "3.10"
+meshlib>=3.0.6
+
+# Data / reporting
+pandas
+xlsxwriter
+reportlab
