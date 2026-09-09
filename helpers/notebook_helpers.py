@@ -57,6 +57,7 @@ __all__ = [
     "plot_spatial_distributions",
     "prepare_stain_settings",
     "print_population_summary",
+    "read_file_metadata",
     "remove_small_island_labels",
     "remove_small_islands",
     "resample_to_isotropic",
@@ -72,6 +73,59 @@ __all__ = [
     "voxel_volume",
     "watershed_nuclei",
 ]
+
+
+def read_file_metadata(input_file: str, meta) -> dict:
+    """Return file metadata (date, channel names) for nd2, czi, tif, or other formats.
+
+    Parameters
+    ----------
+    input_file : str
+        Path to the microscopy file.
+    meta : AICSImage
+        Already-opened AICSImage object for the file.
+
+    Returns
+    -------
+    dict with keys:
+        'date'     : acquisition date string, or None if not available
+        'channels' : list of channel name strings
+    """
+    from pathlib import Path as _Path
+    ext = _Path(input_file).suffix.lower()
+
+    if ext == '.nd2':
+        try:
+            from nd2reader import ND2Reader
+            with ND2Reader(input_file) as nd2:
+                date = nd2.metadata.get("date")
+                channels = nd2.metadata.get("channels")
+            return {"date": date, "channels": channels}
+        except Exception as exc:
+            print(f"[read_file_metadata] nd2reader fallback: {exc}")
+
+    if ext == '.czi':
+        channels = list(meta.channel_names)
+        date = None
+        try:
+            import xml.etree.ElementTree as ET
+            xml_meta = meta.metadata  # ElementTree Element for CZI
+            for xpath in [
+                "./Metadata/Information/Document/CreationDate",
+                "./Information/Document/CreationDate",
+                "./Metadata/Experiment/ExperimentBlocks/AcquisitionBlock/AcquisitionModeSetup/CreationDate",
+            ]:
+                elem = xml_meta.find(xpath)
+                if elem is not None and elem.text:
+                    date = elem.text.strip()
+                    break
+        except Exception:
+            pass
+        return {"date": date, "channels": channels}
+
+    # Generic fallback (tif, tiff, lif, etc.) — AICSImage provides channel_names
+    channels = list(meta.channel_names)
+    return {"date": None, "channels": channels}
 
 
 def set_notebook_context(**kwargs):
