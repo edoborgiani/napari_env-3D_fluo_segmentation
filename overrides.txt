@@ -1,0 +1,15 @@
+# uv override file -- use with:
+#   uv pip install -r requirements.txt --override overrides.txt
+#
+# Forces the lxml floor past aicsimageio==4.14.0's unconditional lxml<5 pin
+# on Python 3.13 (see the lxml comment in requirements.txt for why this is
+# safe). Kept as a separate, minimal file -- rather than reusing
+# requirements.txt itself as the override -- deliberately: an earlier version
+# of this setup passed requirements.txt as its own override, and on at least
+# one real install that caused napari[all] to install without a Qt binding
+# (PyQt6 missing at runtime) even though nothing else about the resolution
+# looked wrong. The extras-bearing lines in requirements.txt (napari[all],
+# aicsimageio[nd2], dask[array]) are deliberately NOT repeated here so they
+# can't be affected by whatever caused that.
+lxml<5,>=4.6; python_version < "3.13"
+lxml>=5.3; python_version >= "3.13"

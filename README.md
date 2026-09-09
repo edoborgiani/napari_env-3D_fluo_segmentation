@@ -21,6 +21,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 ├── Fluo_3D_nuc_seg_v1.6.ipynb      # Nuclei segmentation — latest recommended version
 ├── Fluo_3D_LD_seg_v1.2.ipynb       # Live/Dead segmentation — latest recommended version
 ├── requirements.txt                # Python dependencies
+├── overrides.txt                   # uv --override file (see Prerequisites)
 ├── README.md                       # This file
 └── helpers/
     ├── __init__.py
@@ -65,7 +66,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 3. **Install dependencies**
    ```powershell
    pip install uv
-   uv pip install -r requirements.txt --override requirements.txt
+   uv pip install -r requirements.txt --override overrides.txt
    ```
 
 4. **Launch Jupyter**
@@ -93,7 +94,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 3. **Install dependencies**
    ```bash
    pip install uv
-   uv pip install -r requirements.txt --override requirements.txt
+   uv pip install -r requirements.txt --override overrides.txt
    ```
 
 4. **Launch Jupyter**
@@ -107,7 +108,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 > conda create -n napari-fluo python=3.10
 > conda activate napari-fluo
 > pip install uv
-> uv pip install -r requirements.txt --override requirements.txt
+> uv pip install -r requirements.txt --override overrides.txt
 > ```
 > Then proceed directly to step 4.
 
@@ -132,7 +133,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 3. **Install dependencies**
    ```bash
    pip install uv
-   uv pip install -r requirements.txt --override requirements.txt
+   uv pip install -r requirements.txt --override overrides.txt
    ```
 
 4. **Launch Jupyter**

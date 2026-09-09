@@ -3,10 +3,16 @@
 # numpy/tensorflow/lxml below are pinned per Python version via markers,
 # since their <3.13 pins have no Python 3.13 wheels. Install with (uv
 # required -- see the lxml note below for why):
-#   uv pip install -r requirements.txt --override requirements.txt
+#   uv pip install -r requirements.txt --override overrides.txt
 #
 # Core / visualization
 napari[all]
+# Pinned explicitly (not just via napari[all]'s "pyqt6" extra): napari can
+# resolve without a Qt binding actually getting installed in some resolver/
+# override combinations, which fails at runtime ("No Qt bindings could be
+# found") rather than at install time. Requiring it directly here guarantees
+# one is present regardless of how napari's extras resolve.
+PyQt6
 # Pinned: napari/aicsimageio only require a lower bound on dask, but dask
 # cuts new releases very often, so leaving it unpinned makes pip's resolver
 # backtrack through hundreds of dask versions. Pinning skips that search.
@@ -40,8 +46,12 @@ nd2reader
 # full MSVC toolchain. ome-types -- aicsimageio's own lxml consumer --
 # declares lxml>=5.3 as correct for Python 3.13, so raising the floor here
 # is safe; it's aicsimageio's cap that's stale, not a real incompatibility.
-# This line must be passed as BOTH -r and --override (see the command at the
-# top of this file) so it takes precedence over that cap on 3.13.
+# This line must ALSO be listed in overrides.txt (see the command at the top
+# of this file) so it takes precedence over that cap on 3.13. overrides.txt
+# is kept separate from this file -- and deliberately doesn't repeat the
+# extras-bearing lines above (napari[all], aicsimageio[nd2], dask[array]) --
+# because an override entry with extras isn't guaranteed to propagate them
+# the same way a normal requirement does.
 lxml<5,>=4.6; python_version < "3.13"
 lxml>=5.3; python_version >= "3.13"
 
