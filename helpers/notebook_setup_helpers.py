@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import subprocess
 import sys
 from typing import Any
@@ -38,6 +39,46 @@ def check_python_version() -> None:
             f"{supported_str} -- other versions may fail to install or behave "
             "unexpectedly. See README.md Prerequisites."
         )
+
+
+def stardist_available() -> bool:
+    """Return True if the StarDist stack (tensorflow, csbdeep, stardist) is installed."""
+    return all(
+        importlib.util.find_spec(name) is not None
+        for name in ("tensorflow", "csbdeep", "stardist")
+    )
+
+
+def resolve_stardist_flag(trig_stardist: bool) -> bool:
+    """Return ``trig_stardist``, forced to False (with a warning) if StarDist can't run.
+
+    StarDist needs TensorFlow, which has no wheels for Python 3.14. Call this
+    right after setting ``trig_stardist`` so the rest of the notebook (including
+    the parameters saved to Excel) sees the value that is actually used.
+    """
+    if not trig_stardist or stardist_available():
+        return trig_stardist
+
+    if sys.version_info[:2] > TENSORFLOW_MAX_PYTHON:
+        reason = (
+            f"Python {sys.version_info[0]}.{sys.version_info[1]} is in use and TensorFlow "
+            "has no wheels for it, so StarDist (which needs TensorFlow) is not installed."
+        )
+        hint = "Use Python 3.10-3.13 to run StarDist, or use trig_cellpose = True instead."
+    else:
+        reason = "TensorFlow, csbdeep and/or stardist are not installed in this environment."
+        hint = "Install them with requirements.txt, or use trig_cellpose = True instead."
+
+    print(
+        "\n" + "!" * 78 + "\n"
+        "WARNING: trig_stardist was set to True but StarDist is NOT available.\n"
+        f"  {reason}\n"
+        f"  {hint}\n"
+        "  -> trig_stardist has been automatically set to False; the workflow will\n"
+        "     use the other selected method (Cellpose, or watershed if none).\n"
+        + "!" * 78 + "\n"
+    )
+    return False
 
 
 def get_tetgen_requirement() -> str:
@@ -173,6 +214,7 @@ def load_common_imports(
     imported["get_settings"] = get_settings
     settings = get_settings()
     imported["settings"] = settings
+    imported["resolve_stardist_flag"] = resolve_stardist_flag
 
     if enable_napari_interactive:
         settings.application.ipy_interactive = True
