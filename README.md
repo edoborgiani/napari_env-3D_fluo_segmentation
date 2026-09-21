@@ -35,7 +35,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 
 ### Prerequisites
 
-- **Python 3.10, 3.11, 3.12, or 3.13.** `requirements.txt` pins `numpy`/`tensorflow`/`lxml` per Python version via markers, so one file covers all four (3.10/3.11 is the most tested range; 3.12/3.13 have been checked against current PyPI wheel availability but are less exercised in practice; **3.13 is the newest supported — avoid 3.14+, which this repo hasn't been updated for**). Check your version with `python --version` (Windows/macOS) or `python3 --version` (macOS/Linux). Don't have it? Download from [python.org/downloads](https://www.python.org/downloads/).
+- **Python 3.10, 3.11, 3.12, 3.13, or 3.14.** `requirements.txt` pins `numpy`/`scipy`/`tensorflow`/`lxml` per Python version via markers, so one file covers all five (3.10/3.11 is the most tested range; 3.12–3.14 have been checked against current PyPI wheel availability but are less exercised in practice; **3.14 is the newest supported — avoid 3.15+**). **Python 3.14 limitation:** TensorFlow publishes no 3.14 wheels, so TensorFlow, `csbdeep` and `stardist` are not installed there and the StarDist option (`trig_stardist`) is unavailable; Cellpose and the classical methods work normally. Use Python 3.10–3.13 if you need StarDist. Check your version with `python --version` (Windows/macOS) or `python3 --version` (macOS/Linux). Don't have it? Download from [python.org/downloads](https://www.python.org/downloads/).
 - **Git**, to clone the repository. Don't have it? Download from [git-scm.com/downloads](https://git-scm.com/downloads).
 - **[`uv`](https://github.com/astral-sh/uv)**, used in every "Install dependencies" step below instead of plain `pip`. Two independent reasons:
   - **Speed:** `requirements.txt` pulls in several large, dependency-heavy packages (napari, TensorFlow, PyTorch-based Cellpose, VTK/PyVista, SimpleITK). Plain `pip` can take a long time to resolve and download all of them; `uv` resolves and installs the same packages dramatically faster.
@@ -59,7 +59,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    .venv\Scripts\Activate.ps1
    ```
 
-   If PowerShell reports that `python` is not recognized, use the [Python Launcher](https://docs.python.org/3/using/windows.html#launcher) instead — it ships with the official python.org installer even when `python` isn't on `PATH`: `py -3.11 -m venv .venv` (or `py -3.13 -m venv .venv`).
+   If PowerShell reports that `python` is not recognized, use the [Python Launcher](https://docs.python.org/3/using/windows.html#launcher) instead — it ships with the official python.org installer even when `python` isn't on `PATH`: `py -3.11 -m venv .venv` (or `py -3.13 -m venv .venv` / `py -3.14 -m venv .venv`).
 
    > If activation fails with a message about running scripts being disabled on this system, PowerShell's execution policy is blocking it. Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once (in the same PowerShell window), confirm with `Y`, then re-run the activation command above.
 

@@ -935,8 +935,15 @@ def stardist3d_from_2d(
     norm=True,
 ):
     """Apply StarDist2D slice by slice, then split merged objects in 3D."""
-    from csbdeep.utils import normalize
-    from stardist.models import StarDist2D
+    try:
+        from csbdeep.utils import normalize
+        from stardist.models import StarDist2D
+    except ImportError as exc:
+        raise ImportError(
+            "StarDist requires TensorFlow, csbdeep and stardist, which are not "
+            "installed (TensorFlow has no wheels for Python 3.14). Use Python "
+            "3.10-3.13 for StarDist, or set trig_stardist=False."
+        ) from exc
 
     if img_3d.ndim != 3:
         raise ValueError("Input must be 3D with shape (Z, Y, X)")

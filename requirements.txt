@@ -1,6 +1,7 @@
-# Works for Python 3.10-3.13 (3.10/3.11 most tested; 3.12 and 3.13 verified
-# against current PyPI wheel availability but less exercised in practice):
-# numpy/tensorflow/lxml below are pinned per Python version via markers,
+# Works for Python 3.10-3.14 (3.10/3.11 most tested; 3.12-3.14 verified
+# against current PyPI wheel availability but less exercised in practice;
+# on 3.14 StarDist is unavailable -- see the tensorflow note below):
+# numpy/scipy/tensorflow/lxml below are pinned per Python version via markers,
 # since their <3.13 pins have no Python 3.13 wheels. Install with (uv
 # required -- see the lxml note below for why):
 #   uv pip install -r requirements.txt --override overrides.txt
@@ -25,7 +26,9 @@ dask[array]==2026.7.1
 # all, so both floors move up together instead.
 numpy==1.26.4; python_version < "3.13"
 numpy>=2.1; python_version >= "3.13"
-scipy==1.14.1
+# scipy 1.14.1 has no Python 3.14 wheels; 1.16.2 is the first release with them.
+scipy==1.14.1; python_version < "3.14"
+scipy>=1.16.2; python_version >= "3.14"
 scikit-image
 matplotlib
 Pillow
@@ -56,10 +59,14 @@ lxml<5,>=4.6; python_version < "3.13"
 lxml>=5.3; python_version >= "3.13"
 
 # Segmentation models
+# Python 3.14: TensorFlow publishes no cp314 wheels (latest 2.21 stops at
+# cp313), so tensorflow/csbdeep/stardist -- StarDist's whole stack -- are
+# skipped there. Cellpose and the classical methods still work; StarDist
+# (trig_stardist) is unavailable until TensorFlow ships 3.14 wheels.
 tensorflow>=2.16,<2.17; python_version < "3.13"
-tensorflow>=2.20; python_version >= "3.13"
-csbdeep
-stardist
+tensorflow>=2.20; python_version == "3.13"
+csbdeep; python_version < "3.14"
+stardist; python_version < "3.14"
 cellpose>=3.0
 
 # 3D processing / meshing
