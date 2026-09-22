@@ -34,6 +34,7 @@ __all__ = [
     "compute_full_marker_stats_for_marker",
     "compute_marker_stats_for_marker",
     "compute_nuclei_cytoplasm_stats",
+    "compute_percell_marker_intensity_df",
     "contr_limit",
     "contr_stretch",
     "create_row_pdf",
@@ -70,6 +71,7 @@ __all__ = [
     "load_image_with_roi",
     "open_image_file",
     "select_roi_interactively",
+    "plot_marker_intensity_clouds",
     "plot_nucleus_kdes",
     "plot_size_distributions",
     "plot_spatial_distributions",
@@ -2551,8 +2553,17 @@ def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None):
     return labels_df, truncated_df
 
 
-def print_population_summary(labels_df, stain_complete_df, stain_df, progress=None):
-    """Print the compact summary block used in the analysis section."""
+def print_population_summary(labels_df, stain_complete_df, stain_df, percell_df=None, progress=None):
+    """Print the compact summary block used in the analysis section.
+
+    ``percell_df`` (optional, see ``compute_percell_marker_intensity_df``) adds
+    a second "Marker intensity (all cells)" line per marker -- the whole
+    segmented population's mean intensity, positive or not -- next to the
+    existing "Marker intensity (positive cells)" line, which only covers
+    cells where that marker's threshold mask fired. Skipped for multi-marker
+    combination rows, since ``percell_df`` only has one column per single
+    marker channel.
+    """
     nuclei_rows = labels_df[labels_df["Condition"] == "NUCLEI"]
     total_cells = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_df.iloc[0]["Number"])
 
@@ -2622,7 +2633,15 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
             _size_stats_line(row["Avg. marker intensity cytoplasm"], "   Cytoplasm intensity", unit="a.u.")
 
         # Marker intensity (mean/median/min/max across cells)
-        _size_stats_line(row["Avg. marker intensity"], "   Marker intensity", unit="a.u.")
+        _size_stats_line(row["Avg. marker intensity"], "   Marker intensity (positive cells)", unit="a.u.")
+
+        # Whole-population intensity, including cells that didn't pass
+        # threshold for this marker -- only meaningful for a single marker
+        # channel, not a multi-marker combination row.
+        if percell_df is not None and condition in percell_df.columns:
+            vals_all = percell_df[condition].dropna().to_numpy()
+            if vals_all.size:
+                _size_stats_line(tuple(vals_all), "   Marker intensity (all cells)", unit="a.u.")
 
     print("_" * 80)
 
@@ -2886,6 +2905,111 @@ def plot_size_distributions(labels_df, stain_complete_df, stain_df, progress=Non
     axs[1].set_xlabel("[μm3]")
     axs[1].legend(loc="upper right")
     return fig, axs
+
+
+def compute_percell_marker_intensity_df(
+    im_segmentation_stack,
+    im_final_stack,
+    stain_complete_df,
+    conditions=None,
+    progress=None,
+):
+    """Build a per-cell x per-marker mean intensity table (one row per cell).
+
+    Unlike ``labels_df``'s "Avg. marker intensity" column -- which only
+    covers cells where that marker's threshold mask fired at all -- this
+    measures every segmented cell's mean intensity over its full volume
+    (nucleus + cytoplasm + PCM), whether or not it passed threshold. That is
+    what a flow-cytometry-style intensity cloud needs: the negative/dim
+    population has to stay visible next to the positive one instead of being
+    filtered out before plotting.
+
+    Returns a DataFrame indexed by nucleus label, one column per condition in
+    ``conditions`` (default: every channel except NUCLEI).
+    """
+    filtered_img = im_final_stack['Filtered image']
+    nuclei_img = im_segmentation_stack['Nuclei']
+    cyto_img = im_segmentation_stack.get('Cytoplasm')
+    pcm_img = im_segmentation_stack.get('PCM')
+    max_label = int(np.max(nuclei_img))
+
+    if conditions is None:
+        conditions = [c for c in stain_complete_df.index if c != "NUCLEI"]
+    channel_idx = {c: i for i, c in enumerate(stain_complete_df.index)}
+
+    data = {condition: np.full(max_label, np.nan) for condition in conditions}
+
+    for label_id in _progress_iter(
+        range(1, max_label + 1), progress, desc="Step Q1 - Per-Cell Marker Intensity"
+    ):
+        cell_mask = nuclei_img == label_id
+        if cyto_img is not None:
+            cell_mask = cell_mask | (cyto_img == label_id)
+        if pcm_img is not None:
+            cell_mask = cell_mask | (pcm_img == label_id)
+        if not np.any(cell_mask):
+            continue
+
+        for condition in conditions:
+            c = channel_idx.get(condition)
+            if c is None:
+                continue
+            values = filtered_img[:, :, :, c][cell_mask]
+            if values.size:
+                data[condition][label_id - 1] = float(np.mean(values))
+
+    return pd.DataFrame(data, index=pd.RangeIndex(1, max_label + 1, name="Cell label"))
+
+
+def plot_marker_intensity_clouds(
+    percell_df,
+    stain_complete_df,
+    stain_df=None,
+    conditions=None,
+    log_scale=False,
+    point_size=8,
+    alpha=0.45,
+    seed=0,
+    progress=None,
+):
+    """Flow-cytometry-style per-cell intensity cloud: one jittered scatter column per marker.
+
+    Each point is one segmented cell's mean intensity for that channel (see
+    ``compute_percell_marker_intensity_df``). The black horizontal bar marks
+    the median, the vertical line the interquartile range.
+    """
+    if conditions is None:
+        conditions = list(percell_df.columns)
+
+    fig, ax = plt.subplots(figsize=(max(6, 1.8 * len(conditions)), 6))
+    rng = np.random.default_rng(seed)
+    positions = np.arange(len(conditions))
+
+    for pos, condition in _progress_iter(
+        list(zip(positions, conditions)), progress, desc="Step Q2 - Plot Marker Intensity Clouds"
+    ):
+        vals = percell_df[condition].dropna().to_numpy()
+        if vals.size == 0:
+            continue
+        color = _condition_color(condition, stain_complete_df, stain_df=stain_df)
+        jitter = rng.uniform(-0.35, 0.35, size=vals.size)
+        ax.scatter(pos + jitter, vals, s=point_size, alpha=alpha, color=color, edgecolors="none")
+
+        median = float(np.median(vals))
+        q1, q3 = np.percentile(vals, [25, 75])
+        ax.hlines(median, pos - 0.4, pos + 0.4, color="black", linewidth=2, zorder=3)
+        ax.vlines(pos, q1, q3, color="black", linewidth=1.2, zorder=2)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(conditions, rotation=30, ha="right")
+    ax.set_ylabel("Mean intensity per cell (a.u.)")
+    if log_scale:
+        ax.set_yscale("symlog", linthresh=1.0)
+    ax.set_title("Per-cell marker intensity distribution")
+    ax.grid(alpha=0.2, axis="y")
+    plt.tight_layout()
+    plt.show()
+    return fig, ax
 
 
 def export_quantification_to_excel(input_file, original_stain_complete_df, labels_full_df, progress=None):
