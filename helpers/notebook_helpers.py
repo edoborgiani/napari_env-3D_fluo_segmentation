@@ -1765,6 +1765,8 @@ LABELS_TABLE_COLUMNS = [
     "Marker size PCM [um3]",
     "Avg. marker intensity PCM",
     "STD marker intensity PCM",
+    "Avg. marker intensity (all cells)",
+    "STD marker intensity (all cells)",
 ]
 
 
@@ -1796,8 +1798,17 @@ def _make_labels_record(
     marker_pcm_sizes=(),
     avg_pcm_marker=(),
     std_pcm_marker=(),
+    avg_marker_all=(),
+    std_marker_all=(),
 ):
-    """Create one quantification row in the shared notebook output format."""
+    """Create one quantification row in the shared notebook output format.
+
+    ``avg_marker_all``/``std_marker_all`` (see
+    ``compute_percell_marker_intensity_df``) are dense, one entry per
+    segmented cell (positive or not) in cell-label order -- unlike every
+    other per-marker field here, which only covers cells where that
+    marker's threshold mask fired.
+    """
     return [
         condition,
         laser,
@@ -1817,6 +1828,8 @@ def _make_labels_record(
         tuple(marker_pcm_sizes),
         tuple(avg_pcm_marker),
         tuple(std_pcm_marker),
+        tuple(avg_marker_all),
+        tuple(std_marker_all),
     ]
 
 
@@ -2266,9 +2279,17 @@ def build_labels_dict(
     r_xyz,
     zooms,
     multilabel=False,
+    percell_mean_df=None,
+    percell_std_df=None,
     progress=None,
 ):
-    """Build the compact per-marker quantification dictionary used by the notebook."""
+    """Build the compact per-marker quantification dictionary used by the notebook.
+
+    ``percell_mean_df``/``percell_std_df`` (optional, see
+    ``compute_percell_marker_intensity_df``) add the "(all cells)" avg/std
+    columns per single-marker row -- the whole segmented population's
+    intensity for that channel, not just cells that passed threshold.
+    """
     labels_dict = {}
     nuc_positions, nuc_sizes, cyto_positions, cyto_sizes = compute_nuclei_cytoplasm_stats(
         im_segmentation_stack,
@@ -2318,6 +2339,13 @@ def build_labels_dict(
             m_pcm_std,
         ) = compute_marker_stats_for_marker(c, im_segmentation_stack, filtered_img, r_xyz, zooms)
 
+        avg_marker_all = ()
+        std_marker_all = ()
+        if percell_mean_df is not None and condition in percell_mean_df.columns:
+            avg_marker_all = percell_mean_df[condition].to_numpy()
+        if percell_std_df is not None and condition in percell_std_df.columns:
+            std_marker_all = percell_std_df[condition].to_numpy()
+
         labels_dict[marker] = _make_labels_record(
             condition,
             stain_complete_df.loc[condition, "Laser"],
@@ -2337,6 +2365,8 @@ def build_labels_dict(
             marker_pcm_sizes=m_pcm_sizes,
             avg_pcm_marker=m_pcm_avg,
             std_pcm_marker=m_pcm_std,
+            avg_marker_all=avg_marker_all,
+            std_marker_all=std_marker_all,
         )
 
     if multilabel:
@@ -2383,9 +2413,16 @@ def build_full_labels_dict(
     stain_complete_df,
     r_xyz,
     zooms,
+    percell_mean_df=None,
+    percell_std_df=None,
     progress=None,
 ):
-    """Build the full per-marker quantification dictionary for exports and meshes."""
+    """Build the full per-marker quantification dictionary for exports and meshes.
+
+    ``percell_mean_df``/``percell_std_df`` (optional, see
+    ``compute_percell_marker_intensity_df``) add the "(all cells)" avg/std
+    columns per single-marker row -- see ``build_labels_dict``.
+    """
     labels_full_dict = {}
     nuc_positions, nuc_sizes, cyto_positions, cyto_sizes = compute_nuclei_cytoplasm_stats(
         im_segmentation_stack,
@@ -2435,6 +2472,13 @@ def build_full_labels_dict(
             m_full_pcm_std,
         ) = compute_full_marker_stats_for_marker(c, im_final_stack, im_segmentation_stack, filtered_img, r_xyz, zooms)
 
+        avg_marker_all = ()
+        std_marker_all = ()
+        if percell_mean_df is not None and condition in percell_mean_df.columns:
+            avg_marker_all = percell_mean_df[condition].to_numpy()
+        if percell_std_df is not None and condition in percell_std_df.columns:
+            std_marker_all = percell_std_df[condition].to_numpy()
+
         labels_full_dict[marker] = _make_labels_record(
             condition,
             stain_complete_df.iloc[c]["Laser"],
@@ -2454,6 +2498,8 @@ def build_full_labels_dict(
             marker_pcm_sizes=m_full_pcm_sizes,
             avg_pcm_marker=m_full_pcm_avg,
             std_pcm_marker=m_full_pcm_std,
+            avg_marker_all=avg_marker_all,
+            std_marker_all=std_marker_all,
         )
 
     return labels_full_dict
@@ -2469,9 +2515,16 @@ def build_labels_df(
     r_zZ,
     zooms,
     multilabel=False,
+    percell_mean_df=None,
+    percell_std_df=None,
     progress=None,
 ):
-    """Build the compact quantification dictionary, display a preview, and return the DataFrame."""
+    """Build the compact quantification dictionary, display a preview, and return the DataFrame.
+
+    ``percell_mean_df``/``percell_std_df`` (optional, see
+    ``compute_percell_marker_intensity_df``) add the "(all cells)" avg/std
+    columns per single-marker row.
+    """
     filtered_img = im_final_stack['Filtered image']
     r_xyz = (r_zX, r_zY, r_zZ)
     labels_dict = build_labels_dict(
@@ -2482,6 +2535,8 @@ def build_labels_df(
         r_xyz=r_xyz,
         zooms=zooms,
         multilabel=multilabel,
+        percell_mean_df=percell_mean_df,
+        percell_std_df=percell_std_df,
         progress=progress,
     )
     labels_df, truncated_df = labels_dict_to_dataframe(labels_dict, truncate=True, progress=progress)
@@ -2501,12 +2556,18 @@ def build_full_labels_df(
     r_zY,
     r_zZ,
     zooms,
+    percell_mean_df=None,
+    percell_std_df=None,
     progress=None,
 ):
     """Build the full quantification dictionary and convert it to a DataFrame.
 
     Uses zoomed voxel sizes (r_zX, r_zY, r_zZ) because the segmentation arrays
     are in zoomed pixel space — consistent with build_labels_df (Cell 24).
+
+    ``percell_mean_df``/``percell_std_df`` (optional, see
+    ``compute_percell_marker_intensity_df``) add the "(all cells)" avg/std
+    columns per single-marker row.
     """
     filtered_img = im_final_stack['Filtered image']
     r_xyz = (r_zX, r_zY, r_zZ)
@@ -2517,6 +2578,8 @@ def build_full_labels_df(
         stain_complete_df=stain_complete_df,
         r_xyz=r_xyz,
         zooms=zooms,
+        percell_mean_df=percell_mean_df,
+        percell_std_df=percell_std_df,
         progress=progress,
     )
     return labels_dict_to_dataframe(labels_full_dict)
@@ -2546,6 +2609,8 @@ def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None):
         "Marker size PCM [um3]",
         "Avg. marker intensity PCM",
         "STD marker intensity PCM",
+        "Avg. marker intensity (all cells)",
+        "STD marker intensity (all cells)",
     ]
     for column in _progress_iter(truncate_columns, progress, desc="Step 23D - Truncate Display Columns"):
         truncated_df[column] = truncated_df[column].apply(lambda value: truncate_cell(value))
@@ -2553,16 +2618,17 @@ def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None):
     return labels_df, truncated_df
 
 
-def print_population_summary(labels_df, stain_complete_df, stain_df, percell_df=None, progress=None):
+def print_population_summary(labels_df, stain_complete_df, stain_df, progress=None):
     """Print the compact summary block used in the analysis section.
 
-    ``percell_df`` (optional, see ``compute_percell_marker_intensity_df``) adds
-    a second "Marker intensity (all cells)" line per marker -- the whole
+    When ``labels_df`` was built with ``percell_mean_df`` (see
+    ``build_labels_df`` / ``compute_percell_marker_intensity_df``), prints a
+    second "Marker intensity (all cells)" line per marker -- the whole
     segmented population's mean intensity, positive or not -- next to the
     existing "Marker intensity (positive cells)" line, which only covers
     cells where that marker's threshold mask fired. Skipped for multi-marker
-    combination rows, since ``percell_df`` only has one column per single
-    marker channel.
+    combination rows, since that column only exists for single marker
+    channels.
     """
     nuclei_rows = labels_df[labels_df["Condition"] == "NUCLEI"]
     total_cells = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_df.iloc[0]["Number"])
@@ -2593,6 +2659,7 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, percell_df=
     # --- Nuclei and cytoplasm population size statistics ---
     def _size_stats_line(sizes_tuple, label, unit="um\u00b3"):
         arr = np.array(sizes_tuple, dtype=float)
+        arr = arr[~np.isnan(arr)]
         if arr.size == 0:
             return
         print(
@@ -2636,12 +2703,10 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, percell_df=
         _size_stats_line(row["Avg. marker intensity"], "   Marker intensity (positive cells)", unit="a.u.")
 
         # Whole-population intensity, including cells that didn't pass
-        # threshold for this marker -- only meaningful for a single marker
-        # channel, not a multi-marker combination row.
-        if percell_df is not None and condition in percell_df.columns:
-            vals_all = percell_df[condition].dropna().to_numpy()
-            if vals_all.size:
-                _size_stats_line(tuple(vals_all), "   Marker intensity (all cells)", unit="a.u.")
+        # threshold for this marker -- only present for single-marker rows
+        # (see build_labels_df's percell_mean_df), not multi-marker combos.
+        if "Avg. marker intensity (all cells)" in labels_df.columns:
+            _size_stats_line(row["Avg. marker intensity (all cells)"], "   Marker intensity (all cells)", unit="a.u.")
 
     print("_" * 80)
 
@@ -2914,18 +2979,25 @@ def compute_percell_marker_intensity_df(
     conditions=None,
     progress=None,
 ):
-    """Build a per-cell x per-marker mean intensity table (one row per cell).
+    """Build per-cell x per-marker mean/std intensity tables (one row per cell).
 
-    Unlike ``labels_df``'s "Avg. marker intensity" column -- which only
-    covers cells where that marker's threshold mask fired at all -- this
-    measures every segmented cell's mean intensity over its full volume
-    (nucleus + cytoplasm + PCM), whether or not it passed threshold. That is
-    what a flow-cytometry-style intensity cloud needs: the negative/dim
-    population has to stay visible next to the positive one instead of being
-    filtered out before plotting.
+    Unlike ``labels_df``'s "Avg./STD marker intensity" columns -- which only
+    cover cells where that marker's threshold mask fired at all -- this
+    measures every segmented cell's intensity over its full volume (nucleus +
+    cytoplasm + PCM), whether or not it passed threshold. That is what a
+    flow-cytometry-style intensity cloud needs: the negative/dim population
+    has to stay visible next to the positive one instead of being filtered
+    out before plotting.
 
-    Returns a DataFrame indexed by nucleus label, one column per condition in
-    ``conditions`` (default: every channel except NUCLEI).
+    Returns
+    -------
+    (percell_mean_df, percell_std_df) : tuple of DataFrame
+        Both indexed by nucleus label, one column per condition in
+        ``conditions`` (default: every real image channel except NUCLEI).
+        ``percell_mean_df`` holds each cell's mean intensity over its whole
+        volume; ``percell_std_df`` holds that same cell's own voxel-to-voxel
+        std (signal heterogeneity within that one cell) -- mirroring the
+        existing "Avg./STD marker intensity" pair, just unthresholded.
     """
     filtered_img = im_final_stack['Filtered image']
     nuclei_img = im_segmentation_stack['Nuclei']
@@ -2933,11 +3005,22 @@ def compute_percell_marker_intensity_df(
     pcm_img = im_segmentation_stack.get('PCM')
     max_label = int(np.max(nuclei_img))
 
-    if conditions is None:
-        conditions = [c for c in stain_complete_df.index if c != "NUCLEI"]
-    channel_idx = {c: i for i, c in enumerate(stain_complete_df.index)}
+    # stain_complete_df can carry extra rows with no matching image channel
+    # (e.g. segment_cytoplasm appends a placeholder 'CYTOPLASM' row when
+    # cytoplasm is derived from cyto_markers instead of a dedicated channel)
+    # -- so channel indices must come positionally from the real channels
+    # only, the same way build_full_labels_dict does it.
+    num_channels = filtered_img.shape[3]
+    real_channel_conditions = list(stain_complete_df.index[:num_channels])
+    channel_idx = {c: i for i, c in enumerate(real_channel_conditions)}
 
-    data = {condition: np.full(max_label, np.nan) for condition in conditions}
+    if conditions is None:
+        conditions = [c for c in real_channel_conditions if c != "NUCLEI"]
+    else:
+        conditions = [c for c in conditions if c in channel_idx]
+
+    mean_data = {condition: np.full(max_label, np.nan) for condition in conditions}
+    std_data = {condition: np.full(max_label, np.nan) for condition in conditions}
 
     for label_id in _progress_iter(
         range(1, max_label + 1), progress, desc="Step Q1 - Per-Cell Marker Intensity"
@@ -2956,13 +3039,17 @@ def compute_percell_marker_intensity_df(
                 continue
             values = filtered_img[:, :, :, c][cell_mask]
             if values.size:
-                data[condition][label_id - 1] = float(np.mean(values))
+                mean_data[condition][label_id - 1] = float(np.mean(values))
+                std_data[condition][label_id - 1] = float(np.std(values))
 
-    return pd.DataFrame(data, index=pd.RangeIndex(1, max_label + 1, name="Cell label"))
+    index = pd.RangeIndex(1, max_label + 1, name="Cell label")
+    percell_mean_df = pd.DataFrame(mean_data, index=index)
+    percell_std_df = pd.DataFrame(std_data, index=index)
+    return percell_mean_df, percell_std_df
 
 
 def plot_marker_intensity_clouds(
-    percell_df,
+    percell_mean_df,
     stain_complete_df,
     stain_df=None,
     conditions=None,
@@ -2979,7 +3066,7 @@ def plot_marker_intensity_clouds(
     the median, the vertical line the interquartile range.
     """
     if conditions is None:
-        conditions = list(percell_df.columns)
+        conditions = list(percell_mean_df.columns)
 
     fig, ax = plt.subplots(figsize=(max(6, 1.8 * len(conditions)), 6))
     rng = np.random.default_rng(seed)
@@ -2988,7 +3075,7 @@ def plot_marker_intensity_clouds(
     for pos, condition in _progress_iter(
         list(zip(positions, conditions)), progress, desc="Step Q2 - Plot Marker Intensity Clouds"
     ):
-        vals = percell_df[condition].dropna().to_numpy()
+        vals = percell_mean_df[condition].dropna().to_numpy()
         if vals.size == 0:
             continue
         color = _condition_color(condition, stain_complete_df, stain_df=stain_df)
@@ -3185,7 +3272,9 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
         marker_sub = ['Vol. total [μm³]', 'Vol. cyto [μm³]', 'Vol. PCM [μm³]',
                       'Avg int. total', 'STD total',
                       'Avg int. cyto', 'STD cyto',
-                      'Avg int. PCM', 'STD PCM']
+                      'Avg int. PCM', 'STD PCM',
+                      'Avg int. all cells', 'STD int. all cells']
+        n_positive_sub = 9  # first 9 sub-columns above: only cells sharing this marker's threshold mask
         n_base = len(base_cols)
         n_msub = len(marker_sub)
 
@@ -3232,22 +3321,32 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
                 alt = (k % 2 == 0)
 
                 for m_i, (m_idx, m_name, m_cond) in enumerate(single_markers):
-                    shared = labels_full_df.iloc[m_idx]["Shared labels"]
+                    m_row = labels_full_df.iloc[m_idx]
+                    shared = m_row["Shared labels"]
                     if k in shared:
                         si = list(shared).index(k)
                         row_vals.extend([
-                            labels_full_df.iloc[m_idx]["Marker size [um3]"][si],
-                            labels_full_df.iloc[m_idx]["Marker size cytoplasm [um3]"][si],
-                            labels_full_df.iloc[m_idx]["Marker size PCM [um3]"][si],
-                            labels_full_df.iloc[m_idx]["Avg. marker intensity"][si],
-                            labels_full_df.iloc[m_idx]["STD marker intensity"][si],
-                            labels_full_df.iloc[m_idx]["Avg. marker intensity cytoplasm"][si],
-                            labels_full_df.iloc[m_idx]["STD marker intensity cytoplasm"][si],
-                            labels_full_df.iloc[m_idx]["Avg. marker intensity PCM"][si],
-                            labels_full_df.iloc[m_idx]["STD marker intensity PCM"][si],
+                            m_row["Marker size [um3]"][si],
+                            m_row["Marker size cytoplasm [um3]"][si],
+                            m_row["Marker size PCM [um3]"][si],
+                            m_row["Avg. marker intensity"][si],
+                            m_row["STD marker intensity"][si],
+                            m_row["Avg. marker intensity cytoplasm"][si],
+                            m_row["STD marker intensity cytoplasm"][si],
+                            m_row["Avg. marker intensity PCM"][si],
+                            m_row["STD marker intensity PCM"][si],
                         ])
                     else:
-                        row_vals.extend([''] * n_msub)
+                        row_vals.extend([''] * n_positive_sub)
+
+                    # Whole-cell intensity, positive or not (dense, indexed
+                    # directly by cell ID -- not gated by "shared").
+                    all_mean = m_row.get("Avg. marker intensity (all cells)", ())
+                    all_std = m_row.get("STD marker intensity (all cells)", ())
+                    mean_val = all_mean[k - 1] if len(all_mean) >= k else np.nan
+                    std_val = all_std[k - 1] if len(all_std) >= k else np.nan
+                    row_vals.append('' if pd.isna(mean_val) else mean_val)
+                    row_vals.append('' if pd.isna(std_val) else std_val)
 
                 _write_row(ws_cyto, r, row_vals, alt=alt)
                 r += 1
@@ -3273,8 +3372,9 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
 
         # Add marker-specific mean columns
         for _, m_name, _ in single_markers:
-            sum_cols += [f'{m_name} mean int.', f'{m_name} SD int.',
-                         f'{m_name} mean vol. [μm³]']
+            sum_cols += [f'{m_name} mean int. (positive cells)', f'{m_name} SD int. (positive cells)',
+                         f'{m_name} mean vol. [μm³]',
+                         f'{m_name} mean int. (all cells)', f'{m_name} SD int. (all cells)']
 
         for c, col in enumerate(sum_cols):
             ws_sum.write(r, c, col, f_hdr)
@@ -3317,13 +3417,17 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
                 if cond == m_cond:
                     ints = m_row.get("Avg. marker intensity", [])
                     vols = m_row.get("Marker size [um3]", [])
+                    ints_all = np.array(m_row.get("Avg. marker intensity (all cells)", []), dtype=float)
+                    ints_all = ints_all[~np.isnan(ints_all)]
                     vals += [
                         round(float(np.mean(ints)), 2) if len(ints) > 0 else '',
                         round(float(np.std(ints)),  2) if len(ints) > 0 else '',
                         round(float(np.mean(vols)), 2) if len(vols) > 0 else '',
+                        round(float(np.mean(ints_all)), 2) if ints_all.size > 0 else '',
+                        round(float(np.std(ints_all)),  2) if ints_all.size > 0 else '',
                     ]
                 else:
-                    vals += ['', '', '']
+                    vals += ['', '', '', '', '']
 
             for c, v in enumerate(vals):
                 num_fmt_row = _fmt(bg_color=bg, num_format='0.00') if c > 4 else _fmt(bg_color=bg)
@@ -3372,7 +3476,7 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
                 round(float(np.std(nuc_sizes)),   2) if len(nuc_sizes)  > 0 else '',
                 round(float(np.mean(cyto_sizes)), 2) if len(cyto_sizes) > 0 else '',
                 round(float(np.std(cyto_sizes)),  2) if len(cyto_sizes) > 0 else '',
-            ] + [''] * (len(single_markers) * 3)
+            ] + [''] * (len(single_markers) * 5)
 
             for c, v in enumerate(vals):
                 fmt = row_fmt_num if c > 4 and isinstance(v, float) else row_fmt
@@ -7086,6 +7190,14 @@ def build_vtk_volumes(
                 if cond in ('NUCLEI', 'CYTOPLASM') or np.size(marker) != 1:
                     continue
                 shared = list(row['Shared labels'])
+
+                # Whole-cell intensity, positive or not (dense, indexed
+                # directly by cell label j -- not gated by "shared").
+                all_mean = row.get('Avg. marker intensity (all cells)', ())
+                if len(all_mean) >= j and not np.isnan(all_mean[j - 1]):
+                    mesh_cyto.cell_data[marker + ' avg. intensity all cells (-)'] = np.ones(mesh_cyto.n_cells) * all_mean[j - 1]
+                    mesh_PCM.cell_data[marker + ' avg. intensity all cells (-)'] = np.ones(mesh_PCM.n_cells) * all_mean[j - 1]
+
                 if j in shared:
                     idx = shared.index(j)
                     vol_um3 = row['Marker size [um3]'][idx]
