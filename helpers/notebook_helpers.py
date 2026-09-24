@@ -919,10 +919,12 @@ def _display_uint8(image, contrast_limits=None, gamma=None):
     return napari_contrast_gamma_uint8(arr, (cmin, cmax), gamma_value)
 
 
-def remove_small_islands(binary_matrix, area_threshold):
+def remove_small_islands(binary_matrix, area_threshold, progress=None, desc=None):
     """Remove small connected components from a binary mask."""
     labeled_array, num_features = ndi.label(binary_matrix)
-    for component_id in range(1, num_features + 1):
+    for component_id in _progress_iter(
+        range(1, num_features + 1), progress, desc=desc, leave=False
+    ):
         component = labeled_array == component_id
         if component.sum() < area_threshold:
             binary_matrix[component] = 0
@@ -935,6 +937,7 @@ def stardist3d_from_2d(
     nucleus_radius=5,
     voxel_size=(1.0, 0.5, 0.5),
     norm=True,
+    progress=None,
 ):
     """Apply StarDist2D slice by slice, then split merged objects in 3D."""
     try:
@@ -957,7 +960,9 @@ def stardist3d_from_2d(
     labels_3d = np.zeros_like(img_3d, dtype=np.int32)
     current_label = 1
 
-    for z_index in range(img_3d.shape[0]):
+    for z_index in _progress_iter(
+        range(img_3d.shape[0]), progress, desc="StarDist - Predict Z-slices", leave=False
+    ):
         img = img_3d[z_index]
         if norm:
             img = normalize(img, 1, 99.8, axis=None)
@@ -1559,7 +1564,7 @@ def merge_small_touching_labels(label_matrix, size_threshold, z_weight=2.0):
     return merged
 
 
-def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms):
+def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms, progress=None):
     """Compute centroid positions and volumes for nuclei and cytoplasm."""
     max_label = int(np.max(seg_stack["Nuclei"]))
     nucleus_positions = []
@@ -1567,7 +1572,9 @@ def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms):
     cytoplasm_positions = []
     cytoplasm_sizes = []
 
-    for label_id in range(1, max_label + 1):
+    for label_id in _progress_iter(
+        range(1, max_label + 1), progress, desc="Quantify Nuclei/Cytoplasm per cell", leave=False
+    ):
         z_nuc, y_nuc, x_nuc = np.where(seg_stack["Nuclei"] == label_id)
         if x_nuc.size == 0:
             nucleus_positions.append((0.0, 0.0, 0.0))
@@ -1575,12 +1582,12 @@ def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms):
         else:
             nucleus_positions.append(
                 (
-                    np.mean(x_nuc) * r_xyz[0],
-                    np.mean(y_nuc) * r_xyz[1],
-                    np.mean(z_nuc) * r_xyz[2],
+                    float(np.mean(x_nuc) * r_xyz[0]),
+                    float(np.mean(y_nuc) * r_xyz[1]),
+                    float(np.mean(z_nuc) * r_xyz[2]),
                 )
             )
-            nucleus_sizes.append(x_nuc.size * r_xyz[0] * r_xyz[1] * r_xyz[2])
+            nucleus_sizes.append(float(x_nuc.size * r_xyz[0] * r_xyz[1] * r_xyz[2]))
 
         z_cyto, y_cyto, x_cyto = np.where(seg_stack["Cytoplasm"] == label_id)
         if x_cyto.size == 0:
@@ -1589,12 +1596,12 @@ def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms):
         else:
             cytoplasm_positions.append(
                 (
-                    np.mean(x_cyto) * r_xyz[0],
-                    np.mean(y_cyto) * r_xyz[1],
-                    np.mean(z_cyto) * r_xyz[2],
+                    float(np.mean(x_cyto) * r_xyz[0]),
+                    float(np.mean(y_cyto) * r_xyz[1]),
+                    float(np.mean(z_cyto) * r_xyz[2]),
                 )
             )
-            cytoplasm_sizes.append(x_cyto.size * r_xyz[0] * r_xyz[1] * r_xyz[2])
+            cytoplasm_sizes.append(float(x_cyto.size * r_xyz[0] * r_xyz[1] * r_xyz[2]))
 
     return nucleus_positions, nucleus_sizes, cytoplasm_positions, cytoplasm_sizes
 
@@ -1607,6 +1614,8 @@ def _compute_marker_stats_core(
     stain_complete_df,
     seg_key,
     fallback_to_marker_when_missing=False,
+    progress=None,
+    progress_desc=None,
 ):
     """Shared implementation for compute_marker_stats_for_marker and
     compute_full_marker_stats_for_marker.
@@ -1644,7 +1653,10 @@ def _compute_marker_stats_core(
     std_pcm_marker = []
 
     max_label = int(np.max(seg_stack["Nuclei"]))
-    for label_id in range(1, max_label + 1):
+    for label_id in _progress_iter(
+        range(1, max_label + 1), progress,
+        desc=progress_desc or f"Quantify [{condition}] per cell", leave=False,
+    ):
         nucleus_mask = seg_stack["Nuclei"] == label_id
         cytoplasm_mask = seg_stack["Cytoplasm"] == label_id
         pcm_mask = seg_stack["PCM"] == label_id
@@ -1719,7 +1731,7 @@ def _compute_marker_stats_core(
     )
 
 
-def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, zooms):
+def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, zooms, progress=None):
     """Compute marker measurements per nucleus for one marker channel."""
     stain_complete_df = _context("stain_complete_df")
     stain_df = _context("stain_df")
@@ -1727,10 +1739,11 @@ def compute_marker_stats_for_marker(marker_idx, seg_stack, filtered_img, r_xyz, 
     return _compute_marker_stats_core(
         marker_idx, seg_stack, filtered_img, r_xyz, stain_complete_df, seg_key,
         fallback_to_marker_when_missing=False,
+        progress=progress,
     )
 
 
-def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filtered_img, r_xyz, zooms):
+def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filtered_img, r_xyz, zooms, progress=None):
     """Compute full marker measurements from the filtered image channel.
 
     Uses the assigned segmentation label image (same presence test as
@@ -1743,6 +1756,7 @@ def compute_full_marker_stats_for_marker(marker_idx, seg_final, seg_stack, filte
     return _compute_marker_stats_core(
         marker_idx, seg_stack, filtered_img, r_xyz, stain_complete_df, seg_key,
         fallback_to_marker_when_missing=True,
+        progress=progress,
     )
 
 
@@ -2295,6 +2309,7 @@ def build_labels_dict(
         im_segmentation_stack,
         r_xyz,
         zooms,
+        progress=progress,
     )
 
     if "NUCLEI" in stain_complete_df.index:
@@ -2337,7 +2352,7 @@ def build_labels_dict(
             m_pcm_sizes,
             m_pcm_avg,
             m_pcm_std,
-        ) = compute_marker_stats_for_marker(c, im_segmentation_stack, filtered_img, r_xyz, zooms)
+        ) = compute_marker_stats_for_marker(c, im_segmentation_stack, filtered_img, r_xyz, zooms, progress=progress)
 
         avg_marker_all = ()
         std_marker_all = ()
@@ -2428,6 +2443,7 @@ def build_full_labels_dict(
         im_segmentation_stack,
         r_xyz,
         zooms,
+        progress=progress,
     )
 
     if "NUCLEI" in stain_complete_df.index:
@@ -2470,7 +2486,7 @@ def build_full_labels_dict(
             m_full_pcm_sizes,
             m_full_pcm_avg,
             m_full_pcm_std,
-        ) = compute_full_marker_stats_for_marker(c, im_final_stack, im_segmentation_stack, filtered_img, r_xyz, zooms)
+        ) = compute_full_marker_stats_for_marker(c, im_final_stack, im_segmentation_stack, filtered_img, r_xyz, zooms, progress=progress)
 
         avg_marker_all = ()
         std_marker_all = ()
@@ -3071,7 +3087,10 @@ def plot_marker_intensity_clouds(
     size ``r_xyz``; falls back to the nuclei labels when there is no
     cytoplasm label image). Marginal histograms show the intensity
     distribution per marker (top) and the cytoplasm size distribution
-    (right). Dashed lines mark each marker's median intensity.
+    (right). In the main plot, dashed lines mark each marker's median
+    intensity (and the median cytoplasm size, in grey). In the marginal
+    histograms, dashed lines mark the mean and dotted lines mean +/- 1
+    standard deviation (across cells), with the values printed as text.
     """
     if conditions is None:
         conditions = list(percell_mean_df.columns)
@@ -3097,6 +3116,18 @@ def plot_marker_intensity_clouds(
     size_vals = cell_size.dropna()
     if not size_vals.empty:
         ax_right.hist(size_vals, bins=bins, orientation="horizontal", color="0.5", alpha=0.7)
+        ax.axhline(float(size_vals.median()), color="0.3", linestyle="--", linewidth=1.4)
+        size_mean = float(size_vals.mean())
+        size_std = float(size_vals.std(ddof=0))
+        ax_right.axhline(size_mean, color="black", linestyle="--", linewidth=1.4)
+        for edge in (size_mean - size_std, size_mean + size_std):
+            ax_right.axhline(edge, color="black", linestyle=":", linewidth=1.1)
+        ax_right.text(
+            0.95, 0.97, f"mean\n{size_mean:.0f}\n± {size_std:.0f}",
+            transform=ax_right.transAxes, ha="right", va="top", fontsize=8,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="0.7"),
+        )
+    top_stats = []
 
     # Shared bins so the per-marker histograms are comparable.
     all_vals = np.concatenate(
@@ -3115,7 +3146,14 @@ def plot_marker_intensity_clouds(
                    edgecolors="none", label=str(condition))
         ax_top.hist(data["x"], bins=x_bins, histtype="stepfilled", color=color, alpha=0.35)
         ax_top.hist(data["x"], bins=x_bins, histtype="step", color=color, linewidth=1.2)
-        ax.axvline(float(data["x"].median()), color=color, linestyle="--", linewidth=1.2)
+        ax.axvline(float(data["x"].median()), color=color, linestyle="--", linewidth=1.4)
+
+        mean_x = float(data["x"].mean())
+        std_x = float(data["x"].std(ddof=0))
+        ax_top.axvline(mean_x, color=color, linestyle="--", linewidth=1.4)
+        for edge in (mean_x - std_x, mean_x + std_x):
+            ax_top.axvline(edge, color=color, linestyle=":", linewidth=1.1)
+        top_stats.append((f"{condition}: {mean_x:.1f} ± {std_x:.1f}", color))
 
     if log_scale:
         ax.set_xscale("symlog", linthresh=1.0)
@@ -3123,6 +3161,13 @@ def plot_marker_intensity_clouds(
     ax.set_ylabel("Cytoplasm size [um3]")
     ax.grid(alpha=0.2)
     ax.legend(title="Marker", loc="upper right", markerscale=2)
+    if top_stats:
+        # One coloured line of text per marker, stacked in the top-left corner.
+        for k, (text, color) in enumerate(top_stats):
+            ax_top.text(
+                0.01, 0.95 - 0.14 * k, text, transform=ax_top.transAxes,
+                ha="left", va="top", fontsize=8, color=color, fontweight="bold",
+            )
     ax_top.set_title("Per-cell marker intensity vs cytoplasm size")
     ax_top.set_ylabel("Cells")
     ax_right.set_xlabel("Cells")
@@ -4717,6 +4762,7 @@ def segment_nuclei_watershed(
     nuclei_distance_weight=1.0,
     nuclei_intensity_weight=1.0,
     nuclei_gradient_weight=1.0,
+    progress=None,
 ):
     """
     Segment nuclei using watershed with multi-scale erosion and EDT peak fallback.
@@ -5065,7 +5111,9 @@ def segment_nuclei_watershed(
     )
     peak_threshold_fraction = 0.45
 
-    for cc_id in range(1, num_cc + 1):
+    for cc_id in _progress_iter(
+        range(1, num_cc + 1), progress, desc='Step 17 - Seed Nuclei Components', leave=False
+    ):
         cc_mask = cc_labels == cc_id
         cc_marker_ids = np.unique(markers[cc_mask])
         cc_marker_ids = cc_marker_ids[cc_marker_ids > 0]
@@ -5130,7 +5178,9 @@ def segment_nuclei_watershed(
         im_out = watershed(-distance, markers, mask=binary_mask)
 
     preserve_labels = set()
-    for cc_id in range(1, num_cc + 1):
+    for cc_id in _progress_iter(
+        range(1, num_cc + 1), progress, desc='Step 17 - Check Nuclei Components', leave=False
+    ):
         cc_vals = np.unique(im_out[cc_labels == cc_id])
         cc_vals = cc_vals[cc_vals > 0]
         if cc_vals.size == 1:
@@ -5177,7 +5227,9 @@ def segment_nuclei_watershed(
         # value and hides real internal structure that's still present
         # before that clip was applied.
         split_intensity_img = intensity_img_raw if intensity_img_raw is not None else intensity_img
-        for _round in range(3):
+        for _round in _progress_iter(
+            range(3), progress, desc='Step 17 - Split Non-round Clusters', leave=False
+        ):
             im_out, round_peak_splits = _split_nonround_clusters_by_intensity_peaks(
                 im_out,
                 split_intensity_img,
@@ -6060,7 +6112,10 @@ def apply_threshold_per_channel(
         else:
             min_size = np.ceil(0.4 * np.pi * ((nuclei_size / 2) ** 2))
 
-        im_out[:, :, :, c] = remove_small_islands(arrayseg, min_size)
+        im_out[:, :, :, c] = remove_small_islands(
+            arrayseg, min_size, progress=progress,
+            desc=f'Step 15 - Remove Small Islands [{marker_name}]',
+        )
 
     hist_plot_with_thresholds(image_stack, stain_complete_df, global_thresholds, combined_thresholds)
 
@@ -6277,6 +6332,7 @@ def segment_nuclei(
             nuclei_diameter=nuclei_diameter,
             intensity_img=intensity_img,
             intensity_img_raw=intensity_img_raw,
+            progress=progress,
             **split_cfg,
         )
 
@@ -6309,6 +6365,7 @@ def segment_nuclei(
                 img_3d=im_filt[:, :, :, c],
                 nucleus_radius=nuclei_diameter / 2.0,
                 voxel_size=(r_zZ, r_zY, r_zX),
+                progress=progress,
             )
             im_mask = transl > 0
             im_mask = morphology.erosion(
@@ -6329,6 +6386,7 @@ def segment_nuclei(
                 nuclei_diameter=nuclei_diameter,
                 intensity_img=im_filt[:, :, :, c],
                 intensity_img_raw=im_denoised[:, :, :, c],
+                progress=progress,
                 **split_cfg,
             )
 
@@ -6663,7 +6721,10 @@ def segment_cytoplasm(
                 min_cyto_volume = 0.2 * expected_cell_volume
                 max_label = int(nuclei_labels.max())
                 undersized = 0
-                for label_id in range(1, max_label + 1):
+                for label_id in _progress_iter(
+                    range(1, max_label + 1), progress,
+                    desc='Step 18B - Check Cell Volumes', leave=False,
+                ):
                     nuc_mask = nuclei_labels == label_id
                     if not np.any(nuc_mask):
                         continue
@@ -6688,7 +6749,9 @@ def segment_cytoplasm(
     nuclei_labels = im_segmentation_stack['Nuclei']
     max_label = int(nuclei_labels.max())
     filled = 0
-    for label_id in range(1, max_label + 1):
+    for label_id in _progress_iter(
+        range(1, max_label + 1), progress, desc='Step 18C - Gap-fill Cytoplasm', leave=False
+    ):
         nuc_mask = nuclei_labels == label_id
         if not np.any(nuc_mask):
             continue
