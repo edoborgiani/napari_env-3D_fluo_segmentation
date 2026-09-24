@@ -3051,50 +3051,83 @@ def compute_percell_marker_intensity_df(
 def plot_marker_intensity_clouds(
     percell_mean_df,
     stain_complete_df,
+    im_segmentation_stack,
+    r_xyz=(1.0, 1.0, 1.0),
     stain_df=None,
     conditions=None,
     log_scale=False,
-    point_size=8,
-    alpha=0.45,
-    seed=0,
+    point_size=10,
+    alpha=0.4,
+    bins=40,
     progress=None,
 ):
-    """Flow-cytometry-style per-cell intensity cloud: one jittered scatter column per marker.
+    """Flow-cytometry-style XY cloud: per-cell marker intensity vs cytoplasm size.
 
-    Each point is one segmented cell's mean intensity for that channel (see
-    ``compute_percell_marker_intensity_df``). The black horizontal bar marks
-    the median, the vertical line the interquartile range.
+    Every segmented cell is one point per marker channel, all channels drawn
+    in the same axes (one colour per marker) so their positivity can be
+    compared directly. X is the cell's mean intensity for that channel (see
+    ``compute_percell_marker_intensity_df``); Y is the cell's cytoplasm
+    volume in um3 (from ``im_segmentation_stack['Cytoplasm']`` and the voxel
+    size ``r_xyz``; falls back to the nuclei labels when there is no
+    cytoplasm label image). Marginal histograms show the intensity
+    distribution per marker (top) and the cytoplasm size distribution
+    (right). Dashed lines mark each marker's median intensity.
     """
     if conditions is None:
         conditions = list(percell_mean_df.columns)
 
-    fig, ax = plt.subplots(figsize=(max(6, 1.8 * len(conditions)), 6))
-    rng = np.random.default_rng(seed)
-    positions = np.arange(len(conditions))
+    # Per-cell cytoplasm volume, indexed like percell_mean_df (label 1..N).
+    seg_img = im_segmentation_stack.get("Cytoplasm")
+    if seg_img is None:
+        seg_img = im_segmentation_stack["Nuclei"]
+    max_label = len(percell_mean_df)
+    counts = np.bincount(np.asarray(seg_img).ravel(), minlength=max_label + 1)[1:max_label + 1]
+    cell_size = pd.Series(
+        counts * float(r_xyz[0]) * float(r_xyz[1]) * float(r_xyz[2]),
+        index=percell_mean_df.index,
+    )
+    cell_size = cell_size.where(cell_size > 0)
 
-    for pos, condition in _progress_iter(
-        list(zip(positions, conditions)), progress, desc="Step Q2 - Plot Marker Intensity Clouds"
-    ):
-        vals = percell_mean_df[condition].dropna().to_numpy()
-        if vals.size == 0:
+    fig = plt.figure(figsize=(10, 8))
+    gs = fig.add_gridspec(2, 2, width_ratios=(4, 1), height_ratios=(1, 4), hspace=0.05, wspace=0.05)
+    ax = fig.add_subplot(gs[1, 0])
+    ax_top = fig.add_subplot(gs[0, 0], sharex=ax)
+    ax_right = fig.add_subplot(gs[1, 1], sharey=ax)
+
+    size_vals = cell_size.dropna()
+    if not size_vals.empty:
+        ax_right.hist(size_vals, bins=bins, orientation="horizontal", color="0.5", alpha=0.7)
+
+    # Shared bins so the per-marker histograms are comparable.
+    all_vals = np.concatenate(
+        [percell_mean_df[c].dropna().to_numpy() for c in conditions] or [np.array([])]
+    )
+    x_bins = bins
+    if all_vals.size:
+        x_bins = np.linspace(all_vals.min(), all_vals.max(), bins + 1)
+
+    for condition in _progress_iter(conditions, progress, desc="Step Q2 - Plot Marker Intensity Clouds"):
+        data = pd.DataFrame({"x": percell_mean_df[condition], "y": cell_size}).dropna()
+        if data.empty:
             continue
         color = _condition_color(condition, stain_complete_df, stain_df=stain_df)
-        jitter = rng.uniform(-0.35, 0.35, size=vals.size)
-        ax.scatter(pos + jitter, vals, s=point_size, alpha=alpha, color=color, edgecolors="none")
+        ax.scatter(data["x"], data["y"], s=point_size, alpha=alpha, color=color,
+                   edgecolors="none", label=str(condition))
+        ax_top.hist(data["x"], bins=x_bins, histtype="stepfilled", color=color, alpha=0.35)
+        ax_top.hist(data["x"], bins=x_bins, histtype="step", color=color, linewidth=1.2)
+        ax.axvline(float(data["x"].median()), color=color, linestyle="--", linewidth=1.2)
 
-        median = float(np.median(vals))
-        q1, q3 = np.percentile(vals, [25, 75])
-        ax.hlines(median, pos - 0.4, pos + 0.4, color="black", linewidth=2, zorder=3)
-        ax.vlines(pos, q1, q3, color="black", linewidth=1.2, zorder=2)
-
-    ax.set_xticks(positions)
-    ax.set_xticklabels(conditions, rotation=30, ha="right")
-    ax.set_ylabel("Mean intensity per cell (a.u.)")
     if log_scale:
-        ax.set_yscale("symlog", linthresh=1.0)
-    ax.set_title("Per-cell marker intensity distribution")
-    ax.grid(alpha=0.2, axis="y")
-    plt.tight_layout()
+        ax.set_xscale("symlog", linthresh=1.0)
+    ax.set_xlabel("Mean intensity per cell (a.u.)")
+    ax.set_ylabel("Cytoplasm size [um3]")
+    ax.grid(alpha=0.2)
+    ax.legend(title="Marker", loc="upper right", markerscale=2)
+    ax_top.set_title("Per-cell marker intensity vs cytoplasm size")
+    ax_top.set_ylabel("Cells")
+    ax_right.set_xlabel("Cells")
+    plt.setp(ax_top.get_xticklabels(), visible=False)
+    plt.setp(ax_right.get_yticklabels(), visible=False)
     plt.show()
     return fig, ax
 
