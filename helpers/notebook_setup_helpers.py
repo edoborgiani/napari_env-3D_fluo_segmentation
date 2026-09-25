@@ -10,9 +10,10 @@ from typing import Any
 
 
 DEFAULT_PIP_PACKAGES = [
-    "aicsimageio[nd2]",
+    "aicsimageio[nd2,czi,lif]",
     "aicspylibczi",
     "nd2reader",
+    "oiffile",
     "opencv-python",
     "cellpose>=3.0",
     "xlsxwriter",

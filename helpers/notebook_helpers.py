@@ -111,6 +111,11 @@ __all__ = [
     "run_smooth",
     "run_equalize",
     "run_threshold",
+    "BatchCompleted",
+    "get_batch_output_dir",
+    "is_batch_input",
+    "list_image_files",
+    "run_batch_folder",
 ]
 
 
@@ -217,6 +222,117 @@ class _MetaWithVoxelSizeOverride:
         return getattr(self._wrapped_meta, name)
 
 
+def _settings_float(value):
+    """Parse a number from an Olympus settings value (may be a quoted string)."""
+    try:
+        return float(str(value).strip().strip('"'))
+    except (TypeError, ValueError):
+        return None
+
+
+class _OifFileReader:
+    """Minimal AICSImage-compatible wrapper for Olympus .oib files.
+
+    aicsimageio can only open Olympus files through Bio-Formats (which needs
+    Java), so they are read with the pure-Python ``oiffile`` package instead.
+    The whole file is loaded into memory as ZYXC; any extra axis (e.g. time)
+    is reduced to its first index. Voxel sizes and channel names are read
+    from the file's settings on a best-effort basis -- a voxel size that can't
+    be found is left as None, so ``_prompt_missing_voxel_sizes`` asks for it.
+    """
+
+    def __init__(self, path: str):
+        import oiffile
+
+        oif = oiffile.OifFile(path)
+        try:
+            data = np.asarray(oif.asarray())
+            axes = str(getattr(oif, 'axes', '') or '').upper()
+            mainfile = oif.mainfile
+        finally:
+            oif.close()
+
+        self._data_zyxc = self._to_zyxc(data, axes)
+        z, y, x, c = self._data_zyxc.shape
+        self.shape = (1, c, z, y, x)
+        self.dtype = self._data_zyxc.dtype
+        self.channel_names = self._channel_names(mainfile, c)
+        self._pixel_sizes = _PhysicalPixelSizesOverride(*self._voxel_sizes(mainfile))
+
+    @staticmethod
+    def _to_zyxc(data, axes):
+        if len(axes) != data.ndim:
+            raise ValueError(
+                f"_OifFileReader: can't interpret axes '{axes}' for an array of shape {data.shape}"
+            )
+        axes = list(axes)
+        # Keep only Z/Y/X/C: take the first index of any other axis (e.g. T).
+        for i in reversed(range(len(axes))):
+            if axes[i] not in "ZYXC":
+                data = np.take(data, 0, axis=i)
+                del axes[i]
+        for missing in "ZC":
+            if missing not in axes:
+                data = data[np.newaxis]
+                axes.insert(0, missing)
+        return np.transpose(data, [axes.index(a) for a in "ZYXC"])
+
+    @staticmethod
+    def _channel_names(mainfile, n_channels):
+        names = []
+        for i in range(1, n_channels + 1):
+            section = mainfile.get(f"Channel {i} Parameters", {}) or {}
+            name = str(section.get("DyeName", "")).strip().strip('"')
+            names.append(name or f"Channel {i}")
+        return names
+
+    @staticmethod
+    def _voxel_sizes(mainfile):
+        """Return (X, Y, Z) in um; None for any value that can't be read."""
+        ref = mainfile.get("Reference Image Parameter", {}) or {}
+        r_x = _settings_float(ref.get("WidthConvertValue"))
+        r_y = _settings_float(ref.get("HeightConvertValue"))
+        r_z = None
+        for section_name, section in mainfile.items():
+            if not (section_name.startswith("Axis ") and section_name.endswith("Parameters Common")):
+                continue
+            if str(section.get("AxisCode", "")).strip().strip('"').upper() != "Z":
+                continue
+            start = _settings_float(section.get("StartPosition"))
+            end = _settings_float(section.get("EndPosition"))
+            n = _settings_float(section.get("MaxSize"))
+            if start is None or end is None or not n or n < 2:
+                break
+            step = abs(end - start) / (n - 1)
+            unit = str(section.get("UnitName", "")).strip().strip('"').lower()
+            if unit == "nm":
+                step /= 1000.0
+            elif unit == "mm":
+                step *= 1000.0
+            r_z = step
+            break
+        return tuple(v if (v is not None and v > 0) else None for v in (r_x, r_y, r_z))
+
+    @property
+    def physical_pixel_sizes(self):
+        return self._pixel_sizes
+
+    def get_image_data(self, dim_order="ZYXC", T=0):
+        if dim_order == "ZYXC":
+            return self._data_zyxc
+        raise NotImplementedError(
+            f"_OifFileReader: dim_order '{dim_order}' is not supported"
+        )
+
+    def get_image_dask_data(self, dim_order="ZYXC"):
+        import dask.array as da
+        if dim_order == "ZYXC":
+            return da.from_array(self._data_zyxc, chunks=self._data_zyxc.shape)
+        raise NotImplementedError(
+            f"_OifFileReader: dim_order '{dim_order}' is not supported"
+        )
+
+
 def _prompt_missing_voxel_sizes(r_X, r_Y, r_Z):
     """Prompt for any voxel size axis the file metadata didn't provide.
 
@@ -263,19 +379,27 @@ def _prompt_missing_voxel_sizes(r_X, r_Y, r_Z):
 def open_image_file(input_file: str):
     """Open a microscopy file with AICSImage, falling back to a nd2reader-based
     wrapper for legacy ND2 files that raise ``ValueError: Invalid ChunkMap signature``.
+    Olympus .oib files are opened with ``_OifFileReader`` (oiffile) instead.
+
+    Supported: .nd2, .tif/.tiff (incl. .ome.tif), .czi (aicspylibczi),
+    .lif (readlif), .oib (oiffile). For multi-scene .czi/.lif files only the
+    first scene is read.
 
     Parameters
     ----------
     input_file : str
-        Path to the microscopy file (.nd2, .czi, .tif, …).
+        Path to the microscopy file.
 
     Returns
     -------
-    meta : AICSImage or _ND2ReaderFallback
+    meta : AICSImage, _ND2ReaderFallback or _OifFileReader
         Object with the same interface used by the notebook cells
         (``shape``, ``physical_pixel_sizes``, ``get_image_data``,
         ``get_image_dask_data``).
     """
+    if str(input_file).lower().endswith('.oib'):
+        return _OifFileReader(str(input_file))
+
     from aicsimageio import AICSImage
     try:
         return AICSImage(input_file)
@@ -506,7 +630,8 @@ def initialize_dataset(input_file, roi_coords,
 
 def prepare_and_preview(img, nuclei_diameter, cell_diameter,
                         stain_dict, file_meta,
-                        napari_module, r_xyz=None, progress=None):
+                        napari_module, r_xyz=None, progress=None,
+                        show_viewer=True):
     """Prepare image stack, build stain table, and open napari preview.
 
     Combines ``prepare_image_stack``, ``build_stain_dataframe``, and
@@ -524,13 +649,16 @@ def prepare_and_preview(img, nuclei_diameter, cell_diameter,
     r_xyz : tuple of float (r_X, r_Y, r_Z), optional
         Physical voxel sizes in micrometers, forwarded to the napari preview
         so the displayed volume isn't stretched/squashed along Z.
+    show_viewer : bool, optional
+        If False, skip the napari preview (used by batch mode); ``viewer`` is
+        then returned as None.
 
     Returns
     -------
     im_final_stack : dict
     nuclei_radius, cell_radius, nuclei_volume, cell_volume : float
     stain_df : DataFrame
-    viewer : napari.Viewer
+    viewer : napari.Viewer or None
     """
     im_final_stack, nuclei_radius, cell_radius, nuclei_volume, cell_volume = (
         prepare_image_stack(img, nuclei_diameter, cell_diameter)
@@ -548,7 +676,9 @@ def prepare_and_preview(img, nuclei_diameter, cell_diameter,
     im_final_stack['Original image'] = im_final_stack['Original image'][..., channel_indices]
 
     stain_df = stain_df.drop(columns='Channel_index')
-    viewer = view_original_channels(im_final_stack, stain_df, napari_module, r_xyz=r_xyz, progress=progress)
+    viewer = None
+    if show_viewer:
+        viewer = view_original_channels(im_final_stack, stain_df, napari_module, r_xyz=r_xyz, progress=progress)
     return (im_final_stack, nuclei_radius, cell_radius, nuclei_volume, cell_volume,
             stain_df, viewer)
 
@@ -604,6 +734,24 @@ def read_file_metadata(input_file: str, meta) -> dict:
     # Generic fallback (tif, tiff, lif, etc.) — AICSImage provides channel_names
     channels = list(meta.channel_names)
     return {"date": None, "channels": channels}
+
+
+def _image_stem(input_file):
+    """File name without extension; the double extension of OME-TIFF
+    ('x.ome.tif') is stripped completely, giving 'x'."""
+    from pathlib import Path as _Path
+    stem = _Path(input_file).stem
+    if stem.lower().endswith('.ome'):
+        stem = stem[:-4]
+    return stem
+
+
+def _stem_output_path(input_file, suffix, output_dir=None):
+    """Return ``<input stem><suffix>`` inside *output_dir*, or in the current
+    working directory when *output_dir* is None (single-file behaviour)."""
+    from pathlib import Path as _Path
+    name = _image_stem(input_file) + suffix
+    return str(_Path(output_dir) / name) if output_dir is not None else name
 
 
 def set_notebook_context(**kwargs):
@@ -2075,6 +2223,7 @@ def export_channel_histograms(
     sauvola_weight=0.60,
     aggregate_grow_factor=2.0,
     progress=None,
+    output_dir=None,
 ):
     """
     Export per-channel intensity histograms for every processing stage in
@@ -2102,13 +2251,14 @@ def export_channel_histograms(
         Parameters sheet (e.g. {'sigma': 0.5, 'threshold_method': 'otsu'}).
     progress : callable, optional
         Progress wrapper (e.g. tqdm).
+    output_dir : str or Path, optional
+        Folder to write the workbook to (default: current working directory).
 
     Returns
     -------
     output_path : str or Path
     """
-    from pathlib import Path as _Path
-    output_path = _Path(input_file).stem + '_histograms.xlsx'
+    output_path = _stem_output_path(input_file, '_histograms.xlsx', output_dir)
 
     processing_params = {
         'Input file':                     str(input_file),
@@ -2736,10 +2886,21 @@ def build_histogram_report(
     pad=20,
     thumb_size=None,
     progress=None,
+    output_dir=None,
+    keep_png=True,
+    show_plot=True,
 ):
-    """Collect histogram data, plot KDEs, and generate the per-nucleus PDF report."""
+    """Collect histogram data, plot KDEs, and generate the per-nucleus PDF report.
+
+    ``output_dir`` sets where the PDF is written (default: current working
+    directory). With ``keep_png=False`` the per-nucleus PNGs embedded in the
+    PDF are written to a temporary folder that is deleted afterwards, instead
+    of the crop_png/merged_png/density_png subfolders. With
+    ``show_plot=False`` the KDE overview figure is not drawn (``fig`` and
+    ``axes`` are returned as None).
+    """
+    import tempfile
     from reportlab.lib.units import inch
-    from pathlib import Path as _Path
 
     if thumb_size is None:
         thumb_size = (2.0 * inch, 2.0 * inch)
@@ -2754,11 +2915,14 @@ def build_histogram_report(
         progress=progress,
     )
 
-    fig, axes, x_grid = plot_nucleus_kdes(
-        hist_data,
-        stain_complete_df=stain_complete_df,
-        progress=progress,
-    )
+    if show_plot:
+        fig, axes, x_grid = plot_nucleus_kdes(
+            hist_data,
+            stain_complete_df=stain_complete_df,
+            progress=progress,
+        )
+    else:
+        fig, axes, x_grid = None, None, np.linspace(0, 255, 400)
 
     set_notebook_context(
         seg_stack=im_segmentation_stack,
@@ -2769,12 +2933,21 @@ def build_histogram_report(
         stain_df=stain_df,
     )
 
-    output_pdf = str(_Path(input_file).stem) + "_nuclei_marker.pdf"
-    create_row_pdf(
-        output_pdf=output_pdf,
-        pad=pad,
-        thumb_size=thumb_size,
-    )
+    output_pdf = _stem_output_path(input_file, "_nuclei_marker.pdf", output_dir)
+    if keep_png:
+        create_row_pdf(
+            output_pdf=output_pdf,
+            pad=pad,
+            thumb_size=thumb_size,
+        )
+    else:
+        with tempfile.TemporaryDirectory(prefix="napari_seg_png_", ignore_cleanup_errors=True) as png_dir:
+            create_row_pdf(
+                output_pdf=output_pdf,
+                pad=pad,
+                thumb_size=thumb_size,
+                png_dir=png_dir,
+            )
 
     return hist_data, intensity_ranges, fig, axes, x_grid
 
@@ -3177,11 +3350,13 @@ def plot_marker_intensity_clouds(
     return fig, ax
 
 
-def export_quantification_to_excel(input_file, original_stain_complete_df, labels_full_df, progress=None):
+def export_quantification_to_excel(input_file, original_stain_complete_df, labels_full_df, progress=None,
+                                   output_dir=None):
     """Write the main quantification report to Excel.
 
-    Generates ``<stem>_segmentation.xlsx`` next to *input_file* with four
-    sheets styled to match the histogram workbook:
+    Generates ``<stem>_segmentation.xlsx`` next to *input_file* (or inside
+    *output_dir*, if given) with four sheets styled to match the histogram
+    workbook:
 
     * **Setup** — channel stain table with colour-coded header per marker.
     * **Nuclei** — per-nucleus position and size.
@@ -3194,7 +3369,10 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
     """
     from pathlib import Path as _Path
 
-    output_path = _Path(input_file).with_suffix('').as_posix() + '_segmentation.xlsx'
+    if output_dir is not None:
+        output_path = _stem_output_path(input_file, '_segmentation.xlsx', output_dir)
+    else:
+        output_path = (_Path(input_file).parent / _image_stem(input_file)).as_posix() + '_segmentation.xlsx'
 
     # ── Colour palette (matches histogram workbook) ──────────────────────
     _channel_bg = {
@@ -3614,8 +3792,13 @@ def get_stain_name(stain_df, key):
             return key
 
 
-def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
-    """Create the nuclei report PDF using notebook context previously registered."""
+def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None, png_dir=None):
+    """Create the nuclei report PDF using notebook context previously registered.
+
+    The per-nucleus PNGs embedded in the PDF are written to crop_png/,
+    merged_png/ and density_png/ inside *png_dir* (default: current working
+    directory).
+    """
     from matplotlib.lines import Line2D
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.pagesizes import A4
@@ -3686,9 +3869,13 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
         else "blue"
     )
 
-    os.makedirs("crop_png", exist_ok=True)
-    os.makedirs("merged_png", exist_ok=True)
-    os.makedirs("density_png", exist_ok=True)
+    png_dir = png_dir or ""
+    crop_dir = os.path.join(png_dir, "crop_png")
+    merged_dir = os.path.join(png_dir, "merged_png")
+    density_dir = os.path.join(png_dir, "density_png")
+    os.makedirs(crop_dir, exist_ok=True)
+    os.makedirs(merged_dir, exist_ok=True)
+    os.makedirs(density_dir, exist_ok=True)
 
     for nucleus_id in nuclei:
         full_stack = {}
@@ -3714,7 +3901,7 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
         for condition in marker_conditions:
             img = crop_dict.get(condition)
             arr = np.zeros((min_h, min_w)) if img is None or img.size == 0 else img[:min_h, :min_w]
-            fname = f"crop_png/n{nucleus_id}_{condition}.png"
+            fname = os.path.join(crop_dir, f"n{nucleus_id}_{condition}.png")
             color = stain_complete_df.loc[condition, "Color"] if (
                 condition in stain_complete_df.index and "Color" in stain_complete_df.columns
             ) else "gray"
@@ -3741,10 +3928,10 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
             cytoplasm_color="green",
             pcm_color="magenta",
             pad=pad,
-            out_dir="merged_png",
+            out_dir=merged_dir,
         )
         if merged_png is None:
-            merged_png = f"merged_png/n{nucleus_id}_merged_placeholder.png"
+            merged_png = os.path.join(merged_dir, f"n{nucleus_id}_merged_placeholder.png")
             save_raw_png(np.zeros((min_h, min_w)), merged_png)
 
         fig, ax = plt.subplots(figsize=(4, 2.2))
@@ -3778,7 +3965,7 @@ def create_row_pdf(output_pdf="nuclei_row_pages.pdf", pad=20, thumb_size=None):
         ]
         ax.legend(legend_handles, [marker_labels[condition] for condition in all_conditions], loc="upper right", framealpha=0.9)
         plt.tight_layout()
-        density_png = f"density_png/n{nucleus_id}_density.png"
+        density_png = os.path.join(density_dir, f"n{nucleus_id}_density.png")
         fig.savefig(density_png, dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -7146,6 +7333,8 @@ def build_vtk_volumes(
     r_xyz,
     zoom_factors,
     progress=None,
+    output_dir=None,
+    live_counter=True,
 ):
     """Build labelled VTK volume meshes for nuclei, cytoplasm and PCM and save to disk.
 
@@ -7165,6 +7354,11 @@ def build_vtk_volumes(
         Zoom factors [Z, Y, X] applied during isotropic resampling.
     progress : callable or None
         tqdm-compatible wrapper used for the per-nucleus loop.
+    output_dir : str or Path, optional
+        Folder to write the .vtk files to (default: current working directory).
+    live_counter : bool
+        If True, clear the cell output and print a 'NUCLEI j / n' counter per
+        nucleus. Batch mode sets this to False so earlier output is kept.
     """
     import pyvista as pv
     import meshlib.mrmeshpy as mr
@@ -7210,8 +7404,9 @@ def build_vtk_volumes(
 
     k = 0
     for j in _progress_iter(range(1, nuc_max + 1), progress, desc='Step 30 - Build VTK Volumes'):
-        clear_output(wait=True)
-        print(f'NUCLEI {j} / {nuc_max}')
+        if live_counter:
+            clear_output(wait=True)
+            print(f'NUCLEI {j} / {nuc_max}')
 
         # --- nuclei ---
         simpleVolume = mrn.simpleVolumeFrom3Darray(np.float32(im_segmentation_stack['Nuclei'] == j))
@@ -7325,10 +7520,9 @@ def build_vtk_volumes(
                 return block.extract_surface()
         return block.extract_geometry()
 
-    stem = str(_Path(input_file).stem)
-    _to_surface(blocks_nuclei).save(stem + '_NUCLEI_labelled.vtk')
-    _to_surface(blocks_cyto).save(stem + '_CYTOPLASM_labelled.vtk')
-    _to_surface(blocks_PCM).save(stem + '_PCM_labelled.vtk')
+    _to_surface(blocks_nuclei).save(_stem_output_path(input_file, '_NUCLEI_labelled.vtk', output_dir))
+    _to_surface(blocks_cyto).save(_stem_output_path(input_file, '_CYTOPLASM_labelled.vtk', output_dir))
+    _to_surface(blocks_PCM).save(_stem_output_path(input_file, '_PCM_labelled.vtk', output_dir))
 
     shutil.rmtree(_stl_tmpdir, ignore_errors=True)
 
@@ -7341,6 +7535,7 @@ def export_marker_stl(
     r_xyz=(1.0, 1.0, 1.0),
     zoom_factors=(1.0, 1.0, 1.0),
     progress=None,
+    output_dir=None,
 ):
     """Export per-marker binary volumes as STL mesh files.
 
@@ -7362,10 +7557,11 @@ def export_marker_stl(
         Zoom factors [Z, Y, X] applied during isotropic resampling.
     progress : callable or None
         tqdm-compatible wrapper.
+    output_dir : str or Path, optional
+        Folder to write the .stl files to (default: current working directory).
     """
     import meshlib.mrmeshpy as mr
     import meshlib.mrmeshnumpy as mrn
-    from pathlib import Path as _Path
 
     r_X, r_Y, r_Z = r_xyz
     mesh_voxel_size = mr.Vector3f(
@@ -7389,13 +7585,14 @@ def export_marker_stl(
         _g2m_settings.voxelSize = mesh_voxel_size
         _g2m_settings.isoValue = 0.5
         mesh_stl = mr.gridToMesh(floatGrid, _g2m_settings)
-        mr.saveMesh(mesh_stl, str(_Path(input_file).stem) + "_" + row['Marker'] + "_mesh.stl")
+        mr.saveMesh(mesh_stl, _stem_output_path(input_file, "_" + row['Marker'] + "_mesh.stl", output_dir))
 
 
 def export_fea_mesh(
     im_segmentation_stack,
     input_file,
     progress=None,
+    output_dir=None,
 ):
     """Build a FEA tetrahedral mesh from the nuclei segmentation and write an Abaqus .inp file.
 
@@ -7412,13 +7609,15 @@ def export_fea_mesh(
         Source image path (used to derive output filenames).
     progress : callable or None
         tqdm-compatible wrapper.
+    output_dir : str or Path, optional
+        Folder to write the final ``_FEA.inp`` to (default: current working
+        directory).
     """
     import meshlib.mrmeshpy as mr
     import meshlib.mrmeshnumpy as mrn
     import meshio
     import tetgen
     import statistics as st
-    from pathlib import Path as _Path
 
     nuc_max = int(np.max(im_segmentation_stack['Nuclei']))
 
@@ -7491,11 +7690,425 @@ def export_fea_mesh(
     with open("FE_segmentation.inp", "r") as f:
         lines = f.readlines()
 
-    out_path = str(_Path(input_file).stem) + "_FEA.inp"
+    out_path = _stem_output_path(input_file, "_FEA.inp", output_dir)
     with open(out_path, "w") as f:
         for line in _progress_iter(lines, progress, desc='Step 33D - Write Final INP'):
             if line == "*NODE\n":
                 f.write("*PART, name=Part-1\n")
             f.write(line)
         f.write("*END PART\n")
+
+
+# ---------------------------------------------------------------------------
+# Batch mode: input_file is a folder
+# ---------------------------------------------------------------------------
+
+# .ome.tif/.ome.tiff are covered by .tif/.tiff.
+SUPPORTED_IMAGE_EXTENSIONS = (".nd2", ".tif", ".tiff", ".czi", ".lif", ".oib")
+
+
+class BatchCompleted(Exception):
+    """Raised by the batch cell once the folder is processed, so that 'Run All'
+    stops there instead of running the single-file cells that follow.
+    Rendered as a one-line message rather than a traceback."""
+
+    def _render_traceback_(self):
+        return [str(self) or "Batch processing finished."]
+
+
+def is_batch_input(input_file):
+    """True if *input_file* is a folder (batch mode) rather than a single file."""
+    return os.path.isdir(input_file)
+
+
+def get_batch_output_dir(input_folder):
+    """Return the ``<folder>_output`` sibling folder used for batch outputs."""
+    from pathlib import Path as _Path
+    folder = _Path(input_folder).resolve()
+    return folder.parent / f"{folder.name}_output"
+
+
+def list_image_files(input_folder, extensions=SUPPORTED_IMAGE_EXTENSIONS):
+    """Sorted list of the supported image files directly inside *input_folder*
+    (subfolders are not searched)."""
+    from pathlib import Path as _Path
+    return sorted(
+        p for p in _Path(input_folder).iterdir()
+        if p.is_file() and p.suffix.lower() in extensions
+    )
+
+
+def _process_single_image_batch(
+    input_file,
+    output_dir,
+    roi_coords,
+    stain_dict,
+    cyto_markers,
+    name_setup,
+    use_setup,
+    automatic_contrast,
+    interactive_roi,
+    nuclei_diameter,
+    cell_diameter,
+    scale_factor,
+    zoom_factors,
+    trig_cellpose,
+    trig_stardist,
+    trig_cellpose_cyto,
+    multilabel,
+    aggregate_grow_factor,
+    nuclei_split_config,
+    cyto_split_config,
+    sigma,
+    num_plateaus,
+    plateau_factor,
+    threshold_method,
+    export_vtk,
+    export_stl,
+    export_fea,
+    settings,
+    napari_module,
+    progress,
+):
+    """Run the notebook pipeline (Cells 4-34) on one file, without viewers,
+    plots or PNG subfolders, writing every output file into *output_dir*
+    (this image's own subfolder of the batch output folder)."""
+    roi = list(roi_coords)
+    if interactive_roi:
+        roi = select_roi_interactively(input_file, roi, napari_module=napari_module)
+
+    # Cell 4
+    (meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
+     cyto_factor, PCM_factor, zooms, used_lazy_loading) = initialize_dataset(
+        input_file, roi,
+        nuclei_diameter=nuclei_diameter,
+        cell_diameter=cell_diameter,
+        scale_factor=scale_factor,
+        zoom_factors=list(zoom_factors),
+    )
+
+    # Cells 6-7
+    im_final_stack, _, _, _, _, stain_df, _ = prepare_and_preview(
+        img,
+        nuclei_diameter, cell_diameter,
+        stain_dict, file_meta,
+        napari_module=napari_module, r_xyz=(r_X, r_Y, r_Z), progress=progress,
+        show_viewer=False,
+    )
+    del img
+    stain_df, stain_complete_df, original_stain_complete_df = prepare_stain_settings(
+        im_final_stack['Original image'],
+        stain_df=stain_df,
+        name_setup=name_setup,
+        use_setup=use_setup,
+        automatic_contrast=automatic_contrast,
+        settings=settings,
+        napari_module=napari_module,
+        r_xyz=(r_X, r_Y, r_Z),
+        progress=progress,
+    )
+
+    # Cells 9-15
+    im_final_stack = run_normalize(im_final_stack, stain_complete_df=stain_complete_df)
+    im_final_stack, r_zX, r_zY, r_zZ = run_resample(
+        im_final_stack, stain_complete_df=stain_complete_df, zoom_factors=zooms, meta=meta,
+    )
+    im_final_stack = run_denoise(im_final_stack, stain_complete_df=stain_complete_df)
+    im_final_stack = run_contrast_gamma(im_final_stack, stain_complete_df=stain_complete_df)
+    im_final_stack = run_smooth(im_final_stack, stain_complete_df=stain_complete_df, sigma=sigma)
+    im_final_stack = run_equalize(
+        im_final_stack, stain_complete_df=stain_complete_df,
+        num_plateaus=num_plateaus, plateau_factor=plateau_factor,
+    )
+    im_final_stack = run_threshold(
+        im_final_stack,
+        stain_complete_df=stain_complete_df,
+        nuclei_diameter=nuclei_diameter,
+        cell_diameter=cell_diameter,
+        r_zX=r_zX, r_zY=r_zY, r_zZ=r_zZ,
+        threshold_method=threshold_method,
+        progress=progress,
+    )
+
+    # Cell 16
+    export_channel_histograms(
+        im_final_stack, stain_complete_df, input_file,
+        ROI_print=ROI_print, lazy_loading_used=used_lazy_loading,
+        name_setup=name_setup,
+        nuclei_diameter=nuclei_diameter, cell_diameter=cell_diameter,
+        cyto_factor=cyto_factor, PCM_factor=PCM_factor,
+        zoom_factors=zooms, scale_factor=scale_factor,
+        trig_cellpose=trig_cellpose, trig_stardist=trig_stardist,
+        trig_cellpose_cyto=trig_cellpose_cyto,
+        multilabel=multilabel, cyto_markers=cyto_markers,
+        nuclei_split_config=nuclei_split_config,
+        sigma=sigma, num_plateaus=num_plateaus, plateau_factor=plateau_factor,
+        threshold_method=threshold_method,
+        aggregate_grow_factor=aggregate_grow_factor,
+        progress=progress,
+        output_dir=output_dir,
+    )
+
+    # Cells 17-21
+    im_segmentation_stack = segment_nuclei(
+        im_final_stack,
+        stain_df=stain_df,
+        stain_complete_df=stain_complete_df,
+        nuclei_split_config=nuclei_split_config,
+        r_zxyz=(r_zX, r_zY, r_zZ),
+        nuclei_diameter=nuclei_diameter,
+        trig_stardist=trig_stardist,
+        trig_cellpose=trig_cellpose,
+        progress=progress,
+    )
+    im_segmentation_stack, stain_complete_df = segment_cytoplasm(
+        im_final_stack,
+        im_segmentation_stack=im_segmentation_stack,
+        stain_df=stain_df,
+        stain_complete_df=stain_complete_df,
+        cyto_markers=cyto_markers,
+        cyto_factor=cyto_factor,
+        nuclei_diameter=nuclei_diameter,
+        cell_diameter=cell_diameter,
+        trig_cellpose_cyto=trig_cellpose_cyto,
+        r_zxyz=(r_zX, r_zY, r_zZ),
+        progress=progress,
+        **cyto_split_config,
+    )
+    im_segmentation_stack = segment_pcm(
+        im_segmentation_stack=im_segmentation_stack,
+        stain_df=stain_df,
+        cyto_markers=cyto_markers,
+        cyto_factor=cyto_factor,
+        PCM_factor=PCM_factor,
+    )
+    im_segmentation_stack = assign_channel_labels(
+        im_final_stack,
+        im_segmentation_stack=im_segmentation_stack,
+        stain_df=stain_df,
+        progress=progress,
+    )
+    im_segmentation_stack = detect_aggregates(
+        im_segmentation_stack,
+        stain_df=stain_df,
+        aggregate_grow_factor=aggregate_grow_factor,
+    )
+
+    # _context() looks at this module's globals first, which may still hold
+    # the previous image's tables -- register this image's before quantifying.
+    set_notebook_context(stain_df=stain_df, stain_complete_df=stain_complete_df)
+
+    # Cells 23 and 25
+    percell_mean_df, percell_std_df = compute_percell_marker_intensity_df(
+        im_segmentation_stack, im_final_stack,
+        stain_complete_df=stain_complete_df,
+        progress=progress,
+    )
+    labels_full_df = build_full_labels_df(
+        im_segmentation_stack, im_final_stack,
+        stain_complete_df=stain_complete_df,
+        r_zX=r_zX, r_zY=r_zY, r_zZ=r_zZ,
+        zooms=zooms,
+        percell_mean_df=percell_mean_df,
+        percell_std_df=percell_std_df,
+        progress=progress,
+    )
+
+    # Cell 33 (written first: it is the main result and the cheapest export)
+    export_quantification_to_excel(
+        input_file, original_stain_complete_df, labels_full_df,
+        progress=progress, output_dir=output_dir,
+    )
+
+    # Cell 26 -- PDF only, PNGs go to a temporary folder
+    build_histogram_report(
+        im_segmentation_stack, im_final_stack,
+        stain_df=stain_df,
+        stain_complete_df=stain_complete_df,
+        input_file=input_file,
+        progress=progress,
+        output_dir=output_dir,
+        keep_png=False,
+        show_plot=False,
+    )
+
+    # Cells 30, 31, 34
+    if export_vtk:
+        build_vtk_volumes(
+            im_segmentation_stack,
+            labels_full_df=labels_full_df,
+            stain_complete_df=stain_complete_df,
+            input_file=input_file,
+            r_xyz=(r_X, r_Y, r_Z),
+            zoom_factors=zooms,
+            progress=progress,
+            output_dir=output_dir,
+            live_counter=False,
+        )
+    if export_stl:
+        export_marker_stl(
+            im_segmentation_stack,
+            stain_df=stain_df,
+            stain_complete_df=stain_complete_df,
+            input_file=input_file,
+            r_xyz=(r_X, r_Y, r_Z),
+            zoom_factors=zooms,
+            progress=progress,
+            output_dir=output_dir,
+        )
+    if export_fea:
+        export_fea_mesh(
+            im_segmentation_stack,
+            input_file=input_file,
+            progress=progress,
+            output_dir=output_dir,
+        )
+
+
+def run_batch_folder(
+    input_folder,
+    roi_coords,
+    stain_dict,
+    cyto_markers,
+    name_setup,
+    use_setup=True,
+    automatic_contrast=False,
+    interactive_roi=False,
+    nuclei_diameter=10.0,
+    cell_diameter=30.0,
+    scale_factor=1.0,
+    zoom_factors=None,
+    trig_cellpose=False,
+    trig_stardist=False,
+    trig_cellpose_cyto=False,
+    multilabel=True,
+    aggregate_grow_factor=2.0,
+    nuclei_split_config=None,
+    cyto_split_config=None,
+    sigma=0.5,
+    num_plateaus=2,
+    plateau_factor=0.7,
+    threshold_method='otsu',
+    export_vtk=True,
+    export_stl=True,
+    export_fea=True,
+    settings=None,
+    napari_module=None,
+    progress=None,
+):
+    """Process every supported image file in *input_folder* with the full
+    pipeline and write each image's outputs into its own subfolder,
+    ``<input_folder>_output/<image stem>/``.
+
+    Each file goes through the same steps as the single-file notebook
+    (Cells 4-34) with the same settings, but without napari viewers, inline
+    plots, the optional single-nucleus export, or the crop_png/merged_png/
+    density_png subfolders (the PNGs are only needed to build the PDF, so
+    they are written to a temporary folder and deleted). Output files keep
+    the ``<image stem>_...`` naming of the single-file mode.
+
+    Contrast/gamma settings come from ``<name_setup>_setup.csv`` like in
+    Cell 7: if it doesn't exist yet (or ``use_setup`` is False), the napari
+    setup viewer opens -- or ``automatic_contrast`` picks limits -- and the
+    CSV written for the first image is then reused for the following ones
+    (as long as ``use_setup`` is True).
+
+    A file that raises an error is reported and skipped; the batch carries on
+    with the next one.
+
+    Returns
+    -------
+    summary : DataFrame
+        One row per file with its status ('OK'/'FAILED'), output subfolder
+        and error message.
+    """
+    import traceback
+
+    image_files = list_image_files(input_folder)
+    if not image_files:
+        raise FileNotFoundError(
+            f"No supported image files ({', '.join(SUPPORTED_IMAGE_EXTENSIONS)}) "
+            f"found in {input_folder}"
+        )
+
+    output_dir = get_batch_output_dir(input_folder)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if zoom_factors is None:
+        zoom_factors = [1.0, 1.0, 1.0]
+    if nuclei_split_config is None:
+        nuclei_split_config = get_nuclei_split_config(profile="balanced")
+    if cyto_split_config is None:
+        cyto_split_config = get_cyto_split_config(profile="balanced")
+
+    print(f"Batch mode: {len(image_files)} image file(s) found in {input_folder}")
+    print(f"Outputs are written to: {output_dir}")
+
+    results = []
+    for n, image_path in enumerate(image_files, start=1):
+        print("\n" + "=" * 80)
+        print(f"[{n}/{len(image_files)}] {image_path.name}")
+        print("=" * 80)
+        image_output_dir = output_dir / _image_stem(image_path)
+        try:
+            image_output_dir.mkdir(parents=True, exist_ok=True)
+            _process_single_image_batch(
+                str(image_path),
+                image_output_dir,
+                roi_coords=roi_coords,
+                stain_dict=stain_dict,
+                cyto_markers=cyto_markers,
+                name_setup=name_setup,
+                use_setup=use_setup,
+                automatic_contrast=automatic_contrast,
+                interactive_roi=interactive_roi,
+                nuclei_diameter=nuclei_diameter,
+                cell_diameter=cell_diameter,
+                scale_factor=scale_factor,
+                zoom_factors=zoom_factors,
+                trig_cellpose=trig_cellpose,
+                trig_stardist=trig_stardist,
+                trig_cellpose_cyto=trig_cellpose_cyto,
+                multilabel=multilabel,
+                aggregate_grow_factor=aggregate_grow_factor,
+                nuclei_split_config=nuclei_split_config,
+                cyto_split_config=cyto_split_config,
+                sigma=sigma,
+                num_plateaus=num_plateaus,
+                plateau_factor=plateau_factor,
+                threshold_method=threshold_method,
+                export_vtk=export_vtk,
+                export_stl=export_stl,
+                export_fea=export_fea,
+                settings=settings,
+                napari_module=napari_module,
+                progress=progress,
+            )
+            results.append({
+                "File": image_path.name,
+                "Status": "OK",
+                "Output folder": str(image_output_dir),
+                "Error": "",
+            })
+        except Exception as exc:
+            traceback.print_exc()
+            print(f"[run_batch_folder] {image_path.name} FAILED -- continuing with the next file.")
+            results.append({
+                "File": image_path.name,
+                "Status": "FAILED",
+                "Output folder": str(image_output_dir),
+                "Error": f"{type(exc).__name__}: {exc}",
+            })
+        finally:
+            # Figures are not shown in batch mode; closing them also stops
+            # the inline backend from dumping them all at the end of the cell.
+            plt.close("all")
+            gc.collect()
+
+    summary = pd.DataFrame(results)
+    n_ok = int((summary["Status"] == "OK").sum())
+    print("\n" + "=" * 80)
+    print(f"Batch finished: {n_ok}/{len(summary)} file(s) processed successfully.")
+    print(f"Outputs: {output_dir}")
+    return summary
 

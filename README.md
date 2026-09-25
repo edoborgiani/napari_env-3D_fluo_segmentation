@@ -163,7 +163,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 Cell 1 loads all required imports in one step via `load_nuclei_notebook_setup()`. Cell 2 calls `reload_helpers()` to reload `helpers/notebook_helpers.py` without restarting the kernel.
 
 ### 2. Inputs & Setup
-- Set `input_file` to your `.nd2` or `.tif` file path, plus `ROI`, `name_setup`, `nuclei_diameter`/`cell_diameter`, `scale_factor`, the segmentation method flags (`trig_cellpose`, `trig_stardist`, `trig_cellpose_cyto`), and `nuclei_split_config`.
+- Set `input_file` to your image file path (`.nd2`, `.tif`/`.tiff`/`.ome.tif`, `.czi`, `.lif` or `.oib`; for multi-scene `.czi`/`.lif` files only the first scene is read), plus `ROI`, `name_setup`, `nuclei_diameter`/`cell_diameter`, `scale_factor`, the segmentation method flags (`trig_cellpose`, `trig_stardist`, `trig_cellpose_cyto`), and `nuclei_split_config`.
 - Set `interactive_roi = True` to pick the ROI visually instead of typing coordinates — `select_roi_interactively()` opens a napari window with a draggable rectangle over the full image (X/Y only; Z stays as set in `ROI`).
 - `initialize_dataset()` loads the image — automatically choosing lazy (chunked, dask-based) or eager reading depending on the file's size, with no setting to configure — reads physical pixel sizes from metadata, and computes derived parameters for correct spatial scaling.
 
@@ -225,7 +225,7 @@ The Live/Dead notebook follows the same helper-based structure as the nuclei not
 Cell 1 loads all required imports in one step via `load_ld_notebook_setup()`, which applies a lighter import profile than the nuclei workflow. Cell 2 calls `reload_helpers()` to reload `helpers/notebook_helpers.py` without restarting the kernel.
 
 ### 2. Load Image Data
-- Set `input_file` to your `.nd2` or `.tif` file path.
+- Set `input_file` to your image file path (`.nd2`, `.tif`/`.tiff`/`.ome.tif`, `.czi`, `.lif` or `.oib`).
 - `initialize_dataset()` loads the image — automatically choosing lazy (chunked, dask-based) or eager reading depending on the file's size, with no setting to configure — reads physical pixel sizes from metadata, and computes derived parameters for correct spatial scaling.
 
 ### 3. Define Sample & Staining Information
@@ -274,7 +274,7 @@ Cell 1 loads all required imports in one step via `load_ld_notebook_setup()`, wh
 ## Requirements
 See `requirements.txt` for the full list. Key dependencies:
 - `napari[all]`, `numpy`, `scipy`, `scikit-image`, `matplotlib`, `pandas`
-- `aicsimageio[nd2]`, `nd2reader`
+- `aicsimageio[nd2,czi,lif]`, `nd2reader`, `oiffile` — image readers (ND2, TIFF/OME-TIFF, CZI, LIF, OIB)
 - `tensorflow`, `csbdeep`, `stardist`, `cellpose` — segmentation models
 - `pyvista`, `SimpleITK`
 - `meshio`, `tetgen`, `meshlib`
