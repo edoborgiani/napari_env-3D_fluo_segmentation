@@ -3249,6 +3249,9 @@ def plot_marker_intensity_clouds(
     alpha=0.4,
     bins=40,
     progress=None,
+    input_file=None,
+    output_dir=None,
+    show=True,
 ):
     """Flow-cytometry-style XY cloud: per-cell marker intensity vs cytoplasm size.
 
@@ -3264,6 +3267,10 @@ def plot_marker_intensity_clouds(
     intensity (and the median cytoplasm size, in grey). In the marginal
     histograms, dashed lines mark the mean and dotted lines mean +/- 1
     standard deviation (across cells), with the values printed as text.
+
+    If *input_file* is given, the figure is also saved as
+    ``<input stem>_marker_intensity.png`` in *output_dir* (default: current
+    working directory). ``show=False`` skips displaying it (batch mode).
     """
     if conditions is None:
         conditions = list(percell_mean_df.columns)
@@ -3346,7 +3353,12 @@ def plot_marker_intensity_clouds(
     ax_right.set_xlabel("Cells")
     plt.setp(ax_top.get_xticklabels(), visible=False)
     plt.setp(ax_right.get_yticklabels(), visible=False)
-    plt.show()
+    if input_file is not None:
+        png_path = _stem_output_path(input_file, "_marker_intensity.png", output_dir)
+        fig.savefig(png_path, dpi=150, bbox_inches="tight")
+        print(f"Marker intensity plot saved to: {png_path}")
+    if show:
+        plt.show()
     return fig, ax
 
 
@@ -7913,6 +7925,20 @@ def _process_single_image_batch(
         percell_std_df=percell_std_df,
         progress=progress,
     )
+
+    # Cell 29 -- saved as PNG only, not displayed
+    plot_marker_intensity_clouds(
+        percell_mean_df,
+        stain_complete_df=stain_complete_df,
+        im_segmentation_stack=im_segmentation_stack,
+        r_xyz=(r_zX, r_zY, r_zZ),
+        stain_df=stain_df,
+        progress=progress,
+        input_file=input_file,
+        output_dir=output_dir,
+        show=False,
+    )
+    plt.close("all")
 
     # Cell 33 (written first: it is the main result and the cheapest export)
     export_quantification_to_excel(
