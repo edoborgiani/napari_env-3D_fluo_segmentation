@@ -10,8 +10,10 @@ from typing import Any
 
 
 DEFAULT_PIP_PACKAGES = [
-    "aicsimageio[nd2,czi,lif]",
+    "aicsimageio[nd2]",
     "aicspylibczi",
+    "fsspec",
+    "readlif",
     "nd2reader",
     "oiffile",
     "opencv-python",

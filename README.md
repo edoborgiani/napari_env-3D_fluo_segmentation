@@ -274,7 +274,7 @@ Cell 1 loads all required imports in one step via `load_ld_notebook_setup()`, wh
 ## Requirements
 See `requirements.txt` for the full list. Key dependencies:
 - `napari[all]`, `numpy`, `scipy`, `scikit-image`, `matplotlib`, `pandas`
-- `aicsimageio[nd2,czi,lif]`, `nd2reader`, `oiffile` — image readers (ND2, TIFF/OME-TIFF, CZI, LIF, OIB)
+- `aicsimageio[nd2]`, `nd2reader`, `aicspylibczi` + `fsspec`, `readlif`, `oiffile` — image readers (ND2, TIFF/OME-TIFF, CZI, LIF, OIB)
 - `tensorflow`, `csbdeep`, `stardist`, `cellpose` — segmentation models
 - `pyvista`, `SimpleITK`
 - `meshio`, `tetgen`, `meshlib`

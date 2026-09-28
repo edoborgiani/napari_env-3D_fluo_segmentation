@@ -42,10 +42,15 @@ opencv-python==4.10.0.84
 # with the dask pin above and sent pip walking back through aicsimageio's
 # whole history (down to versions that predate the 'nd2' extra) looking for
 # an alternative. 4.14.0 has no dask ceiling and includes the nd2 extra.
-# Extras = optional readers: nd2 (Nikon), czi (Zeiss, via aicspylibczi) and
-# lif (Leica, via readlif). TIFF/OME-TIFF need no extra.
-aicsimageio[nd2,czi,lif]==4.14.0
+# TIFF/OME-TIFF need no extra reader.
+aicsimageio[nd2]==4.14.0
 nd2reader
+# Optional aicsimageio readers, listed directly: aicsimageio 4.14.0 has no
+# 'czi'/'lif' extras (uv warns and silently skips them). aicsimageio picks
+# these up automatically when they are installed.
+aicspylibczi>=3.1.1  # Zeiss .czi
+fsspec>=2022.8.0     # needed by aicsimageio's CZI reader
+readlif>=0.6.4       # Leica .lif
 # Olympus .oib: aicsimageio can only read it through Bio-Formats (needs Java),
 # so it is read with oiffile instead -- see _OifFileReader in notebook_helpers.
 oiffile
@@ -57,7 +62,7 @@ oiffile
 # This line must ALSO be listed in overrides.txt (see the command at the top
 # of this file) so it takes precedence over that cap on 3.13. overrides.txt
 # is kept separate from this file -- and deliberately doesn't repeat the
-# extras-bearing lines above (napari[all], aicsimageio[nd2,czi,lif], dask[array]) --
+# extras-bearing lines above (napari[all], aicsimageio[nd2], dask[array]) --
 # because an override entry with extras isn't guaranteed to propagate them
 # the same way a normal requirement does.
 lxml<5,>=4.6; python_version < "3.13"
