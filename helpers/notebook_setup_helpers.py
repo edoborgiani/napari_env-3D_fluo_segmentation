@@ -11,7 +11,6 @@ from typing import Any
 
 DEFAULT_PIP_PACKAGES = [
     "aicsimageio[nd2]",
-    "aicspylibczi",
     "fsspec",
     "readlif",
     "nd2reader",
@@ -24,6 +23,9 @@ DEFAULT_PIP_PACKAGES = [
 
 # TensorFlow (and therefore StarDist) ships no wheels for Python 3.14 yet.
 TENSORFLOW_MAX_PYTHON = (3, 13)
+
+# aicspylibczi (Zeiss .czi reader) ships no wheels for Python 3.14 yet.
+AICSPYLIBCZI_MAX_PYTHON = (3, 13)
 
 # Kept in sync with the python_version markers in requirements.txt.
 SUPPORTED_PYTHON_VERSIONS = {(3, 10), (3, 11), (3, 12), (3, 13), (3, 14)}
@@ -98,6 +100,10 @@ def install_required_packages(extra_packages: list[str] | None = None) -> None:
         packages.append("tensorflow")
     else:
         print("Skipping tensorflow: no wheels for this Python version (StarDist will be unavailable).")
+    if sys.version_info[:2] <= AICSPYLIBCZI_MAX_PYTHON:
+        packages.append("aicspylibczi")
+    else:
+        print("Skipping aicspylibczi: no wheels for this Python version (.czi files cannot be read).")
     packages.append(get_tetgen_requirement())
     if extra_packages:
         packages.extend(extra_packages)

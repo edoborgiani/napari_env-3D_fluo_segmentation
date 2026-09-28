@@ -1,6 +1,7 @@
 # Works for Python 3.10-3.14 (3.10/3.11 most tested; 3.12-3.14 verified
 # against current PyPI wheel availability but less exercised in practice;
-# on 3.14 StarDist is unavailable -- see the tensorflow note below):
+# on 3.14 StarDist and .czi reading are unavailable -- see the tensorflow
+# and aicspylibczi notes below):
 # numpy/scipy/tensorflow/lxml below are pinned per Python version via markers,
 # since their <3.13 pins have no Python 3.13 wheels. Install with (uv
 # required -- see the lxml note below for why):
@@ -48,7 +49,11 @@ nd2reader
 # Optional aicsimageio readers, listed directly: aicsimageio 4.14.0 has no
 # 'czi'/'lif' extras (uv warns and silently skips them). aicsimageio picks
 # these up automatically when they are installed.
-aicspylibczi>=3.1.1  # Zeiss .czi
+# Python 3.14: aicspylibczi publishes no cp314 wheels (latest 4.0.1 stops at
+# cp313) and building it from source needs CMake + a C++ compiler, so it is
+# skipped there and .czi files can't be read on 3.14. Use Python 3.10-3.13
+# for .czi, or export the images to OME-TIFF.
+aicspylibczi>=3.1.1; python_version < "3.14"  # Zeiss .czi
 fsspec>=2022.8.0     # needed by aicsimageio's CZI reader
 readlif>=0.6.4       # Leica .lif
 # Olympus .oib: aicsimageio can only read it through Bio-Formats (needs Java),

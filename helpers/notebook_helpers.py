@@ -404,6 +404,17 @@ def open_image_file(input_file: str):
     if str(input_file).lower().endswith('.oib'):
         return _OifFileReader(str(input_file))
 
+    if str(input_file).lower().endswith('.czi'):
+        import importlib.util
+        if importlib.util.find_spec('aicspylibczi') is None:
+            import sys
+            raise ImportError(
+                f"Cannot read '{input_file}': .czi files need aicspylibczi, which "
+                f"is not installed (it has no wheels for Python "
+                f"{sys.version_info[0]}.{sys.version_info[1]}). Use Python "
+                "3.10-3.13 for .czi files, or export the image to OME-TIFF."
+            )
+
     from aicsimageio import AICSImage
     try:
         return AICSImage(input_file)
