@@ -93,6 +93,10 @@ __all__ = [
     "segment_nuclei",
     "segment_nuclei_cellpose",
     "segment_nuclei_watershed",
+    "refine_oversized_nuclei",
+    "merge_undersized_nuclei",
+    "estimate_reference_nucleus_size",
+    "refine_nuclei_by_size",
     "segment_cytoplasm",
     "segment_cytoplasm_cellpose",
     "segment_pcm",
@@ -6442,6 +6446,715 @@ def _display_nuclei_roundness_size_table(debug_info):
     return stats_df
 
 
+# Escalating split configurations used by `refine_oversized_nuclei`, from
+# gentlest to strongest. Each entry is (name, config overrides, diameter scale).
+# The diameter scale shrinks the nucleus diameter the crop re-segmentation
+# assumes, so seeds/peaks are allowed closer together at higher levels.
+_NUCLEI_SPLIT_ESCALATION_LEVELS = (
+    ("aggressive", {
+        "nuclei_bridge_shrink_factor": 0.30,
+        "nuclei_split_diameter_min_factor": 0.40,
+        "nuclei_split_diameter_max_factor": 1.4,
+        "nuclei_split_diameter_scales": 5,
+        "nuclei_seed_min_fraction": 0.02,
+        "nuclei_intensity_weight": 1.25,
+        "nuclei_gradient_weight": 1.5,
+        "nuclei_gradient_smooth_sigma": 1.0,
+    }, 1.0),
+    ("very aggressive", {
+        "nuclei_bridge_shrink_factor": 0.36,
+        "nuclei_split_diameter_min_factor": 0.35,
+        "nuclei_split_diameter_max_factor": 1.2,
+        "nuclei_split_diameter_scales": 6,
+        "nuclei_seed_min_fraction": 0.015,
+        "nuclei_intensity_weight": 1.5,
+        "nuclei_gradient_weight": 2.0,
+        "nuclei_gradient_smooth_sigma": 0.75,
+        "z_split_aggressive": True,
+    }, 0.9),
+    ("extreme", {
+        "nuclei_bridge_shrink_factor": 0.44,
+        "nuclei_split_diameter_min_factor": 0.30,
+        "nuclei_split_diameter_max_factor": 1.0,
+        "nuclei_split_diameter_scales": 8,
+        "nuclei_seed_min_fraction": 0.01,
+        "nuclei_intensity_weight": 2.0,
+        "nuclei_gradient_weight": 3.0,
+        "nuclei_gradient_smooth_sigma": 0.5,
+        "z_split_aggressive": True,
+    }, 0.8),
+)
+
+# For each escalated key: True = larger value splits more, False = smaller does.
+# Used so an escalation level is never gentler than the user's base config.
+_NUCLEI_SPLIT_AGGRESSIVE_DIRECTION = {
+    "nuclei_bridge_shrink_factor": True,
+    "nuclei_split_diameter_min_factor": False,
+    "nuclei_split_diameter_max_factor": False,
+    "nuclei_split_diameter_scales": True,
+    "nuclei_seed_min_fraction": False,
+    "nuclei_intensity_weight": True,
+    "nuclei_gradient_weight": True,
+    "nuclei_gradient_smooth_sigma": False,
+    "z_split_aggressive": True,
+}
+
+
+def _escalated_nuclei_split_config(base_config, level):
+    """Return (name, config, diameter_scale) for escalation *level* (0-based),
+    never gentler than *base_config* on any escalated key."""
+    name, overrides, diameter_scale = _NUCLEI_SPLIT_ESCALATION_LEVELS[level]
+    cfg = dict(base_config or {})
+    for key, value in overrides.items():
+        if key in cfg:
+            pick = max if _NUCLEI_SPLIT_AGGRESSIVE_DIRECTION[key] else min
+            cfg[key] = type(value)(pick(cfg[key], value))
+        else:
+            cfg[key] = value
+    # The stronger levels rely on the signal's own dip between nuclei.
+    cfg["split_by_intensity_gradient"] = True
+    return name, cfg, diameter_scale
+
+
+def _resegment_nucleus_assembly(
+    assembly_mask,
+    intensity_crop,
+    intensity_raw_crop,
+    r_zxyz,
+    nuclei_diameter,
+    split_config,
+    min_piece_vox,
+):
+    """Re-run the watershed split on one cropped nuclei assembly.
+
+    Returns an int32 label crop (0 outside *assembly_mask*) covering every
+    voxel of the assembly, or None if it could not be split into >= 2 pieces
+    of at least *min_piece_vox* voxels.
+    """
+    r_zX, r_zY, r_zZ = r_zxyz
+    pad = 4  # > the 3-voxel boundary margin used by segment_nuclei_watershed
+    mask_p = np.pad(assembly_mask, pad, mode="constant", constant_values=False)
+    inten_p = np.pad(intensity_crop.astype(np.float32), pad, mode="edge")
+    inten_raw_p = None
+    if intensity_raw_crop is not None:
+        inten_raw_p = np.pad(intensity_raw_crop.astype(np.float32), pad, mode="edge")
+    # Only the assembly itself should carry signal, not neighbouring nuclei
+    # that fall inside its bounding box.
+    inten_p = np.where(mask_p, inten_p, 0.0)
+    if inten_raw_p is not None:
+        inten_raw_p = np.where(mask_p, inten_raw_p, 0.0)
+
+    sub_labels, _ = segment_nuclei_watershed(
+        binary_mask=mask_p,
+        r_zX=r_zX, r_zY=r_zY, r_zZ=r_zZ,
+        nuclei_diameter=nuclei_diameter,
+        intensity_img=inten_p,
+        intensity_img_raw=inten_raw_p,
+        progress=None,
+        **split_config,
+    )
+    sub_labels = sub_labels[pad:-pad, pad:-pad, pad:-pad]
+    sub_labels = np.where(assembly_mask, sub_labels, 0).astype(np.int32)
+
+    # Drop fragments too small to be a nucleus; their voxels are refilled below.
+    ids, counts = np.unique(sub_labels[sub_labels > 0], return_counts=True)
+    keep_ids = ids[counts >= min_piece_vox]
+    if keep_ids.size < 2:
+        return None
+    sub_labels[~np.isin(sub_labels, keep_ids)] = 0
+
+    # Give every assembly voxel back to a piece so no nuclear signal is lost:
+    # watershed along the distance map first, then nearest piece for any
+    # voxel the watershed could not reach (e.g. disconnected fragments).
+    distance = ndi.distance_transform_edt(assembly_mask, sampling=(r_zZ, r_zY, r_zX))
+    filled = watershed(-distance, sub_labels, mask=assembly_mask).astype(np.int32)
+    holes = assembly_mask & (filled == 0)
+    if np.any(holes):
+        _, nearest = ndi.distance_transform_edt(filled == 0, return_indices=True)
+        filled[holes] = filled[tuple(idx[holes] for idx in nearest)]
+    return filled
+
+
+def refine_oversized_nuclei(
+    labels,
+    intensity_img,
+    r_zxyz,
+    nuclei_diameter,
+    base_split_config=None,
+    intensity_img_raw=None,
+    oversize_factor=2.0,
+    max_iterations=3,
+    reference_vox=None,
+    undersize_factor=0.5,
+    progress=None,
+    verbose=True,
+):
+    """Iteratively split nuclei labels that are much bigger than one nucleus.
+
+    A label whose volume is more than ``oversize_factor`` times the reference
+    single-nucleus volume (``reference_vox``, e.g. from
+    `estimate_reference_nucleus_size`; defaults to a sphere of
+    ``nuclei_diameter``) is treated as an assembly of several nuclei that the
+    first segmentation pass left merged.
+    Each assembly is cropped and re-segmented on its own with a split
+    configuration that gets stronger each iteration:
+
+    1. "aggressive"       - stronger erosion, more scales, smaller seeds
+    2. "very aggressive"  - + stronger intensity/gradient weighting, Z split
+    3. "extreme"          - strongest erosion, closest allowed seeds
+
+    Pieces that are still oversized after one iteration are passed on to the
+    next, stronger level. Assemblies that cannot be split at any level are
+    kept unchanged (never deleted). Every voxel of a split assembly is
+    reassigned to one of its pieces, so no nuclear signal is lost.
+
+    Parameters
+    ----------
+    labels : ndarray (Z, Y, X), int
+        Nuclei label volume from the first segmentation pass.
+    intensity_img : ndarray (Z, Y, X)
+        Nuclei-channel intensity ('Filtered image').
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
+        Isotropic voxel sizes in micrometers.
+    nuclei_diameter : float
+        Expected nucleus diameter in micrometers.
+    base_split_config : dict, optional
+        The user's `nuclei_split_config`; escalation levels are never gentler
+        than it.
+    intensity_img_raw : ndarray (Z, Y, X), optional
+        Same channel before contrast/gamma clipping ('Denoised image').
+    oversize_factor : float
+        Volume, in multiples of one expected nucleus, above which a label is
+        treated as an assembly (default 2.0).
+    max_iterations : int
+        Number of escalation levels to try (1-3, default 3).
+    reference_vox : float, optional
+        Reference single-nucleus volume in voxels. None = sphere of
+        ``nuclei_diameter``. The crop re-segmentation also assumes the
+        matching diameter.
+    undersize_factor : float
+        A split is only accepted with pieces of at least this many reference
+        volumes (scaled with the level's diameter), so splitting never
+        creates labels `merge_undersized_nuclei` would treat as fragments.
+    verbose : bool
+        Print a per-iteration summary and display a per-assembly table.
+
+    Returns
+    -------
+    labels_out : ndarray (Z, Y, X), int32
+        Refined, sequentially relabelled nuclei volume.
+    refine_info : dict
+        Keys: 'expected_nucleus_vox', 'oversize_vox_thresh', 'iterations'
+        (list of per-iteration dicts), 'assemblies' (per-assembly DataFrame),
+        'n_before', 'n_after', 'unresolved'.
+    """
+    from skimage.segmentation import relabel_sequential
+
+    r_zX, r_zY, r_zZ = r_zxyz
+    voxel_um3 = r_zZ * r_zY * r_zX
+    input_vox = max(1.0, _sphere_volume_um3(nuclei_diameter) / voxel_um3)
+    expected_vox = float(reference_vox) if reference_vox else input_vox
+    expected_um3 = expected_vox * voxel_um3
+    # Diameter matching the reference volume, used by the crop re-segmentation.
+    reference_diameter = nuclei_diameter * (expected_vox / input_vox) ** (1.0 / 3.0)
+    oversize_vox = float(oversize_factor) * expected_vox
+    n_iter = int(np.clip(max_iterations, 1, len(_NUCLEI_SPLIT_ESCALATION_LEVELS)))
+
+    labels_out = np.asarray(labels).astype(np.int32, copy=True)
+    n_before = int(np.count_nonzero(np.unique(labels_out)))
+    next_id = int(labels_out.max()) + 1
+    iterations = []
+    records = []
+    # Labels that failed to split at the previous level, or pieces produced
+    # there that are still oversized, are retried at the next level.
+    candidate_ids = None
+
+    if verbose:
+        print(
+            f"Iterative split: reference nucleus ~ {expected_um3:.0f} um^3 "
+            f"({expected_vox:.0f} voxels); labels > {oversize_factor:g}x "
+            f"({oversize_vox:.0f} voxels) are treated as nuclei assemblies."
+        )
+
+    for level in range(n_iter):
+        level_name, cfg, diameter_scale = _escalated_nuclei_split_config(
+            base_split_config, level
+        )
+        volumes = np.bincount(labels_out.ravel())
+        oversized = [int(i) for i in np.nonzero(volumes > oversize_vox)[0] if i > 0]
+        if candidate_ids is not None:
+            oversized = [i for i in oversized if i in candidate_ids]
+        if not oversized:
+            break
+
+        if verbose:
+            print(
+                f"  Iteration {level + 1}/{n_iter} - {len(oversized)} nuclei "
+                f"assembl{'y' if len(oversized) == 1 else 'ies'} detected -> "
+                f"re-splitting with '{level_name}' configuration "
+                f"(bridge shrink={cfg['nuclei_bridge_shrink_factor']:.2f}, "
+                f"gradient weight={cfg['nuclei_gradient_weight']:.1f}, "
+                f"diameter x{diameter_scale:g})"
+            )
+
+        slices = ndi.find_objects(labels_out)
+        min_piece_vox = max(
+            8, int(undersize_factor * expected_vox * diameter_scale ** 3)
+        )
+        split_count = 0
+        new_nuclei = 0
+        next_candidates = set()
+
+        for lab in _progress_iter(
+            oversized, progress,
+            desc=f'Step 17 - Split assemblies ({level_name})', leave=False,
+        ):
+            sl = slices[lab - 1]
+            if sl is None:
+                continue
+            crop_labels = labels_out[sl]
+            assembly_mask = crop_labels == lab
+            vol = int(np.count_nonzero(assembly_mask))
+            pieces = _resegment_nucleus_assembly(
+                assembly_mask,
+                intensity_img[sl],
+                None if intensity_img_raw is None else intensity_img_raw[sl],
+                r_zxyz,
+                reference_diameter * diameter_scale,
+                cfg,
+                min_piece_vox,
+            )
+            if pieces is None:
+                next_candidates.add(lab)
+                records.append({
+                    'Iteration': level + 1, 'Configuration': level_name,
+                    'Label': lab, 'Volume (voxels)': vol,
+                    'Size (x reference)': round(vol / expected_vox, 2),
+                    'Result': 'not split', 'Pieces': 1,
+                })
+                continue
+
+            piece_ids = [int(p) for p in np.unique(pieces) if p > 0]
+            # The first piece keeps the assembly's label id; the others get new ids.
+            id_map = {piece_ids[0]: lab}
+            for p in piece_ids[1:]:
+                id_map[p] = next_id
+                next_id += 1
+            for p, new_lab in id_map.items():
+                piece_mask = pieces == p
+                crop_labels[piece_mask] = new_lab
+                if np.count_nonzero(piece_mask) > oversize_vox:
+                    next_candidates.add(new_lab)
+
+            split_count += 1
+            new_nuclei += len(piece_ids) - 1
+            records.append({
+                'Iteration': level + 1, 'Configuration': level_name,
+                'Label': lab, 'Volume (voxels)': vol,
+                'Size (x reference)': round(vol / expected_vox, 2),
+                'Result': f'split into {len(piece_ids)}', 'Pieces': len(piece_ids),
+            })
+
+        iterations.append({
+            'iteration': level + 1,
+            'configuration': level_name,
+            'assemblies': len(oversized),
+            'split': split_count,
+            'new_nuclei': new_nuclei,
+        })
+        if verbose:
+            print(
+                f"    -> {split_count}/{len(oversized)} split, "
+                f"+{new_nuclei} nuclei recovered"
+            )
+        candidate_ids = next_candidates
+
+    volumes = np.bincount(labels_out.ravel())
+    unresolved = [int(i) for i in np.nonzero(volumes > oversize_vox)[0] if i > 0]
+    labels_out, _, _ = relabel_sequential(labels_out)
+    n_after = int(np.count_nonzero(np.unique(labels_out)))
+    assemblies_df = pd.DataFrame(records)
+
+    if verbose:
+        if not iterations:
+            print("  No oversized nuclei assemblies found - nothing to split.")
+        else:
+            print(
+                f"Iterative split done: {n_before} -> {n_after} nuclei "
+                f"(+{n_after - n_before}). "
+                f"{len(unresolved)} oversized label(s) still unresolved "
+                f"after all levels (kept as-is)."
+            )
+            try:
+                from IPython.display import display as _display
+                _display(assemblies_df)
+            except Exception:
+                pass
+
+    refine_info = {
+        'expected_nucleus_vox': expected_vox,
+        'oversize_vox_thresh': oversize_vox,
+        'iterations': iterations,
+        'assemblies': assemblies_df,
+        'n_before': n_before,
+        'n_after': n_after,
+        'unresolved': len(unresolved),
+    }
+    return labels_out, refine_info
+
+
+def _sphere_volume_um3(diameter_um):
+    """Volume (um^3) of a sphere of the given diameter."""
+    return (4.0 * np.pi * ((float(diameter_um) / 2.0) ** 3)) / 3.0
+
+
+def _display_if_notebook(df):
+    try:
+        from IPython.display import display as _display
+        _display(df)
+    except Exception:
+        pass
+
+
+def estimate_reference_nucleus_size(
+    labels,
+    r_zxyz,
+    nuclei_diameter,
+    size_reference="blend",
+    plausible_range=(0.25, 4.0),
+    min_labels=5,
+    verbose=True,
+):
+    """Estimate the reference single-nucleus volume used to judge label sizes.
+
+    Two estimates are combined:
+
+    - the **input** volume: a sphere of ``nuclei_diameter``;
+    - the **detected** volume: the median volume of the labels found by the
+      first segmentation pass, using only "plausible" labels (between
+      ``plausible_range`` x the input volume) so fragments and assemblies do
+      not bias it. The median is used because it is robust to the remaining
+      outliers.
+
+    Parameters
+    ----------
+    size_reference : {"blend", "input", "detected"}
+        - "blend"    (default): geometric mean of the input and detected
+          volumes -- follows the data when cells are on average bigger or
+          smaller than the input diameter, but stays anchored to it.
+        - "input"    : input diameter only.
+        - "detected" : detected median only.
+        If fewer than ``min_labels`` plausible labels exist, the input
+        volume is used whatever the setting.
+
+    Returns
+    -------
+    reference_vox : float
+        Reference single-nucleus volume in voxels.
+    info : dict
+        'input_vox', 'detected_vox' (or None), 'n_plausible',
+        'reference_vox', 'reference_diameter_um', 'size_reference'.
+    """
+    choices = ("blend", "input", "detected")
+    if size_reference not in choices:
+        raise ValueError(
+            f"Unknown size_reference '{size_reference}'. Choose from {choices}."
+        )
+    r_zX, r_zY, r_zZ = r_zxyz
+    voxel_um3 = r_zZ * r_zY * r_zX
+    input_vox = max(1.0, _sphere_volume_um3(nuclei_diameter) / voxel_um3)
+
+    volumes = np.bincount(np.asarray(labels).ravel())[1:]
+    volumes = volumes[volumes > 0]
+    lo, hi = plausible_range
+    plausible = volumes[(volumes >= lo * input_vox) & (volumes <= hi * input_vox)]
+    detected_vox = float(np.median(plausible)) if plausible.size >= min_labels else None
+
+    used = size_reference
+    if detected_vox is None or size_reference == "input":
+        reference_vox = input_vox
+        used = "input"
+    elif size_reference == "detected":
+        reference_vox = detected_vox
+    else:
+        reference_vox = float(np.sqrt(input_vox * detected_vox))
+
+    reference_diameter = nuclei_diameter * (reference_vox / input_vox) ** (1.0 / 3.0)
+
+    if verbose:
+        def _diam(vox):
+            return nuclei_diameter * (vox / input_vox) ** (1.0 / 3.0)
+        print(
+            f"Reference nucleus size: input diameter {nuclei_diameter:g} um -> "
+            f"{input_vox:.0f} voxels"
+        )
+        if detected_vox is None:
+            print(
+                f"  Detected: only {plausible.size} plausible label(s) "
+                f"(< {min_labels}) -> using the input size."
+            )
+        else:
+            print(
+                f"  Detected: median of {plausible.size} plausible labels = "
+                f"{detected_vox:.0f} voxels (~{_diam(detected_vox):.1f} um, "
+                f"{detected_vox / input_vox:.2f}x input)"
+            )
+        print(
+            f"  Reference ('{used}'): {reference_vox:.0f} voxels "
+            f"(~{reference_diameter:.1f} um diameter)"
+        )
+
+    info = {
+        'input_vox': input_vox,
+        'detected_vox': detected_vox,
+        'n_plausible': int(plausible.size),
+        'reference_vox': reference_vox,
+        'reference_diameter_um': reference_diameter,
+        'size_reference': used,
+    }
+    return reference_vox, info
+
+
+def merge_undersized_nuclei(
+    labels,
+    intensity_img,
+    reference_vox,
+    undersize_factor=0.5,
+    max_merged_factor=1.5,
+    min_interface_ratio=0.85,
+    smooth_sigma=1.0,
+    max_rounds=5,
+    progress=None,
+    verbose=True,
+):
+    """Merge labels that are too small to be a whole nucleus into a touching
+    neighbour when both most likely belong to the same nucleus (the
+    conservative counterpart of `refine_oversized_nuclei`).
+
+    A label smaller than ``undersize_factor`` x ``reference_vox`` is a
+    candidate fragment. It is merged into the touching neighbour it shares
+    the largest contact surface with, provided that:
+
+    - the merged label would still be one plausible nucleus
+      (<= ``max_merged_factor`` x ``reference_vox``), and
+    - there is no intensity dip at the contact surface: the mean intensity
+      there is at least ``min_interface_ratio`` x the dimmer label's mean.
+      Two different nuclei touching normally show a darker seam between
+      them; two fragments of one nucleus don't.
+
+    If the best-contact neighbour fails, the next one is tried. Fragments
+    that touch nothing, or where every neighbour fails, are kept as they are
+    (never deleted). This is repeated for up to ``max_rounds`` rounds, since
+    a merged fragment may still be small and merge again.
+
+    Returns
+    -------
+    labels_out : ndarray (Z, Y, X), int32
+        Sequentially relabelled nuclei volume.
+    merge_info : dict
+        'undersize_vox_thresh', 'n_small', 'n_merged', 'n_before', 'n_after',
+        'rounds', 'fragments' (per-fragment DataFrame).
+    """
+    from skimage.segmentation import relabel_sequential
+
+    labels_out = np.asarray(labels).astype(np.int32, copy=True)
+    smoothed = ndi.gaussian_filter(
+        np.asarray(intensity_img, dtype=np.float32), sigma=max(float(smooth_sigma), 1e-3)
+    )
+    small_vox = float(undersize_factor) * reference_vox
+    max_merged_vox = float(max_merged_factor) * reference_vox
+    n_before = int(np.count_nonzero(np.unique(labels_out)))
+
+    n_bins = int(labels_out.max()) + 1
+    volumes = np.bincount(labels_out.ravel(), minlength=n_bins).astype(np.int64)
+    sums = np.bincount(labels_out.ravel(), weights=smoothed.ravel(), minlength=n_bins)
+    n_small = int(np.count_nonzero((volumes[1:] > 0) & (volumes[1:] < small_vox)))
+    struct = ndi.generate_binary_structure(3, 1)
+    status = {}  # fragment label -> latest record
+    rounds = 0
+
+    if verbose:
+        print(
+            f"Merge of undersized labels: labels < {undersize_factor:g}x reference "
+            f"({small_vox:.0f} voxels) are treated as possible fragments of one "
+            f"nucleus - {n_small} found."
+        )
+
+    for rnd in range(max_rounds):
+        order = np.argsort(volumes)
+        small_ids = [int(i) for i in order if i > 0 and 0 < volumes[i] < small_vox]
+        if not small_ids:
+            break
+        rounds += 1
+        slices = ndi.find_objects(labels_out)
+        grown = set()  # labels that absorbed a fragment: bbox is stale this round
+        merged_this_round = 0
+
+        for a in _progress_iter(
+            small_ids, progress, desc=f'Step 17 - Merge fragments (round {rnd + 1})',
+            leave=False,
+        ):
+            if volumes[a] == 0 or volumes[a] >= small_vox or a in grown:
+                continue
+            sl = slices[a - 1]
+            if sl is None:
+                continue
+            sl_p = tuple(
+                slice(max(0, s.start - 1), min(dim, s.stop + 1))
+                for s, dim in zip(sl, labels_out.shape)
+            )
+            crop = labels_out[sl_p]
+            inten = smoothed[sl_p]
+            mask_a = crop == a
+            ring = ndi.binary_dilation(mask_a, structure=struct) & ~mask_a
+            nb_ids, contact = np.unique(crop[ring], return_counts=True)
+            keep = nb_ids > 0
+            nb_ids, contact = nb_ids[keep], contact[keep]
+
+            record = {
+                'Label': a,
+                'Volume (voxels)': int(volumes[a]),
+                'Size (x reference)': round(volumes[a] / reference_vox, 2),
+                'Merged into': None,
+                'Contact (voxels)': 0,
+                'Interface/intensity ratio': None,
+                'Result': 'kept (isolated)',
+            }
+            if nb_ids.size == 0:
+                status[a] = record
+                continue
+
+            record['Result'] = 'kept'
+            reasons = []
+            for idx in np.argsort(-contact):
+                b = int(nb_ids[idx])
+                if volumes[a] + volumes[b] > max_merged_vox:
+                    reasons.append('merged size too big')
+                    continue
+                mask_b = crop == b
+                interface = (ring & mask_b) | (
+                    ndi.binary_dilation(mask_b, structure=struct) & mask_a
+                )
+                interface_mean = float(inten[interface].mean())
+                mean_a = sums[a] / volumes[a]
+                mean_b = sums[b] / volumes[b]
+                ratio = interface_mean / max(min(mean_a, mean_b), 1e-6)
+                if ratio < min_interface_ratio:
+                    reasons.append('intensity dip at contact')
+                    record['Interface/intensity ratio'] = round(ratio, 2)
+                    continue
+
+                crop[mask_a] = b
+                volumes[b] += volumes[a]
+                sums[b] += sums[a]
+                volumes[a] = 0
+                sums[a] = 0.0
+                grown.add(b)
+                merged_this_round += 1
+                record.update({
+                    'Merged into': b,
+                    'Contact (voxels)': int(contact[idx]),
+                    'Interface/intensity ratio': round(ratio, 2),
+                    'Result': 'merged',
+                })
+                break
+            if record['Result'] != 'merged':
+                record['Result'] = 'kept (' + ', '.join(sorted(set(reasons))) + ')'
+            status[a] = record
+
+        if verbose:
+            print(f"  Round {rnd + 1}: {merged_this_round} fragment(s) merged")
+        if merged_this_round == 0:
+            break
+
+    labels_out, _, _ = relabel_sequential(labels_out)
+    n_after = int(np.count_nonzero(np.unique(labels_out)))
+    fragments_df = pd.DataFrame(list(status.values()))
+    n_merged = int((fragments_df['Result'] == 'merged').sum()) if len(fragments_df) else 0
+
+    if verbose and n_small:
+        print(
+            f"Merge done: {n_before} -> {n_after} nuclei (-{n_before - n_after}). "
+            f"{n_merged} fragment(s) merged into a touching neighbour, "
+            f"{len(fragments_df) - n_merged} small label(s) kept as-is."
+        )
+        _display_if_notebook(fragments_df)
+
+    merge_info = {
+        'undersize_vox_thresh': small_vox,
+        'n_small': n_small,
+        'n_merged': n_merged,
+        'n_before': n_before,
+        'n_after': n_after,
+        'rounds': rounds,
+        'fragments': fragments_df,
+    }
+    return labels_out, merge_info
+
+
+def refine_nuclei_by_size(
+    labels,
+    intensity_img,
+    r_zxyz,
+    nuclei_diameter,
+    base_split_config=None,
+    intensity_img_raw=None,
+    size_reference="blend",
+    merge_undersized=True,
+    undersize_factor=0.5,
+    iterative_split=True,
+    oversize_factor=2.0,
+    max_split_iterations=3,
+    progress=None,
+    verbose=True,
+):
+    """Size-based refinement of a nuclei label volume, in three steps:
+
+    1. `estimate_reference_nucleus_size` - reference single-nucleus volume
+       from the input diameter and/or the detected label sizes.
+    2. `merge_undersized_nuclei` (if ``merge_undersized``) - conservative:
+       labels < ``undersize_factor`` x reference are merged into a touching
+       neighbour when both look like one nucleus.
+    3. `refine_oversized_nuclei` (if ``iterative_split``) - aggressive:
+       labels > ``oversize_factor`` x reference are re-split with escalating
+       configurations.
+
+    Returns
+    -------
+    labels_out : ndarray (Z, Y, X), int32
+    info : dict with keys 'reference', 'merge', 'split' (None if skipped).
+    """
+    reference_vox, ref_info = estimate_reference_nucleus_size(
+        labels, r_zxyz, nuclei_diameter,
+        size_reference=size_reference, verbose=verbose,
+    )
+    labels_out = np.asarray(labels).astype(np.int32, copy=False)
+    merge_info = split_info = None
+
+    if merge_undersized:
+        labels_out, merge_info = merge_undersized_nuclei(
+            labels_out, intensity_img, reference_vox,
+            undersize_factor=undersize_factor,
+            progress=progress, verbose=verbose,
+        )
+    if iterative_split:
+        labels_out, split_info = refine_oversized_nuclei(
+            labels_out,
+            intensity_img=intensity_img,
+            intensity_img_raw=intensity_img_raw,
+            r_zxyz=r_zxyz,
+            nuclei_diameter=nuclei_diameter,
+            base_split_config=base_split_config,
+            oversize_factor=oversize_factor,
+            max_iterations=max_split_iterations,
+            reference_vox=reference_vox,
+            undersize_factor=undersize_factor,
+            progress=progress,
+            verbose=verbose,
+        )
+    return labels_out, {'reference': ref_info, 'merge': merge_info, 'split': split_info}
+
+
 def segment_nuclei(
     im_final_stack,
     stain_df,
@@ -6451,10 +7164,30 @@ def segment_nuclei(
     nuclei_diameter,
     trig_stardist=False,
     trig_cellpose=False,
+    iterative_split=True,
+    oversize_factor=2.0,
+    max_split_iterations=3,
+    merge_undersized=True,
+    undersize_factor=0.5,
+    size_reference="blend",
     progress=None,
 ):
     """
     Segment nuclei from the image using watershed, StarDist, or Cellpose.
+
+    The first-pass labels are then refined by size with
+    `refine_nuclei_by_size` (for every method):
+
+    - a reference single-nucleus volume is estimated from the input
+      ``nuclei_diameter`` and/or the median detected label size
+      (``size_reference``);
+    - with ``merge_undersized``, labels smaller than ``undersize_factor`` x
+      reference are merged into a touching neighbour when there is no
+      intensity dip between them (conservative: likely one nucleus);
+    - with ``iterative_split``, labels larger than ``oversize_factor`` x
+      reference are treated as merged nuclei assemblies and re-split with
+      increasingly aggressive configurations, for up to
+      ``max_split_iterations`` rounds.
 
     The watershed path passes the 'Filtered image' NUCLEI-channel intensity
     (or the max-projection across channels in LD mode) into
@@ -6486,6 +7219,22 @@ def segment_nuclei(
         If True, use StarDist.
     trig_cellpose : bool
         If True, use Cellpose 3D (takes priority over StarDist and watershed).
+    iterative_split : bool
+        If True, iteratively re-split oversized labels (nuclei assemblies).
+    oversize_factor : float
+        Label volume, in multiples of the reference nucleus, above which a
+        label is treated as an assembly to split (default 2.0).
+    max_split_iterations : int
+        Number of escalating split levels to try (1-3, default 3).
+    merge_undersized : bool
+        If True, merge undersized fragments into a touching neighbour when
+        they most likely belong to the same nucleus.
+    undersize_factor : float
+        Label volume, in multiples of the reference nucleus, below which a
+        label is treated as a possible fragment (default 0.5).
+    size_reference : {"blend", "input", "detected"}
+        How the reference nucleus volume is set - see
+        `estimate_reference_nucleus_size` (default "blend").
     progress : callable, optional
         Progress wrapper (e.g. tqdm).
 
@@ -6500,6 +7249,27 @@ def segment_nuclei(
     r_zX, r_zY, r_zZ = r_zxyz
     im_segmentation_stack = {}
 
+    def _refine(labels, intensity_img, intensity_img_raw):
+        if not (iterative_split or merge_undersized):
+            return labels
+        labels, _ = refine_nuclei_by_size(
+            labels,
+            intensity_img=intensity_img,
+            intensity_img_raw=intensity_img_raw,
+            r_zxyz=r_zxyz,
+            nuclei_diameter=nuclei_diameter,
+            base_split_config=nuclei_split_config,
+            size_reference=size_reference,
+            merge_undersized=merge_undersized,
+            undersize_factor=undersize_factor,
+            iterative_split=iterative_split,
+            oversize_factor=oversize_factor,
+            max_split_iterations=max_split_iterations,
+            progress=progress,
+        )
+        print(f"Total nuclei after size refinement: {int(labels.max())}")
+        return labels
+
     if 'NUCLEI' not in stain_df.index:
         # LD-style: union all channels.
         if trig_cellpose:
@@ -6509,6 +7279,9 @@ def segment_nuclei(
                 combined,
                 nuclei_diameter=nuclei_diameter,
                 voxel_size=(r_zZ, r_zY, r_zX),
+            )
+            im_out = _refine(
+                im_out, combined, np.max(im_final_stack['Denoised image'], axis=-1)
             )
             im_segmentation_stack['Nuclei'] = im_out
             im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
@@ -6537,6 +7310,7 @@ def segment_nuclei(
 
         print(f"Total nuclei found: {int(im_out.max())}")
         _display_nuclei_roundness_size_table(debug_info)
+        im_out = _refine(im_out, intensity_img, intensity_img_raw)
 
         im_segmentation_stack['Nuclei'] = im_out
         im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
@@ -6592,6 +7366,11 @@ def segment_nuclei(
             print(f"Total nuclei found: {int(im_out.max())}")
             _display_nuclei_roundness_size_table(debug_info)
 
+        im_out = _refine(
+            im_out,
+            im_final_stack['Filtered image'][:, :, :, c],
+            im_final_stack['Denoised image'][:, :, :, c],
+        )
         im_segmentation_stack['Nuclei'] = im_out
 
     return im_segmentation_stack
@@ -7771,6 +8550,12 @@ def _process_single_image_batch(
     aggregate_grow_factor,
     nuclei_split_config,
     cyto_split_config,
+    iterative_split,
+    oversize_factor,
+    max_split_iterations,
+    merge_undersized,
+    undersize_factor,
+    size_reference,
     sigma,
     num_plateaus,
     plateau_factor,
@@ -7871,6 +8656,12 @@ def _process_single_image_batch(
         nuclei_diameter=nuclei_diameter,
         trig_stardist=trig_stardist,
         trig_cellpose=trig_cellpose,
+        iterative_split=iterative_split,
+        oversize_factor=oversize_factor,
+        max_split_iterations=max_split_iterations,
+        merge_undersized=merge_undersized,
+        undersize_factor=undersize_factor,
+        size_reference=size_reference,
         progress=progress,
     )
     im_segmentation_stack, stain_complete_df = segment_cytoplasm(
@@ -8011,6 +8802,12 @@ def run_batch_folder(
     aggregate_grow_factor=2.0,
     nuclei_split_config=None,
     cyto_split_config=None,
+    iterative_split=True,
+    oversize_factor=2.0,
+    max_split_iterations=3,
+    merge_undersized=True,
+    undersize_factor=0.5,
+    size_reference="blend",
     sigma=0.5,
     num_plateaus=2,
     plateau_factor=0.7,
@@ -8099,6 +8896,12 @@ def run_batch_folder(
                 aggregate_grow_factor=aggregate_grow_factor,
                 nuclei_split_config=nuclei_split_config,
                 cyto_split_config=cyto_split_config,
+                iterative_split=iterative_split,
+                oversize_factor=oversize_factor,
+                max_split_iterations=max_split_iterations,
+                merge_undersized=merge_undersized,
+                undersize_factor=undersize_factor,
+                size_reference=size_reference,
                 sigma=sigma,
                 num_plateaus=num_plateaus,
                 plateau_factor=plateau_factor,
