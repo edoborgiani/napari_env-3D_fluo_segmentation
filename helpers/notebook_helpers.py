@@ -1,5 +1,6 @@
 from collections import defaultdict
 import gc
+import json
 import os
 
 import cv2
@@ -119,6 +120,10 @@ __all__ = [
     "get_batch_output_dir",
     "is_batch_input",
     "list_image_files",
+    "print_channel_list",
+    "edit_stain_dict",
+    "StainDictEditor",
+    "StainTableNotConfirmed",
     "run_batch_folder",
 ]
 
@@ -908,7 +913,11 @@ def get_nuclei_split_config(profile="aggressive", **overrides):
         "nuclei_split_diameter_scales": 3,
         "nuclei_seed_min_fraction": 0.03,
         "nuclei_min_roundness": 0.45,
-        "z_split_aggressive": False,
+        # z_split_aggressive: split a label whenever any single z-slice has
+        # several separate islands (e.g. a large nucleus that forks into two
+        # lobes above and below its central part), not only when its 3D
+        # regions are fully disconnected.
+        "z_split_aggressive": True,
         # Intensity-aware seeding/splitting: when two individually round
         # nuclei touch with too shallow a geometric neck for erosion alone
         # to separate, also look for two seeds in a combined distance +
@@ -2274,6 +2283,8 @@ def export_channel_histograms(
     output_path : str or Path
     """
     output_path = _stem_output_path(input_file, '_histograms.xlsx', output_dir)
+    if nuclei_split_config is None:
+        nuclei_split_config = get_nuclei_split_config(profile="balanced")
 
     processing_params = {
         'Input file':                     str(input_file),
@@ -7170,9 +7181,9 @@ def segment_nuclei(
     im_final_stack,
     stain_df,
     stain_complete_df,
-    nuclei_split_config,
     r_zxyz,
     nuclei_diameter,
+    nuclei_split_config=None,
     trig_stardist=False,
     trig_cellpose=False,
     iterative_split=True,
@@ -7220,12 +7231,15 @@ def segment_nuclei(
         image' arrays (Z, Y, X, C).
     stain_df, stain_complete_df : DataFrame
         Staining metadata.
-    nuclei_split_config : dict
-        Configuration dict returned by get_nuclei_split_config().
     r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
         Isotropic voxel sizes in micrometers.
     nuclei_diameter : float
         Approximate nucleus diameter in micrometers.
+    nuclei_split_config : dict, optional
+        Configuration dict returned by get_nuclei_split_config(). Default
+        (None): the built-in 'balanced' first pass, with
+        ``z_split_aggressive`` on; oversized labels are then re-split
+        automatically by the size refinement below.
     trig_stardist : bool
         If True, use StarDist.
     trig_cellpose : bool
@@ -7259,6 +7273,8 @@ def segment_nuclei(
 
     r_zX, r_zY, r_zZ = r_zxyz
     im_segmentation_stack = {}
+    if nuclei_split_config is None:
+        nuclei_split_config = get_nuclei_split_config(profile="balanced")
 
     def _refine(labels, intensity_img, intensity_img_raw):
         if not (iterative_split or merge_undersized):
@@ -8538,6 +8554,378 @@ def list_image_files(input_folder, extensions=SUPPORTED_IMAGE_EXTENSIONS):
         p for p in _Path(input_folder).iterdir()
         if p.is_file() and p.suffix.lower() in extensions
     )
+
+
+def _print_channel_names(channels, source):
+    """Print *channels* as a numbered list for copying into ``stain_dict``."""
+    print(f"\nChannels in {source} -- use these names (2nd item of each "
+          f"stain_dict entry) in Cell 5:")
+    if not channels:
+        print("  (no channel names found in the file metadata)")
+        return
+    for i, name in enumerate(channels):
+        print(f"  [{i}] '{name}'")
+
+
+def print_channel_list(input_file, file_meta=None):
+    """Print the file's channel names as a reference for ``stain_dict``.
+
+    Single file: uses *file_meta* (from Cell 4) if given, otherwise reads the
+    metadata. Folder (batch mode): reads only the metadata of every image
+    (no pixel data), prints the first image's channel list, and lists any
+    image whose channels differ from it -- all images in a batch are expected
+    to share the same channels, since one ``stain_dict`` is used for all.
+
+    Returns
+    -------
+    list of str
+        The channel names of the (first) image.
+    """
+    from pathlib import Path as _Path
+
+    if not is_batch_input(input_file):
+        if file_meta is None:
+            file_meta = read_file_metadata(input_file, open_image_file(input_file))
+        channels = list(file_meta.get("channels") or [])
+        _print_channel_names(channels, _Path(input_file).name)
+        return channels
+
+    per_file = {}
+    for image_path in list_image_files(input_file):
+        try:
+            meta = read_file_metadata(str(image_path), open_image_file(str(image_path)))
+            per_file[image_path.name] = list(meta.get("channels") or [])
+        except Exception as exc:
+            print(f"[print_channel_list] Could not read channels of "
+                  f"{image_path.name}: {exc}")
+    if not per_file:
+        print("[print_channel_list] No channel names could be read from the batch folder.")
+        return []
+
+    first_name, channels = next(iter(per_file.items()))
+    _print_channel_names(channels, f"{first_name} (first image of the batch)")
+    mismatched = {name: ch for name, ch in per_file.items() if ch != channels}
+    if mismatched:
+        print(f"\nWARNING: {len(mismatched)} image(s) have a different channel "
+              f"list -- stain_dict may not match them:")
+        for name, ch in mismatched.items():
+            print(f"  {name}: {ch}")
+    else:
+        print(f"All {len(per_file)} image(s) in the batch share this channel list.")
+    return channels
+
+
+# ---------------------------------------------------------------------------
+# Interactive stain table (Cell 5)
+# ---------------------------------------------------------------------------
+STAIN_COLORS = ("blue", "red", "green", "white", "yellow", "magenta")
+_STAIN_NO_CHANNEL = "no"
+_STAIN_FIXED_CONDITIONS = ("NUCLEI", "CYTOPLASM")
+# (keywords in the channel name, default display color) -- first match wins.
+_CHANNEL_COLOR_HINTS = (
+    (("DAPI", "HOECHST", "405", "BFP"), "blue"),
+    (("488", "GFP", "FITC"), "green"),
+    (("555", "561", "568", "594", "CY3", "RFP", "MCHERRY", "TRITC", "TXRED"), "red"),
+    (("633", "640", "647", "CY5"), "magenta"),
+    (("BRIGHT", "TRANS", "DIC"), "white"),
+)
+
+
+class StainTableNotConfirmed(Exception):
+    """Raised when the Cell 5 stain table is read before it was confirmed."""
+
+
+def _guess_channel_color(channel, index):
+    name = str(channel).upper()
+    for keys, color in _CHANNEL_COLOR_HINTS:
+        if any(key in name for key in keys):
+            return color
+    return STAIN_COLORS[index % len(STAIN_COLORS)]
+
+
+def _default_stain_rows(channels):
+    """Preliminary stain table: NUCLEI on the DAPI/Hoechst-like channel (or the
+    first one), no CYTOPLASM, and one STAIN_<n> row per remaining channel."""
+    nuclei_channel = next(
+        (c for c in channels if any(k in c.upper() for k in ("DAPI", "HOECHST", "405"))),
+        channels[0] if channels else _STAIN_NO_CHANNEL,
+    )
+    rest = [c for c in channels if c != nuclei_channel]
+    rows = [
+        dict(condition="NUCLEI", marker="", channel=nuclei_channel,
+             color=_guess_channel_color(nuclei_channel, 0), intracellular=False),
+        dict(condition="CYTOPLASM", marker="", channel=_STAIN_NO_CHANNEL,
+             color="white", intracellular=False),
+    ]
+    for i, channel in enumerate(rest or [_STAIN_NO_CHANNEL], start=1):
+        rows.append(dict(condition=f"STAIN_{i}", marker="", channel=channel,
+                         color=_guess_channel_color(channel, i), intracellular=False))
+    return rows
+
+
+class StainDictEditor:
+    """Interactive table (ipywidgets) that builds ``stain_dict`` and
+    ``cyto_markers`` from the channels found in the file.
+
+    One row per condition: condition name (fixed for NUCLEI/CYTOPLASM), marker
+    name (text), channel (drop-down of the file's channels, or 'no' if the
+    condition isn't used), display color (drop-down), and an 'intracellular?'
+    tick that adds the marker to ``cyto_markers``. Clicking 'Confirm' checks
+    the table and saves it to ``<name_setup>_stain_dict.json``; a saved table
+    is loaded (and counts as confirmed) the next time the notebook runs.
+    Read the result with :meth:`result`.
+    """
+
+    _COLUMNS = ("Condition", "Marker", "Channel", "Color", "Intracellular?", "")
+
+    def __init__(self, channels, name_setup=None, use_saved=True):
+        try:
+            import ipywidgets as widgets
+        except ImportError as exc:
+            raise ImportError(
+                "The interactive stain table needs ipywidgets: "
+                "uv pip install ipywidgets"
+            ) from exc
+        self._w = widgets
+        self.channels = [str(c) for c in (channels or [])]
+        self.save_path = f"{name_setup}_stain_dict.json" if name_setup else None
+        self._rows = []
+        self._confirmed = False
+        self._load_notes = []
+
+        loaded = self._load_saved() if use_saved else None
+        for row in loaded or _default_stain_rows(self.channels):
+            self._add_row(row, render=False)
+
+        self._grid = widgets.GridBox(layout=widgets.Layout(
+            grid_template_columns="120px 180px 240px 110px 110px 40px",
+            grid_gap="4px 10px",
+            align_items="center",
+        ))
+        add_button = widgets.Button(description="Add stain", icon="plus")
+        add_button.on_click(lambda _: self._add_row(self._new_stain_row()))
+        confirm_button = widgets.Button(description="Confirm", icon="check",
+                                        button_style="success")
+        confirm_button.on_click(self._on_confirm)
+        self._status = widgets.HTML()
+        self._output = widgets.Output()
+        self.widget = widgets.VBox([
+            widgets.HTML("<b>Stain table</b> -- pick each condition's channel "
+                         "('no' = not used) and color, type the marker names, "
+                         "tick the intracellular markers, then click <b>Confirm</b>."),
+            self._grid,
+            widgets.HBox([add_button, confirm_button]),
+            self._status,
+            self._output,
+        ])
+        self._render()
+        errors, _ = self._validate()
+        self._confirmed = loaded is not None and not errors and not self._load_notes
+        self._update_status()
+
+    # -- saved table --------------------------------------------------------
+    def _load_saved(self):
+        if not self.save_path or not os.path.exists(self.save_path):
+            return None
+        try:
+            with open(self.save_path, encoding="utf-8") as f:
+                rows = json.load(f)["rows"]
+        except Exception as exc:
+            print(f"[StainDictEditor] Could not read {self.save_path} ({exc}); "
+                  f"starting from a new table.")
+            return None
+        # NUCLEI and CYTOPLASM always come first, even if missing from the file.
+        saved = {r.get("condition"): r for r in rows}
+        defaults = {r["condition"]: r for r in _default_stain_rows(self.channels)}
+        rows = ([dict(saved.get(c, defaults[c])) for c in _STAIN_FIXED_CONDITIONS]
+                + [dict(r) for r in rows if r.get("condition") not in _STAIN_FIXED_CONDITIONS])
+        for row in rows:
+            channel = row.get("channel", _STAIN_NO_CHANNEL)
+            if channel != _STAIN_NO_CHANNEL and channel not in self.channels:
+                self._load_notes.append(
+                    f"{row.get('condition')}: saved channel '{channel}' is not in "
+                    f"this file -- set to 'no'.")
+                row["channel"] = _STAIN_NO_CHANNEL
+        print(f"Stain table loaded from {self.save_path}"
+              + ("" if not self._load_notes else " (needs review, see below)."))
+        return rows
+
+    # -- rows ---------------------------------------------------------------
+    def _new_stain_row(self):
+        taken = {r["condition"] for r in self._values()}
+        n = 1
+        while f"STAIN_{n}" in taken:
+            n += 1
+        return dict(condition=f"STAIN_{n}", marker="", channel=_STAIN_NO_CHANNEL,
+                    color=STAIN_COLORS[n % len(STAIN_COLORS)], intracellular=False)
+
+    def _add_row(self, row, render=True):
+        w = self._w
+        fixed = row["condition"] in _STAIN_FIXED_CONDITIONS
+        auto = w.Layout(width="auto")
+        if fixed:
+            condition = w.HTML(f"<b>{row['condition']}</b>")
+        else:
+            condition = w.Text(value=row["condition"], placeholder="e.g. STAIN_1", layout=auto)
+        marker = w.Text(value=row.get("marker", ""), placeholder="marker name", layout=auto)
+        options = [_STAIN_NO_CHANNEL] + self.channels
+        channel_value = row.get("channel", _STAIN_NO_CHANNEL)
+        channel = w.Dropdown(options=options, layout=auto,
+                             value=channel_value if channel_value in options else _STAIN_NO_CHANNEL)
+        color_value = row.get("color", "white")
+        color = w.Dropdown(options=list(STAIN_COLORS), layout=auto,
+                           value=color_value if color_value in STAIN_COLORS else "white")
+        intracellular = w.Checkbox(value=bool(row.get("intracellular")) and not fixed,
+                                   disabled=fixed, indent=False, description="")
+        if fixed:
+            remove = w.HTML("")
+        else:
+            remove = w.Button(icon="times", tooltip="Remove this stain",
+                              layout=w.Layout(width="36px"))
+        entry = dict(fixed=fixed, name=row["condition"], condition=condition,
+                     marker=marker, channel=channel, color=color,
+                     intracellular=intracellular, remove=remove)
+        if not fixed:
+            remove.on_click(lambda _, e=entry: self._remove_row(e))
+            condition.observe(self._on_change, names="value")
+        for widget in (marker, channel, color, intracellular):
+            widget.observe(self._on_change, names="value")
+        self._rows.append(entry)
+        if render:
+            self._render()
+            self._on_change()
+
+    def _remove_row(self, entry):
+        self._rows.remove(entry)
+        self._render()
+        self._on_change()
+
+    def _render(self):
+        header = [self._w.HTML(f"<b>{c}</b>") for c in self._COLUMNS]
+        cells = []
+        for e in self._rows:
+            cells += [e["condition"], e["marker"], e["channel"], e["color"],
+                      e["intracellular"], e["remove"]]
+        self._grid.children = header + cells
+
+    def _values(self):
+        return [
+            dict(condition=(e["name"] if e["fixed"] else e["condition"].value).strip().upper(),
+                 marker=e["marker"].value.strip(),
+                 channel=e["channel"].value,
+                 color=e["color"].value,
+                 intracellular=e["intracellular"].value and not e["fixed"])
+            for e in self._rows
+        ]
+
+    # -- validation / status ------------------------------------------------
+    def _validate(self):
+        rows = self._values()
+        errors, notes = [], list(self._load_notes)
+        names = [r["condition"] for r in rows]
+        if "" in names:
+            errors.append("Every stain needs a condition name.")
+        dup_names = sorted({n for n in names if n and names.count(n) > 1})
+        if dup_names:
+            errors.append(f"Condition name used more than once: {dup_names}")
+        used = [r for r in rows if r["channel"] != _STAIN_NO_CHANNEL]
+        if not used:
+            errors.append("Assign a channel to at least one condition.")
+        for r in used:
+            if not r["marker"]:
+                errors.append(f"{r['condition'] or '(unnamed)'}: type a marker name.")
+        used_channels = [r["channel"] for r in used]
+        dup_channels = sorted({c for c in used_channels if used_channels.count(c) > 1})
+        if dup_channels:
+            errors.append(f"Channel assigned to more than one condition: {dup_channels}")
+        markers = [r["marker"].upper() for r in used if r["marker"]]
+        dup_markers = sorted({m for m in markers if markers.count(m) > 1})
+        if dup_markers:
+            errors.append(f"Marker name used more than once: {dup_markers}")
+
+        by_name = {r["condition"]: r for r in rows}
+        if by_name["NUCLEI"]["channel"] == _STAIN_NO_CHANNEL:
+            notes.append("No NUCLEI channel: cells are segmented from the union "
+                         "of all channels.")
+        if (by_name["CYTOPLASM"]["channel"] != _STAIN_NO_CHANNEL
+                and any(r["intracellular"] for r in used)):
+            notes.append("A CYTOPLASM channel is set, so the cytoplasm is "
+                         "segmented from it and the 'Intracellular?' ticks are not used.")
+        unused = [c for c in self.channels if c not in used_channels]
+        if unused:
+            notes.append(f"Channel(s) not used (dropped from the analysis): {unused}")
+        return errors, notes
+
+    def _on_change(self, _change=None):
+        self._confirmed = False
+        self._load_notes = []
+        self._update_status()
+
+    def _update_status(self):
+        import html
+        errors, notes = self._validate()
+        if errors:
+            head = "<span style='color:#d9534f'><b>Fix before confirming:</b></span>"
+            items = errors
+        elif self._confirmed:
+            head = "<span style='color:#2e8b57'><b>Confirmed.</b></span>"
+            items = []
+        else:
+            head = ("<span style='color:#e69500'><b>Not confirmed yet</b> -- "
+                    "click Confirm.</span>")
+            items = []
+        lines = [f"<li>{html.escape(t)}</li>" for t in items]
+        lines += [f"<li><i>{html.escape(t)}</i></li>" for t in notes]
+        self._status.value = head + (f"<ul>{''.join(lines)}</ul>" if lines else "")
+
+    def _on_confirm(self, _button):
+        errors, _ = self._validate()
+        if errors:
+            self._update_status()
+            return
+        self._confirmed = True
+        self._update_status()
+        self._output.clear_output()
+        with self._output:
+            if self.save_path:
+                with open(self.save_path, "w", encoding="utf-8") as f:
+                    json.dump({"rows": self._values()}, f, indent=2)
+                print(f"Saved to {self.save_path}")
+            print(f"stain_dict = {self.stain_dict}")
+            print(f"cyto_markers = {self.cyto_markers}")
+
+    # -- results ------------------------------------------------------------
+    @property
+    def stain_dict(self):
+        """``{condition: [marker, channel, color]}`` for every used condition."""
+        return {r["condition"]: [r["marker"], r["channel"], r["color"]]
+                for r in self._values() if r["channel"] != _STAIN_NO_CHANNEL}
+
+    @property
+    def cyto_markers(self):
+        """Marker names ticked as intracellular (upper case, as in stain_df)."""
+        return [r["marker"].upper() for r in self._values()
+                if r["channel"] != _STAIN_NO_CHANNEL and r["intracellular"]]
+
+    def result(self):
+        """Return ``(stain_dict, cyto_markers)``; raise StainTableNotConfirmed
+        if the table has not been confirmed (or has been edited since)."""
+        errors, _ = self._validate()
+        if errors or not self._confirmed:
+            raise StainTableNotConfirmed(
+                "The stain table in Cell 5 is not confirmed yet: fill it in, "
+                "click 'Confirm', then run the notebook again from Cell 5b."
+            )
+        return self.stain_dict, self.cyto_markers
+
+
+def edit_stain_dict(channels, name_setup=None, use_saved=True):
+    """Display the interactive stain table for *channels* and return the
+    :class:`StainDictEditor` (read it later with ``.result()``)."""
+    from IPython.display import display
+    editor = StainDictEditor(channels, name_setup=name_setup, use_saved=use_saved)
+    display(editor.widget)
+    return editor
 
 
 def _process_single_image_batch(
