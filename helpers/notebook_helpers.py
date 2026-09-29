@@ -8557,9 +8557,8 @@ def list_image_files(input_folder, extensions=SUPPORTED_IMAGE_EXTENSIONS):
 
 
 def _print_channel_names(channels, source):
-    """Print *channels* as a numbered list for copying into ``stain_dict``."""
-    print(f"\nChannels in {source} -- use these names (2nd item of each "
-          f"stain_dict entry) in Cell 5:")
+    """Print *channels* as a numbered list (the options of the stain table)."""
+    print(f"\nChannels in {source}:")
     if not channels:
         print("  (no channel names found in the file metadata)")
         return
@@ -8616,7 +8615,7 @@ def print_channel_list(input_file, file_meta=None):
 
 
 # ---------------------------------------------------------------------------
-# Interactive stain table (Cell 5)
+# Interactive stain table (Cell 4)
 # ---------------------------------------------------------------------------
 STAIN_COLORS = ("blue", "red", "green", "white", "yellow", "magenta")
 _STAIN_NO_CHANNEL = "no"
@@ -8632,7 +8631,7 @@ _CHANNEL_COLOR_HINTS = (
 
 
 class StainTableNotConfirmed(Exception):
-    """Raised when the Cell 5 stain table is read before it was confirmed."""
+    """Raised when the Cell 4 stain table is read before it was confirmed."""
 
 
 def _guess_channel_color(channel, index):
@@ -8913,8 +8912,8 @@ class StainDictEditor:
         errors, _ = self._validate()
         if errors or not self._confirmed:
             raise StainTableNotConfirmed(
-                "The stain table in Cell 5 is not confirmed yet: fill it in, "
-                "click 'Confirm', then run the notebook again from Cell 5b."
+                "The stain table in Cell 4 is not confirmed yet: fill it in, "
+                "click 'Confirm', then run the notebook again from Cell 5."
             )
         return self.stain_dict, self.cyto_markers
 

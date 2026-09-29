@@ -5,20 +5,24 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 > **Disclaimer:** This repository is freely available for use. The associated pipeline is currently being prepared for publication — please contact [Edoardo Borgiani](https://github.com/edoborgiani) for more information on how to use the pipeline or for collaboration enquiries.
 
 ## Features
-- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.6`, latest) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.2`, latest). Earlier versions are kept locally in `old_v/` (not tracked in version control).
+- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.6.1`, latest) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.2`, latest). The previous nuclei version (`Fluo_3D_nuc_seg_v1.6`) is still in the repository; older versions are kept locally in `old_v/` (not tracked in version control).
+- **Interactive stain table** (nuclei workflow): after loading, pick each condition's channel and display color from drop-down menus, type the marker names and tick the intracellular markers — no hand-written `stain_dict`. The confirmed table is saved and reused on the next run.
+- **Batch mode** (nuclei workflow): set `input_file` to a folder to process every image in it with the same settings; outputs go to `<folder>_output/<image name>/`. Images whose channel list differs from the first one are flagged before the batch starts.
+- **Automatic nuclei splitting**: touching nuclei are split without any profile to choose — a built-in first pass (including splitting a nucleus that forks into separate islands above and below its centre), followed by a size-based refinement that re-splits oversized labels with increasingly aggressive settings and merges small fragments into their neighbour.
 - **Shared helper library** (`helpers/`): processing, quantification, visualization, and report-export functions shared across notebooks.
-- **Profile-aware imports** (`helpers/notebook_setup_helpers.py`): `load_nuclei_notebook_setup()` and `load_ld_notebook_setup()` load only the dependencies each workflow needs, avoiding unnecessary overhead.
-- **3D Image Processing**: normalization, resampling to isotropic voxel size, denoising, thresholding, and watershed / StarDist / Cellpose 3D segmentation.
+- **Profile-aware imports** (`helpers/notebook_setup_helpers.py`): `load_nuclei_notebook_setup()` and `load_ld_notebook_setup()` load only the dependencies each workflow needs.
+- **3D image processing**: normalization, resampling to isotropic voxel size, denoising, thresholding, and watershed / StarDist / Cellpose 3D segmentation.
 - **Interactive ROI selection** (nuclei workflow): set `interactive_roi = True` to drag a rectangle in a napari window instead of typing pixel coordinates.
-- **Automatic contrast**: set `automatic_contrast = True` to skip the interactive napari contrast/gamma viewer and pick `Cont_min`/`Cont_max` per channel automatically from the histogram (one above the peak, up to the 99th percentile intensity).
-- **LD union labeling**: when no dedicated NUCLEI channel is present, `segment_nuclei()` automatically falls back to merging all threshold channels via bitwise OR and running connected-component labeling to identify individual cells; the same watershed / Cellpose / StarDist method choice as the nuclei workflow applies to the merged mask.
-- **Napari Integration**: interactive visualization and manual correction at each processing step.
-- **Quantification & Export**: per-cell marker statistics, spatial distributions, Excel reports, 3D mesh export (VTK/STL/INP), and — nuclei workflow only — per-nucleus KDE distribution plots and a PDF report.
+- **Automatic contrast**: set `automatic_contrast = True` to skip the interactive napari contrast/gamma viewer and pick contrast limits per channel from the histogram.
+- **LD union labeling**: when no dedicated NUCLEI channel is present, `segment_nuclei()` merges all threshold channels and segments the union with the same watershed / Cellpose / StarDist choice.
+- **Napari integration**: interactive visualization at each processing step.
+- **Quantification & export**: per-cell marker statistics (for positive cells and for all cells), spatial and size distributions, Excel reports, 3D mesh export (VTK/STL/INP), and — nuclei workflow only — per-nucleus KDE plots and a PDF report.
 
 ## Repository Structure
 ```
 .
-├── Fluo_3D_nuc_seg_v1.6.ipynb      # Nuclei segmentation — latest recommended version
+├── Fluo_3D_nuc_seg_v1.6.1.ipynb    # Nuclei segmentation — latest recommended version
+├── Fluo_3D_nuc_seg_v1.6.ipynb      # Nuclei segmentation — previous version
 ├── Fluo_3D_LD_seg_v1.2.ipynb       # Live/Dead segmentation — latest recommended version
 ├── requirements.txt                # Python dependencies
 ├── overrides.txt                   # uv --override file (see Prerequisites)
@@ -73,7 +77,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```powershell
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 ---
 
@@ -101,7 +105,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```bash
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 > **Note (Apple Silicon — M1/M2/M3):** If step 3 fails with build errors for packages like `tetgen` or `meshlib`, your Mac's ARM architecture is likely the cause. In that case, skip steps 2–3 above and use [Miniforge](https://github.com/conda-forge/miniforge) to create a conda environment instead:
 > ```bash
@@ -140,7 +144,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```bash
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 > **Note (Headless servers only):** If you are running on a remote Linux server without a physical display (e.g. an HPC cluster accessed via SSH), Napari's Qt backend will fail to open. Run the following commands **before step 4** to start a virtual framebuffer:
 > ```bash
@@ -152,59 +156,58 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 
 ## Usage
 
-- Follow the notebook cells in order: setup → image loading → preprocessing → segmentation → quantification → export.
-- The first cell calls `notebook_setup_helpers.load_nuclei_notebook_setup()` (or `load_ld_notebook_setup()` in the LD notebook) to import all required libraries in one step; the second cell calls `notebook_helpers.reload_helpers()` so edits to the helper file take effect without restarting the kernel.
-- Use Napari for interactive visualization and manual corrections at any step.
+- Run the notebook cells in order. Each code cell has a short description right above it (**Cell N** (title)), and the notebook is divided into six sections: imports → inputs and setup → preparation → processing and segmentation → quantification → export.
+- The first cell calls `load_nuclei_notebook_setup()` (or `load_ld_notebook_setup()` in the LD notebook) to import all required libraries in one step; the second calls `reload_helpers()` so edits to the helper file take effect without restarting the kernel.
+- Use Napari for interactive visualization at any step.
 - All shared processing logic lives in `helpers/notebook_helpers.py` — customize functions there rather than duplicating code across notebooks.
 
-## Detailed Workflow: `Fluo_3D_nuc_seg_v1.6.ipynb`
+## Detailed Workflow: `Fluo_3D_nuc_seg_v1.6.1.ipynb`
 
-### 1. Environment Setup
-Cell 1 loads all required imports in one step via `load_nuclei_notebook_setup()`. Cell 2 calls `reload_helpers()` to reload `helpers/notebook_helpers.py` without restarting the kernel.
+### 1. Import Libraries and Helpers (Cells 1-2)
+Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 calls `reload_helpers()` to reload `helpers/notebook_helpers.py` without restarting the kernel.
 
-### 2. Inputs & Setup
-- Set `input_file` to your image file path (`.nd2`, `.tif`/`.tiff`/`.ome.tif`, `.czi`, `.lif` or `.oib`; for multi-scene `.czi`/`.lif` files only the first scene is read), plus `ROI`, `name_setup`, `nuclei_diameter`/`cell_diameter`, `scale_factor`, the segmentation method flags (`trig_cellpose`, `trig_stardist`, `trig_cellpose_cyto`), and `nuclei_split_config`.
-- Set `interactive_roi = True` to pick the ROI visually instead of typing coordinates — `select_roi_interactively()` opens a napari window with a draggable rectangle over the full image (X/Y only; Z stays as set in `ROI`).
-- `initialize_dataset()` loads the image — automatically choosing lazy (chunked, dask-based) or eager reading depending on the file's size, with no setting to configure — reads physical pixel sizes from metadata, and computes derived parameters for correct spatial scaling.
+### 2. Inputs and Setup (Cells 3-5)
+- **Cell 3 — Settings.** The only cell to edit for a new dataset:
+  - `input_file`: an image file (`.nd2`, `.tif`/`.tiff`/`.ome.tif`, `.czi`, `.lif` or `.oib`; for multi-scene `.czi`/`.lif` only the first scene is read) — or a **folder** for batch mode.
+  - `ROI`, `interactive_roi`, `name_setup`, `use_setup`, `automatic_contrast`.
+  - `nuclei_diameter`, `cell_diameter`, `scale_factor`, `zoom_factors`.
+  - Segmentation method: `trig_cellpose`, `trig_stardist` (both `False` = watershed) and `trig_cellpose_cyto`.
+  - `multilabel`, `aggregate_grow_factor`.
+  - Nuclei size refinement: `size_reference`, `iterative_split`, `oversize_factor`, `max_split_iterations`, `merge_undersized`, `undersize_factor`.
+- **Cell 4 — Load image and stain table.**
+  - Loads the image with `initialize_dataset()`, automatically choosing lazy (chunked) or eager reading from the file's size. With `interactive_roi = True`, `select_roi_interactively()` first opens a napari window with a draggable ROI rectangle (X/Y only).
+  - Prints the channel list (`print_channel_list()`). In batch mode nothing is loaded: the metadata of every image is read and any image whose channels differ from the first one is flagged.
+  - Shows the **interactive stain table** (`edit_stain_dict()`, requires `ipywidgets`, installed with `jupyter`). One row per condition: NUCLEI and CYTOPLASM are fixed, other stains can be added or removed. Choose each condition's channel (`no` = not used) and color (blue, red, green, white, yellow, magenta), type the marker name, and tick **Intracellular?** for markers that define the cytoplasm when there is no CYTOPLASM channel (`cyto_markers`). The table is checked live (e.g. a channel used twice, a missing marker name). **Confirm** saves it to `<name_setup>_stain_dict.json`; with `use_setup = True` it is reloaded, already confirmed, on the next run.
+- **Cell 5 — Read the stain table and run the batch.** Reads the confirmed table into `stain_dict` / `cyto_markers`. If it isn't confirmed yet, execution stops with a message (click **Confirm**, then run again from Cell 5). In batch mode, `run_batch_folder()` then processes every image in the folder with the whole pipeline (no viewers or plots) and stops; the image-processing parameters for the batch are set in this cell.
 
-### 3. Define Sample & Staining Information
-- Configure `stain_dict` to map channel names — which must match the metadata printed after loading — to biological markers and display colors.
-- `prepare_and_preview()` builds the image stack and the `stain_df` working table, and opens a napari viewer for channel inspection.
+### 3. Preparation and Preview (Cells 6-8)
+- `prepare_and_preview()` builds the image stack and the `stain_df` table (channels not used in the stain table are dropped) and opens a napari viewer for channel inspection.
+- `prepare_stain_settings()` loads or creates per-channel contrast/gamma settings — reused from `<name_setup>_setup.csv` if it exists, otherwise set interactively in napari, or picked automatically from the histogram if `automatic_contrast = True`.
+- Cell 8 shows the complete stain settings table for review.
 
-### 4. Setup & Per-Channel Contrast/Gamma
-- `prepare_stain_settings()` loads or creates a CSV of per-channel contrast/gamma settings — reused automatically if a matching file exists for `name_setup`, otherwise set interactively in napari, or picked automatically per channel from the histogram (peak+1 to the 99th percentile, no viewer) if `automatic_contrast = True`.
+### 4. Image Processing and Segmentation (Cells 9-22)
+- **Preprocessing:** normalization (`run_normalize()`), isotropic resampling (`run_resample()`), median denoising (`run_denoise()`), contrast/gamma (`run_contrast_gamma()`), Gaussian smoothing (`run_smooth()`, tunable `sigma`) and histogram equalization (`run_equalize()`, tunable `num_plateaus` / `plateau_factor`).
+- **Thresholding:** `run_threshold()` combines a selectable global method (`threshold_method`: Otsu / median / Huang), local Sauvola thresholding and a statistical-background component (blend weights fixed internally). The histogram marks the global and final thresholds per channel.
+- **Histogram export:** `export_channel_histograms()` saves every stage's histograms and a Parameters sheet to Excel.
+- **Nuclei:** `segment_nuclei()` with watershed (default), StarDist (`trig_stardist`) or Cellpose 3D (`trig_cellpose`). Splitting is automatic — there is no split profile to choose:
+  - the watershed first pass uses a fixed built-in configuration: it also splits touching nuclei where the nuclear signal dips between them, and always splits a nucleus whose z-slices show separate islands (e.g. two lobes above and below its centre);
+  - then, for every method, a size-based refinement sets a reference nucleus size (`size_reference`), merges fragments smaller than `undersize_factor` × reference into a touching neighbour (only if the result is still one plausible nucleus with no dark seam at the contact), and re-splits labels bigger than `oversize_factor` × reference with increasingly aggressive settings ('aggressive' → 'very aggressive' → 'extreme'). Labels that can't be fixed are kept, never deleted.
+- **Cytoplasm / PCM:** `segment_cytoplasm()` builds the cytoplasm from the CYTOPLASM channel (optionally shaped with Cellpose 3D, `trig_cellpose_cyto = True`), otherwise from the intracellular markers, otherwise by growing the nuclei; touching cells are split where the marker signal fades. `segment_pcm()` adds the pericellular matrix shell.
+- **Label assignment and aggregates:** `assign_channel_labels()` links cells to marker channels; `detect_aggregates()` finds cell aggregates.
+- **Visualization:** `view_processing_results()` opens napari viewers with every stage and the segmentation, including "Thresh islands" layers to check the threshold masks.
 
-### 5. Image Preprocessing
-- **Normalization**: channels normalized to [0, 255] via `run_normalize()`.
-- **Resampling**: isotropic voxel resampling via `run_resample()`.
-- **Denoising**: median filtering via `run_denoise()`.
-- **Contrast/Gamma & Smoothing**: per-channel contrast/gamma (`run_contrast_gamma()`) and Gaussian smoothing (`run_smooth()`, tunable `sigma`).
-- **Histogram equalization**: `run_equalize()`, tunable via `num_plateaus` / `plateau_factor`.
-- **Histogram export**: per-channel histograms and a Parameters sheet saved to Excel via `export_channel_histograms()`.
+### 5. Quantification and Analysis (Cells 23-29)
+Marker intensity is reported both for **positive cells** (cells that passed that marker's threshold) and for **all cells**.
+- `compute_percell_marker_intensity_df()` and `build_labels_df()`: per-cell marker intensity, overlap, volume and position.
+- `print_population_summary()`: counts and percentages per condition.
+- `build_full_labels_df()`: the full table at original (non-resampled) resolution for export.
+- `build_histogram_report()`: per-nucleus KDE plots and a PDF report.
+- `plot_spatial_distributions()`, `plot_size_distributions()` and `plot_marker_intensity_clouds()` (flow-cytometry-style intensity vs cytoplasm size plot, saved as PNG).
 
-### 6. Thresholding
-- `run_threshold()` combines a selectable global method (Otsu / median / Huang via `threshold_method`), local Sauvola thresholding, and a statistical-background component into a combined binary mask (the blend weights between the three components are fixed internally, not user-tunable); the resulting histogram marks where the global and combined thresholds landed.
-
-### 7. Segmentation
-- **Nuclei**: 3D watershed (default, tunable via `nuclei_split_config`), StarDist2D slice-by-slice with 3D merging (`trig_stardist=True`), or Cellpose 3D (`trig_cellpose=True`) — all via `segment_nuclei()`.
-- **Cytoplasm / PCM**: `segment_pcm()` grows nuclei labels into cytoplasm/PCM regions when a CYTOPLASM channel or cyto markers are defined, or shapes the cell body directly with Cellpose 3D (`trig_cellpose_cyto=True`) — independent of which method found the nuclei, so e.g. StarDist nuclei + Cellpose cell shape is a valid combination. When two touching cells' cytoplasm merges into one region, `split_by_intensity_gradient=True` (default) splits it where the marker signal fades rather than only at the geometric midpoint — tune `gradient_smooth_sigma` / `distance_weight` / `intensity_weight` / `gradient_weight` if needed.
-- **Label assignment**: `assign_channel_labels()` maps segmented structures to marker channels.
-- **Aggregate detection**: `detect_aggregates()` flags large multi-cell aggregates separately.
-
-### 8. Visualization
-- `view_processing_results()` opens napari overlays for raw, denoised, thresholded, and labelled images at each stage.
-
-### 9. Quantification
-- `build_labels_df()` computes per-object marker overlap, intensity, volume, and centroid position (X, Y, Z).
-- `print_population_summary()` prints a population-level summary to the notebook.
-- `build_full_labels_df()` builds the full quantification table at original (non-zoomed) resolution.
-- `build_histogram_report()` generates per-nucleus histogram data, KDE distribution plots, and a PDF report (channel-labelled image rows rendered at their correct aspect ratio).
-- `plot_spatial_distributions()` and `plot_size_distributions()` plot the segmented population's spatial and size distributions.
-
-### 10. Export
-- **Excel**: full quantification tables, stain settings, and processing parameters via `export_quantification_to_excel()`.
-- **3D meshes**: VTK volumes (`build_vtk_volumes()`) and per-marker STL meshes (`export_marker_stl()`) for nuclei, cytoplasm, PCM, and markers, for visualization in ParaView or similar. Set `nuc_3D_export=True` to additionally export a single-nucleus VTK sub-volume.
-- **FEA**: optional `.inp` file generated via tetrahedralization (`export_fea_mesh()`, using `tetgen`).
+### 6. Export (Cells 30-34)
+- **3D meshes:** VTK volumes (`build_vtk_volumes()`) and per-marker STL meshes (`export_marker_stl()`) for ParaView or similar. Set `nuc_3D_export = True` in Cell 32 to also export a single cell as a VTK sub-volume.
+- **Excel:** full quantification tables, stain settings and processing parameters (`export_quantification_to_excel()`).
+- **FEA:** Abaqus `.inp` mesh via tetrahedralization (`export_fea_mesh()`, using `tetgen`).
 
 ---
 
@@ -215,6 +218,7 @@ The Live/Dead notebook follows the same helper-based structure as the nuclei not
 | Aspect | Nuclei notebook | LD notebook |
 |---|---|---|
 | Profile | `"nuclei"` | `"ld"` (lighter imports) |
+| Stain definition | Interactive stain table | `stain_dict` typed in the notebook |
 | Segmentation | Watershed / StarDist / Cellpose 3D on the NUCLEI channel | Same method choice, applied to the union of all threshold channels |
 | Cytoplasm / PCM | Dedicated channels + grow / Cellpose steps | Not applicable |
 | NUCLEI row in `stain_complete_df` | Populated by `segment_nuclei()` | Added as empty placeholder after segmentation |
@@ -274,6 +278,7 @@ Cell 1 loads all required imports in one step via `load_ld_notebook_setup()`, wh
 ## Requirements
 See `requirements.txt` for the full list. Key dependencies:
 - `napari[all]`, `numpy`, `scipy`, `scikit-image`, `matplotlib`, `pandas`
+- `jupyter` (includes `ipywidgets`, used by the interactive stain table)
 - `aicsimageio[nd2]`, `nd2reader`, `aicspylibczi` + `fsspec`, `readlif`, `oiffile` — image readers (ND2, TIFF/OME-TIFF, CZI, LIF, OIB)
 - `tensorflow`, `csbdeep`, `stardist`, `cellpose` — segmentation models
 - `pyvista`, `SimpleITK`
