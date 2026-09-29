@@ -1092,14 +1092,19 @@ def _display_uint8(image, contrast_limits=None, gamma=None):
 
 
 def remove_small_islands(binary_matrix, area_threshold, progress=None, desc=None):
-    """Remove small connected components from a binary mask."""
+    """Remove small connected components from a binary mask.
+
+    All component sizes are counted in one pass (``np.bincount``) and the
+    small ones are removed with a single lookup, instead of scanning the
+    whole volume once per component. *progress* and *desc* are accepted for
+    backward compatibility and ignored.
+    """
     labeled_array, num_features = ndi.label(binary_matrix)
-    for component_id in _progress_iter(
-        range(1, num_features + 1), progress, desc=desc, leave=False
-    ):
-        component = labeled_array == component_id
-        if component.sum() < area_threshold:
-            binary_matrix[component] = 0
+    if num_features == 0:
+        return binary_matrix
+    is_small = np.bincount(labeled_array.ravel()) < area_threshold
+    is_small[0] = False  # background
+    binary_matrix[is_small[labeled_array]] = 0
     return binary_matrix
 
 
@@ -1452,24 +1457,37 @@ def _build_neighbor_offsets(connectivity):
 
 
 def _find_label_neighbors(marker_labels, connectivity):
-    neighbors = defaultdict(set)
-    offsets = _build_neighbor_offsets(connectivity)
-    z_size, y_size, x_size = marker_labels.shape
+    """Map each label to the set of labels it touches.
 
-    for z_index in range(z_size):
-        for y_index in range(y_size):
-            for x_index in range(x_size):
-                current_label = marker_labels[z_index, y_index, x_index]
-                if current_label == 0:
-                    continue
-                for dz, dy, dx in offsets:
-                    nz = z_index + dz
-                    ny = y_index + dy
-                    nx = x_index + dx
-                    if 0 <= nz < z_size and 0 <= ny < y_size and 0 <= nx < x_size:
-                        neighbor_label = marker_labels[nz, ny, nx]
-                        if neighbor_label > 0 and neighbor_label != current_label:
-                            neighbors[current_label].add(neighbor_label)
+    Vectorized: for each neighbour offset the volume is compared with a
+    shifted copy of itself, so no Python loop runs over voxels. Only one
+    offset of each +/- pair is needed, since touching is symmetric.
+    """
+    neighbors = defaultdict(set)
+    marker_labels = np.asarray(marker_labels)
+
+    def _axis_slices(d, n):
+        if d > 0:
+            return slice(0, n - d), slice(d, n)
+        if d < 0:
+            return slice(-d, n), slice(0, n + d)
+        return slice(None), slice(None)
+
+    pairs = []
+    for offset in _build_neighbor_offsets(connectivity):
+        if offset < (0, 0, 0):
+            continue
+        src, dst = zip(*(_axis_slices(d, n) for d, n in zip(offset, marker_labels.shape)))
+        a = marker_labels[src]
+        b = marker_labels[dst]
+        touching = (a > 0) & (b > 0) & (a != b)
+        if touching.any():
+            pairs.append(np.stack([a[touching], b[touching]], axis=1))
+
+    if pairs:
+        for label_a, label_b in np.unique(np.concatenate(pairs), axis=0).tolist():
+            neighbors[label_a].add(label_b)
+            neighbors[label_b].add(label_a)
     return neighbors
 
 
@@ -1507,10 +1525,11 @@ def _merge_small_touching_regions(marker_labels, connectivity, size_ratio_thresh
         if size_label <= size_ratio_thresh * size_biggest or size_label < min_size:
             new_label[label] = biggest_neighbor
 
-    relabeled = marker_labels.copy()
+    # One lookup-table pass instead of one full-volume pass per merged label.
+    lut = np.arange(int(marker_labels.max()) + 1, dtype=marker_labels.dtype)
     for label, target in new_label.items():
-        if label != target:
-            relabeled[marker_labels == label] = target
+        lut[label] = target
+    relabeled = lut[marker_labels]
 
     final_labels, _ = ndi.label(
         relabeled > 0,
@@ -5196,14 +5215,10 @@ def segment_nuclei_watershed(
     boundary_mask[:, :, 0:boundary_margin] = True
     boundary_mask[:, :, -boundary_margin:] = True
 
-    boundary_components = set()
     cc_labels_for_boundary, _ = ndi.label(binary_mask)
-    for cc_id in np.unique(cc_labels_for_boundary):
-        if cc_id == 0:
-            continue
-        cc_mask = cc_labels_for_boundary == cc_id
-        if np.any(cc_mask & boundary_mask):
-            boundary_components.add(int(cc_id))
+    boundary_components = set(
+        np.unique(cc_labels_for_boundary[boundary_mask]).tolist()
+    ) - {0}
 
     # Evaluate several size priors from strong to weak erosion.
     dmin = max(0.2, float(nuclei_split_diameter_min_factor))
@@ -5402,17 +5417,21 @@ def segment_nuclei_watershed(
     else:
         im_out = watershed(-distance, markers, mask=binary_mask)
 
+    # Preserve labels that are alone in their mask component, and all labels
+    # of components touching the image border. Computed from the unique
+    # (component, label) pairs in one pass instead of one scan per component.
     preserve_labels = set()
-    for cc_id in _progress_iter(
-        range(1, num_cc + 1), progress, desc='Step 17 - Check Nuclei Components', leave=False
-    ):
-        cc_vals = np.unique(im_out[cc_labels == cc_id])
-        cc_vals = cc_vals[cc_vals > 0]
-        if cc_vals.size == 1:
-            preserve_labels.add(int(cc_vals[0]))
-        if cc_id in boundary_components:
-            for val in cc_vals:
-                preserve_labels.add(int(val))
+    both = (cc_labels > 0) & (im_out > 0)
+    if both.any():
+        n_labels = int(im_out.max()) + 1
+        keys = np.unique(cc_labels[both].astype(np.int64) * n_labels + im_out[both])
+        pair_cc, pair_label = keys // n_labels, keys % n_labels
+        cc_ids, labels_per_cc = np.unique(pair_cc, return_counts=True)
+        keep_cc = set(cc_ids[labels_per_cc == 1].tolist()) | boundary_components
+        preserve_labels = {
+            int(label) for cc_id, label in zip(pair_cc.tolist(), pair_label.tolist())
+            if cc_id in keep_cc
+        }
 
     min_cell_vox = max(8, int(0.3 * full_nucleus_vol_um3 / voxel_um3))
 
