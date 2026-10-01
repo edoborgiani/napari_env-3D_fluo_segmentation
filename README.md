@@ -5,7 +5,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 > **Disclaimer:** This repository is freely available for use. The associated pipeline is currently being prepared for publication — please contact [Edoardo Borgiani](https://github.com/edoborgiani) for more information on how to use the pipeline or for collaboration enquiries.
 
 ## Features
-- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.6.1`, latest) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.2`, latest). The previous nuclei version (`Fluo_3D_nuc_seg_v1.6`) is still in the repository; older versions are kept locally in `old_v/` (not tracked in version control).
+- **Two active workflows**: nuclei segmentation (`Fluo_3D_nuc_seg_v1.6.2`, latest) and Live/Dead segmentation (`Fluo_3D_LD_seg_v1.2`, latest). The previous nuclei version (`Fluo_3D_nuc_seg_v1.6.1`) is still in the repository; older versions are kept locally in `old_v/` (not tracked in version control).
 - **Interactive stain table** (nuclei workflow): after loading, pick each condition's channel and display color from drop-down menus, type the marker names and tick the intracellular markers — no hand-written `stain_dict`. The confirmed table is saved and reused on the next run.
 - **Batch mode** (nuclei workflow): set `input_file` to a folder to process every image in it with the same settings; outputs go to `<folder>_output/<image name>/`. Images whose channel list differs from the first one are flagged before the batch starts.
 - **Automatic nuclei splitting**: touching nuclei are split without any profile to choose — a built-in first pass (including splitting a nucleus that forks into separate islands above and below its centre), followed by a size-based refinement that re-splits oversized labels with increasingly aggressive settings and merges small fragments into their neighbour.
@@ -21,8 +21,8 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 ## Repository Structure
 ```
 .
-├── Fluo_3D_nuc_seg_v1.6.1.ipynb    # Nuclei segmentation — latest recommended version
-├── Fluo_3D_nuc_seg_v1.6.ipynb      # Nuclei segmentation — previous version
+├── Fluo_3D_nuc_seg_v1.6.2.ipynb    # Nuclei segmentation — latest recommended version
+├── Fluo_3D_nuc_seg_v1.6.1.ipynb    # Nuclei segmentation — previous version
 ├── Fluo_3D_LD_seg_v1.2.ipynb       # Live/Dead segmentation — latest recommended version
 ├── requirements.txt                # Python dependencies
 ├── overrides.txt                   # uv --override file (see Prerequisites)
@@ -77,7 +77,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```powershell
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.2.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 ---
 
@@ -105,7 +105,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```bash
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.2.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 > **Note (Apple Silicon — M1/M2/M3):** If step 3 fails with build errors for packages like `tetgen` or `meshlib`, your Mac's ARM architecture is likely the cause. In that case, skip steps 2–3 above and use [Miniforge](https://github.com/conda-forge/miniforge) to create a conda environment instead:
 > ```bash
@@ -144,7 +144,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
    ```bash
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.1.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
+   Open `Fluo_3D_nuc_seg_v1.6.2.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.ipynb` for Live/Dead segmentation.
 
 > **Note (Headless servers only):** If you are running on a remote Linux server without a physical display (e.g. an HPC cluster accessed via SSH), Napari's Qt backend will fail to open. Run the following commands **before step 4** to start a virtual framebuffer:
 > ```bash
@@ -161,7 +161,7 @@ This repository provides Jupyter notebooks and shared Python helpers for 3D segm
 - Use Napari for interactive visualization at any step.
 - All shared processing logic lives in `helpers/notebook_helpers.py` — customize functions there rather than duplicating code across notebooks.
 
-## Detailed Workflow: `Fluo_3D_nuc_seg_v1.6.1.ipynb`
+## Detailed Workflow: `Fluo_3D_nuc_seg_v1.6.2.ipynb`
 
 ### 1. Import Libraries and Helpers (Cells 1-2)
 Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 calls `reload_helpers()` to reload `helpers/notebook_helpers.py` without restarting the kernel.
@@ -187,7 +187,9 @@ Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 cal
 
 ### 4. Image Processing and Segmentation (Cells 9-22)
 - **Preprocessing:** normalization (`run_normalize()`), isotropic resampling (`run_resample()`), median denoising (`run_denoise()`), contrast/gamma (`run_contrast_gamma()`), Gaussian smoothing (`run_smooth()`, tunable `sigma`) and histogram equalization (`run_equalize()`, tunable `num_plateaus` / `plateau_factor`).
-- **Thresholding:** `run_threshold()` combines a selectable global method (`threshold_method`: Otsu / median / Huang), local Sauvola thresholding and a statistical-background component (blend weights fixed internally). The histogram marks the global and final thresholds per channel.
+- **Thresholding (Cell 15):**
+  - Marker channels: `run_threshold()` combines a selectable global method (`threshold_method`: Otsu / median / Huang), local Sauvola thresholding and a statistical-background component (blend weights fixed internally). The histogram marks the global and final thresholds per channel. These masks decide marker positivity.
+  - Nuclei and cell body (new in v1.6.2): `run_cell_body_threshold()` thresholds the NUCLEI channel and the cell body (CYTOPLASM channel and/or the intracellular markers, combined) against a background-noise model, on the image before contrast/gamma: each channel is smoothed, its slowly varying background (uneven illumination, depth) is removed, and a voxel is positive from `nuclei_min_snr` / `cell_min_snr` background-noise SDs when it is connected to clearly bright signal or (cell body) to a nucleus (hysteresis). Dim cytoplasm is kept as cell body while isolated noise is dropped. The resulting nuclei mask and cell body mask (whole cell, nucleus included) are what `segment_nuclei()` and `segment_cytoplasm()` segment. `correct_uneven_background` turns the background removal on/off.
 - **Histogram export:** `export_channel_histograms()` saves every stage's histograms and a Parameters sheet to Excel.
 - **Nuclei:** `segment_nuclei()` with watershed (default), StarDist (`trig_stardist`) or Cellpose 3D (`trig_cellpose`). Splitting is automatic — there is no split profile to choose:
   - the watershed first pass uses a fixed built-in configuration: it also splits touching nuclei where the nuclear signal dips between them, and always splits a nucleus whose z-slices show separate islands (e.g. two lobes above and below its centre);

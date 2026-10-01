@@ -116,6 +116,7 @@ __all__ = [
     "run_smooth",
     "run_equalize",
     "run_threshold",
+    "run_cell_body_threshold",
     "BatchCompleted",
     "get_batch_output_dir",
     "is_batch_input",
@@ -2267,6 +2268,9 @@ def export_channel_histograms(
     aggregate_grow_factor=2.0,
     progress=None,
     output_dir=None,
+    nuclei_min_snr=None,
+    cell_min_snr=None,
+    correct_uneven_background=None,
 ):
     """
     Export per-channel intensity histograms for every processing stage in
@@ -2330,6 +2334,13 @@ def export_channel_histograms(
         'Sauvola (local) threshold weight': str(sauvola_weight),
         'Aggregate grow factor':          str(aggregate_grow_factor),
     }
+    # Nuclei/cell-body thresholding (run_cell_body_threshold), when used.
+    if nuclei_min_snr is not None:
+        processing_params['Nuclei min SNR (background SDs)'] = str(nuclei_min_snr)
+    if cell_min_snr is not None:
+        processing_params['Cell body min SNR (background SDs)'] = str(cell_min_snr)
+    if correct_uneven_background is not None:
+        processing_params['Correct uneven background'] = str(correct_uneven_background)
 
     _stage_abbrev = {
         'Original image':   'Orig',
@@ -6366,6 +6377,346 @@ def apply_threshold_per_channel(
     return im_out
 
 
+# ── Nuclei / cell-body thresholding (background-noise model) ──────────────
+# Used by Cell 15 from v1.6.2 on. The NUCLEI channel and the cell body (the
+# CYTOPLASM channel and/or the intracellular markers) are thresholded against
+# a model of the background noise instead of the combined global/Sauvola
+# threshold, so dim but real signal is kept.
+
+def _sample_values(arr, max_samples=4_000_000):
+    """Evenly strided sample of *arr*'s voxels (a view, no copy)."""
+    flat = arr.ravel()
+    step = max(1, flat.size // max_samples)
+    return flat[::step]
+
+
+def _estimate_background_map(arr, tile_shape, percentile=5.0):
+    """Slowly varying background level of a 3D channel (uneven illumination,
+    dimming with depth).
+
+    A low percentile is taken in each tile; each tile then takes the lowest
+    value of its XY neighbours (a tile filled with cells would otherwise
+    report cell signal as background), the grid is smoothed and interpolated
+    back to the full volume.
+    """
+    shape = arr.shape
+    tile = [max(4, min(int(t), s)) for t, s in zip(tile_shape, shape)]
+    grid_shape = [int(np.ceil(s / t)) for s, t in zip(shape, tile)]
+    grid = np.empty(grid_shape, dtype=np.float32)
+    for gz in range(grid_shape[0]):
+        for gy in range(grid_shape[1]):
+            for gx in range(grid_shape[2]):
+                block = arr[gz * tile[0]:(gz + 1) * tile[0],
+                            gy * tile[1]:(gy + 1) * tile[1],
+                            gx * tile[2]:(gx + 1) * tile[2]]
+                grid[gz, gy, gx] = np.percentile(_sample_values(block, 200_000), percentile)
+    grid = ndi.minimum_filter(grid, size=(1, 3, 3), mode='nearest')
+    grid = ndi.uniform_filter(grid, size=(1, 3, 3), mode='nearest')
+    zoom = [s / g for s, g in zip(shape, grid_shape)]
+    bg = ndi.zoom(grid, zoom, order=1, mode='nearest', grid_mode=True, output=np.float32)
+    # ndi.zoom rounds the output shape; make it match exactly.
+    pad = [(0, max(0, s - b)) for s, b in zip(shape, bg.shape)]
+    if any(p[1] for p in pad):
+        bg = np.pad(bg, pad, mode='edge')
+    return bg[:shape[0], :shape[1], :shape[2]]
+
+
+def _background_noise_stats(values):
+    """Background level (histogram mode) and noise SD of a 1D sample.
+
+    The mode is searched below the Otsu threshold, so a dominant signal peak
+    (dense tissue) is not taken for background. The noise SD comes from the
+    half of the background peak below the mode, which signal never reaches.
+    """
+    from skimage.filters import threshold_otsu
+
+    values = values[np.isfinite(values)].astype(np.float32)
+    if values.size == 0:
+        return 0.0, 1.0
+    try:
+        otsu = float(threshold_otsu(values))
+        below = values[values < otsu]
+    except ValueError:
+        below = values
+    if below.size < 1000:
+        below = values
+    lo, hi = np.percentile(below, [0.5, 99.5])
+    if hi <= lo:
+        return float(np.median(values)), 0.5
+    hist, edges = np.histogram(below, bins=256, range=(lo, hi))
+    hist = ndi.gaussian_filter1d(hist.astype(np.float64), 2)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    mode = float(centers[np.argmax(hist)])
+
+    left = values[values <= mode] - mode
+    if left.size >= 100:
+        sd = float(np.sqrt(np.mean(left ** 2)))
+    else:
+        sd = 1.4826 * float(np.median(np.abs(below - np.median(below))))
+    # 8-bit data smoothed: the noise can't be meaningfully below ~0.5 levels.
+    return mode, max(sd, 0.5)
+
+
+def _snr_map(channel, smooth_px, tile_shape, correct_background):
+    """Convert one channel to background-noise units: 0 = background level,
+    1 = one noise SD above it.
+
+    Returns
+    -------
+    snr : ndarray float32 (Z, Y, X)
+    bg_level, noise_sd : float
+        In smoothed (and background-corrected) intensity units.
+    """
+    img = channel.astype(np.float32)
+    if smooth_px > 0:
+        img = ndi.gaussian_filter(img, smooth_px, output=np.float32)
+    if correct_background:
+        img -= _estimate_background_map(img, tile_shape)
+
+    # Voxels stuck at the channel's minimum (black borders, clipped data)
+    # are not background noise: leave them out of the statistics.
+    sample = _sample_values(img)
+    raw_sample = _sample_values(channel)
+    not_floor = raw_sample > raw_sample.min()
+    if np.count_nonzero(not_floor) >= 1000:
+        sample = sample[not_floor]
+    bg_level, noise_sd = _background_noise_stats(sample)
+
+    img -= bg_level
+    img /= noise_sd
+    return img, bg_level, noise_sd
+
+
+def _hysteresis_mask(snr, low, high, extra_seeds=None):
+    """Voxels above *low* that are connected to a voxel above *high* (or to
+    *extra_seeds*). Dim signal is kept when it belongs to a real object;
+    isolated noise above *low* is dropped."""
+    low_mask = snr > low
+    labels, n = ndi.label(low_mask)
+    if n == 0:
+        return low_mask
+    seeds = snr > high
+    if extra_seeds is not None:
+        seeds |= extra_seeds & low_mask
+    keep = np.zeros(n + 1, dtype=bool)
+    keep[np.unique(labels[seeds])] = True
+    keep[0] = False
+    return keep[labels]
+
+
+def _fill_small_holes_per_slice(mask, max_hole_area):
+    """Fill XY holes smaller than *max_hole_area* (e.g. dark nucleoli),
+    without closing larger gaps enclosed by a ring of objects."""
+    out = mask.copy()
+    for z in range(out.shape[0]):
+        if not out[z].any():
+            continue
+        holes = ndi.binary_fill_holes(out[z]) & ~out[z]
+        hole_labels, n = ndi.label(holes)
+        if n == 0:
+            continue
+        is_small = np.bincount(hole_labels.ravel()) < max_hole_area
+        is_small[0] = False
+        out[z] |= is_small[hole_labels]
+    return out
+
+
+def _mask_panel(title, snr, mask, low, high):
+    """What `_plot_cell_body_masks` needs from one object, without keeping
+    the full float volume alive."""
+    return (title, np.array(_sample_values(snr, 2_000_000)), snr.max(axis=0),
+            mask.max(axis=0), low, high)
+
+
+def _plot_cell_body_masks(panels):
+    """One row per object (nuclei, cell body): signal-to-noise histogram with
+    the thresholds, and a max projection with the mask outline."""
+    if not panels:
+        return None
+    fig, axs = plt.subplots(len(panels), 2, figsize=(12, 3.2 * len(panels)), squeeze=False)
+    for row, (title, sample, snr_mip, mip, low, high) in enumerate(panels):
+        lo = float(np.percentile(sample, 0.1))
+        hi = max(float(np.percentile(sample, 99.9)), 2 * high)
+        ax = axs[row, 0]
+        ax.hist(sample, bins=256, range=(lo, hi), color='gray')
+        ax.axvline(low, color='red', label=f'Signal threshold ({low:g} SD)')
+        ax.axvline(high, color='orange', linestyle='--', label=f'Seed threshold ({high:g} SD)')
+        ax.set_yscale('log')
+        ax.set_xlabel('Signal / background noise (SD units)')
+        ax.set_title(f'{title}: intensity above background')
+        ax.legend(fontsize=7)
+
+        ax = axs[row, 1]
+        ax.imshow(np.clip(snr_mip, 0, 2 * high), cmap='gray')
+        if mip.any() and not mip.all():
+            ax.contour(mip, levels=[0.5], colors='red', linewidths=0.6)
+        ax.set_title(f'{title}: max projection + mask outline')
+        ax.axis('off')
+    fig.tight_layout()
+    return fig
+
+
+def run_cell_body_threshold(
+    im_final_stack,
+    stain_complete_df,
+    cyto_markers,
+    nuclei_diameter,
+    cell_diameter,
+    r_zX, r_zY, r_zZ,
+    nuclei_min_snr=3.0,
+    cell_min_snr=2.0,
+    seed_factor=2.5,
+    correct_uneven_background=True,
+    source_image='Denoised image',
+    progress=None,
+):
+    """Threshold the nuclei and the cell body against a background-noise
+    model, so low-intensity signal still counts as positive.
+
+    Each channel is smoothed, its slowly varying background (uneven
+    illumination, dimming with depth) is subtracted, and it is expressed in
+    units of background noise (SD of the background peak). Then:
+
+    - **Nuclei** (NUCLEI channel): voxels above ``nuclei_min_snr`` SDs,
+      connected to a voxel above ``seed_factor`` x that (hysteresis), with
+      small holes (nucleoli) filled and specks removed.
+    - **Cell body** (CYTOPLASM channel and/or the ``cyto_markers``, combined
+      by taking, per voxel, the strongest channel in noise units): voxels
+      above ``cell_min_snr`` SDs connected to a stronger seed or to a
+      nucleus, plus the nuclei themselves, with gaps closed and enclosed
+      holes filled. Dim cytoplasm is kept as long as it is attached to a cell.
+
+    The results are stored as ``im_final_stack['Nuclei mask']`` and
+    ``im_final_stack['Cell body mask']`` (the whole cell, nucleus included)
+    and also replace the NUCLEI / CYTOPLASM channels of 'Threshold image',
+    so the nuclei and cytoplasm segmentation (Cells 17-18) use them. The
+    other marker channels keep the `run_threshold` masks, which decide
+    marker positivity.
+
+    Parameters
+    ----------
+    im_final_stack : dict
+        Must contain 'Threshold image' (run `run_threshold` first) and
+        *source_image*.
+    cyto_markers : list of str
+        Markers ticked as intracellular; they define the cell body together
+        with the CYTOPLASM channel (if any).
+    nuclei_min_snr, cell_min_snr : float
+        Signal threshold in background-noise SDs. Lower = dimmer signal kept
+        (and more noise risk).
+    seed_factor : float
+        A connected region is kept only if it reaches ``seed_factor`` x the
+        signal threshold somewhere (or touches a nucleus, for the cell body).
+    correct_uneven_background : bool
+        Subtract the slowly varying background before thresholding.
+    source_image : str
+        Stage of *im_final_stack* to threshold. The default, 'Denoised
+        image', is before the contrast/gamma of Cell 12, so dim signal cut
+        by the display contrast is still seen; use 'Filtered image' to
+        threshold after contrast/gamma and smoothing.
+    progress : callable, optional
+        Progress wrapper (e.g. tqdm).
+
+    Returns
+    -------
+    im_final_stack : dict
+    """
+    from skimage.morphology import ball
+
+    if 'Threshold image' not in im_final_stack:
+        raise RuntimeError("Run run_threshold() first: 'Threshold image' is missing.")
+    if source_image not in im_final_stack:
+        raise KeyError(f"'{source_image}' is not in im_final_stack.")
+
+    index = list(stain_complete_df.index)
+    nuc_c = index.index('NUCLEI') if 'NUCLEI' in index else None
+    cyto_markers = list(cyto_markers or [])
+    body_channels = [
+        c for c, idx in enumerate(index)
+        if idx == 'CYTOPLASM' or (idx != 'NUCLEI' and stain_complete_df.loc[idx, 'Marker'] in cyto_markers)
+    ]
+    if nuc_c is None and not body_channels:
+        print("No NUCLEI channel, CYTOPLASM channel or intracellular marker: "
+              "the masks of run_threshold() are kept.")
+        return im_final_stack
+
+    src = im_final_stack[source_image]
+    thr = im_final_stack['Threshold image']
+    r_xy = float(np.mean([r_zX, r_zY]))
+    nuclei_px = nuclei_diameter / r_xy
+    cell_px = cell_diameter / r_xy
+    tile_shape = (max(8, cell_px), 2 * cell_px, 2 * cell_px)
+    nuclei_area = np.pi * (nuclei_px / 2) ** 2
+    panels = []
+
+    def _report(name, noise_sd, low):
+        where = 'local background' if correct_uneven_background else 'background'
+        print(f"  [{name}] background noise SD = {noise_sd:.2f} grey levels "
+              f"-> positive from {low * noise_sd:.1f} grey levels above the {where} "
+              f"({low:g} SD)")
+
+    nuclei_mask = None
+    if nuc_c is not None:
+        marker = stain_complete_df.loc['NUCLEI', 'Marker']
+        snr, _, noise_sd = _snr_map(
+            src[:, :, :, nuc_c], smooth_px=max(0.5, nuclei_px / 20),
+            tile_shape=tile_shape, correct_background=correct_uneven_background,
+        )
+        _report(marker, noise_sd, nuclei_min_snr)
+        high = nuclei_min_snr * seed_factor
+        nuclei_mask = _hysteresis_mask(snr, nuclei_min_snr, high)
+        nuclei_mask = _fill_small_holes_per_slice(nuclei_mask, 0.5 * nuclei_area)
+        nuclei_mask = ndi.binary_opening(nuclei_mask, structure=ball(1))
+        nuclei_mask = remove_small_islands(nuclei_mask, np.ceil(0.4 * nuclei_area))
+        panels.append(_mask_panel(f'Nuclei ({marker})', snr, nuclei_mask, nuclei_min_snr, high))
+        thr[:, :, :, nuc_c] = nuclei_mask.astype(thr.dtype)
+        im_final_stack['Nuclei mask'] = nuclei_mask
+        n_obj = ndi.label(nuclei_mask)[1]
+        print(f"  Nuclei mask: {100 * nuclei_mask.mean():.1f}% of the volume, "
+              f"{n_obj} connected region(s)")
+        del snr
+
+    if body_channels:
+        body_snr = None
+        names = []
+        for c in _progress_iter(body_channels, progress, desc='Step 15B - Cell Body Channels'):
+            marker = stain_complete_df.loc[index[c], 'Marker']
+            names.append(str(marker))
+            snr, _, noise_sd = _snr_map(
+                src[:, :, :, c], smooth_px=max(0.5, nuclei_px / 10),
+                tile_shape=tile_shape, correct_background=correct_uneven_background,
+            )
+            _report(marker, noise_sd, cell_min_snr)
+            body_snr = snr if body_snr is None else np.maximum(body_snr, snr, out=body_snr)
+            del snr
+
+        high = cell_min_snr * seed_factor
+        nuclei_seeds = None
+        if nuclei_mask is not None:
+            nuclei_seeds = ndi.binary_dilation(nuclei_mask, structure=ball(1))
+        body_mask = _hysteresis_mask(body_snr, cell_min_snr, high, extra_seeds=nuclei_seeds)
+        if nuclei_mask is not None:
+            body_mask |= nuclei_mask
+        body_mask = ndi.binary_closing(body_mask, structure=ball(1))
+        body_mask = ndi.binary_fill_holes(body_mask)
+        body_mask = _fill_small_holes_per_slice(body_mask, nuclei_area)
+        body_mask = remove_small_islands(body_mask, np.ceil(0.8 * nuclei_area))
+        panels.append(_mask_panel(
+            f"Cell body ({' + '.join(names)})", body_snr, body_mask, cell_min_snr, high
+        ))
+        if 'CYTOPLASM' in index:
+            thr[:, :, :, index.index('CYTOPLASM')] = body_mask.astype(thr.dtype)
+        im_final_stack['Cell body mask'] = body_mask
+        n_obj = ndi.label(body_mask)[1]
+        print(f"  Cell body mask: {100 * body_mask.mean():.1f}% of the volume, "
+              f"{n_obj} connected region(s)")
+        del body_snr
+
+    _plot_cell_body_masks(panels)
+    gc.collect()
+    return im_final_stack
+
+
 def segment_nuclei_cellpose(image_3d, nuclei_diameter, voxel_size, model_type='nuclei'):
     """Segment nuclei using Cellpose 3D.
 
@@ -7585,7 +7936,9 @@ def segment_cytoplasm(
     ----------
     im_final_stack : dict
         Must contain 'Threshold image' and (when
-        ``split_by_intensity_gradient`` is True) 'Filtered image'.
+        ``split_by_intensity_gradient`` is True) 'Filtered image'. If it
+        also holds a 'Cell body mask' (`run_cell_body_threshold`), that mask
+        replaces the union of the cyto_markers thresholds.
     im_segmentation_stack : dict
         Must contain 'Nuclei'.
     stain_df, stain_complete_df : DataFrame
@@ -7707,6 +8060,12 @@ def segment_cytoplasm(
                     marker_mask |= (im_in[:, :, :, c] > 0)
                     if split_by_intensity_gradient:
                         marker_channel_imgs.append(im_final_stack['Filtered image'][:, :, :, c])
+            if 'Cell body mask' in im_final_stack:
+                # Built by run_cell_body_threshold (Cell 15) from the same
+                # markers, keeping their dim signal; the per-marker masks
+                # above stay in use for marker positivity only.
+                marker_mask = im_final_stack['Cell body mask'].copy()
+                print("Cell body taken from the cell body mask of Cell 15")
 
             nuc_mask = im_segmentation_stack['Nuclei'] > 0
             combined_mask = marker_mask | nuc_mask
@@ -7987,9 +8346,20 @@ def view_processing_results(
             islands.astype(np.int32),
             name=f'Thresh islands {idx} ({marker})', blending='additive', scale=scale_zoom,
         )
-    # 'Threshold image' is also not read by any later cell; free it (and the
-    # local `im_thr` reference used above) the same way.
+    # With a CYTOPLASM channel the cell body mask (Cell 15) is already shown
+    # as that channel's islands; without one it has no channel of its own.
+    if 'Cell body mask' in im_final_stack and 'CYTOPLASM' not in stain_df.index:
+        islands, _ = ndi.label(im_final_stack['Cell body mask'])
+        viewer_0.add_labels(
+            islands.astype(np.int32),
+            name='Thresh islands CELL BODY (intracellular markers)',
+            blending='additive', scale=scale_zoom,
+        )
+    # 'Threshold image' and the masks are also not read by any later cell;
+    # free them (and the local `im_thr` reference used above) the same way.
     del im_final_stack['Threshold image']
+    im_final_stack.pop('Nuclei mask', None)
+    im_final_stack.pop('Cell body mask', None)
     del im_thr
     gc.collect()
     viewer_0.scale_bar.visible = True
@@ -8983,6 +9353,10 @@ def _process_single_image_batch(
     settings,
     napari_module,
     progress,
+    cell_body_threshold=False,
+    nuclei_min_snr=3.0,
+    cell_min_snr=2.0,
+    correct_uneven_background=True,
 ):
     """Run the notebook pipeline (Cells 4-34) on one file, without viewers,
     plots or PNG subfolders, writing every output file into *output_dir*
@@ -9043,6 +9417,24 @@ def _process_single_image_batch(
         threshold_method=threshold_method,
         progress=progress,
     )
+    if cell_body_threshold:
+        im_final_stack = run_cell_body_threshold(
+            im_final_stack,
+            stain_complete_df=stain_complete_df,
+            cyto_markers=cyto_markers,
+            nuclei_diameter=nuclei_diameter,
+            cell_diameter=cell_diameter,
+            r_zX=r_zX, r_zY=r_zY, r_zZ=r_zZ,
+            nuclei_min_snr=nuclei_min_snr,
+            cell_min_snr=cell_min_snr,
+            correct_uneven_background=correct_uneven_background,
+            progress=progress,
+        )
+    cell_body_params = (
+        dict(nuclei_min_snr=nuclei_min_snr, cell_min_snr=cell_min_snr,
+             correct_uneven_background=correct_uneven_background)
+        if cell_body_threshold else {}
+    )
 
     # Cell 16
     export_channel_histograms(
@@ -9061,6 +9453,7 @@ def _process_single_image_batch(
         aggregate_grow_factor=aggregate_grow_factor,
         progress=progress,
         output_dir=output_dir,
+        **cell_body_params,
     )
 
     # Cells 17-21
@@ -9235,6 +9628,10 @@ def run_batch_folder(
     settings=None,
     napari_module=None,
     progress=None,
+    cell_body_threshold=False,
+    nuclei_min_snr=3.0,
+    cell_min_snr=2.0,
+    correct_uneven_background=True,
 ):
     """Process every supported image file in *input_folder* with the full
     pipeline and write each image's outputs into its own subfolder,
@@ -9252,6 +9649,11 @@ def run_batch_folder(
     setup viewer opens -- or ``automatic_contrast`` picks limits -- and the
     CSV written for the first image is then reused for the following ones
     (as long as ``use_setup`` is True).
+
+    With ``cell_body_threshold=True`` the nuclei and cell body are also
+    thresholded with `run_cell_body_threshold` (``nuclei_min_snr``,
+    ``cell_min_snr``, ``correct_uneven_background``), as in Cell 15 of
+    v1.6.2.
 
     A file that raises an error is reported and skipped; the batch carries on
     with the next one.
@@ -9329,6 +9731,10 @@ def run_batch_folder(
                 settings=settings,
                 napari_module=napari_module,
                 progress=progress,
+                cell_body_threshold=cell_body_threshold,
+                nuclei_min_snr=nuclei_min_snr,
+                cell_min_snr=cell_min_snr,
+                correct_uneven_background=correct_uneven_background,
             )
             results.append({
                 "File": image_path.name,
