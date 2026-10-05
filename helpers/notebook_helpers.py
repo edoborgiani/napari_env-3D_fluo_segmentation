@@ -116,7 +116,7 @@ __all__ = [
     "run_smooth",
     "run_equalize",
     "run_threshold",
-    "run_cell_body_threshold",
+    "build_cytoplasm_mask",
     "BatchCompleted",
     "get_batch_output_dir",
     "is_batch_input",
@@ -1756,6 +1756,19 @@ def merge_small_touching_labels(label_matrix, size_threshold, z_weight=2.0):
     return merged
 
 
+def _n_cells(seg_stack):
+    """Number of cells the marker statistics run over (labels 1..N).
+
+    `segment_cytoplasm` numbers the nuclei with a cytoplasm first, so this is
+    the largest cytoplasm label; nuclei above it have no cytoplasm and are
+    excluded. Without a cytoplasm (e.g. LD mode) every nucleus counts.
+    """
+    cyto = seg_stack.get("Cytoplasm")
+    if cyto is not None and np.any(cyto):
+        return int(np.max(cyto))
+    return int(np.max(seg_stack["Nuclei"]))
+
+
 def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms, progress=None):
     """Compute centroid positions and volumes for nuclei and cytoplasm."""
     max_label = int(np.max(seg_stack["Nuclei"]))
@@ -1795,7 +1808,10 @@ def compute_nuclei_cytoplasm_stats(seg_stack, r_xyz, zooms, progress=None):
             )
             cytoplasm_sizes.append(float(x_cyto.size * r_xyz[0] * r_xyz[1] * r_xyz[2]))
 
-    return nucleus_positions, nucleus_sizes, cytoplasm_positions, cytoplasm_sizes
+    # Nuclei excluded for having no cytoplasm (labels above _n_cells) have
+    # no cytoplasm entry.
+    n_cells = _n_cells(seg_stack)
+    return nucleus_positions, nucleus_sizes, cytoplasm_positions[:n_cells], cytoplasm_sizes[:n_cells]
 
 
 def _compute_marker_stats_core(
@@ -1844,7 +1860,7 @@ def _compute_marker_stats_core(
     avg_pcm_marker = []
     std_pcm_marker = []
 
-    max_label = int(np.max(seg_stack["Nuclei"]))
+    max_label = _n_cells(seg_stack)
     for label_id in _progress_iter(
         range(1, max_label + 1), progress,
         desc=progress_desc or f"Quantify [{condition}] per cell", leave=False,
@@ -2280,11 +2296,7 @@ def export_channel_histograms(
     aggregate_grow_factor=2.0,
     progress=None,
     output_dir=None,
-    nuclei_min_snr=None,
-    cell_min_snr=None,
-    correct_uneven_background=None,
     membrane_markers=None,
-    cell_edge_fraction=None,
 ):
     """
     Export per-channel intensity histograms for every processing stage in
@@ -2348,15 +2360,6 @@ def export_channel_histograms(
         'Sauvola (local) threshold weight': str(sauvola_weight),
         'Aggregate grow factor':          str(aggregate_grow_factor),
     }
-    # Nuclei/cell-body thresholding (run_cell_body_threshold), when used.
-    if nuclei_min_snr is not None:
-        processing_params['Nuclei min SNR (background SDs)'] = str(nuclei_min_snr)
-    if cell_min_snr is not None:
-        processing_params['Cell body min SNR (background SDs)'] = str(cell_min_snr)
-    if cell_edge_fraction is not None:
-        processing_params['Cell body edge (x local brightness)'] = str(cell_edge_fraction)
-    if correct_uneven_background is not None:
-        processing_params['Correct uneven background'] = str(correct_uneven_background)
     if membrane_markers is not None:
         processing_params['Membrane markers'] = str(membrane_markers)
 
@@ -2871,7 +2874,13 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
     channels.
     """
     nuclei_rows = labels_df[labels_df["Condition"] == "NUCLEI"]
-    total_cells = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_df.iloc[0]["Number"])
+    cyto_rows = labels_df[labels_df["Condition"] == "CYTOPLASM"]
+    total_nuclei = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_df.iloc[0]["Number"])
+    # Percentages are of the analysed cells: nuclei without a cytoplasm are
+    # excluded (see segment_cytoplasm).
+    total_cells = total_nuclei
+    if not cyto_rows.empty and float(cyto_rows.iloc[0]["Number"]) > 0:
+        total_cells = float(cyto_rows.iloc[0]["Number"])
 
     # --- Channel overview ---
     print("CHANNELS:")
@@ -2881,6 +2890,9 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
 
     print("_" * 80)
     print("TOT CELLS =", int(total_cells))
+    if total_nuclei > total_cells:
+        print(f"  ({int(total_nuclei)} nuclei, {int(total_nuclei - total_cells)} "
+              "excluded: no cytoplasm beyond the nucleus)")
     print(" ")
     for _, marker in _progress_iter(
         enumerate(labels_df.index),
@@ -2911,7 +2923,6 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
 
     if not nuclei_rows.empty:
         _size_stats_line(nuclei_rows.iloc[0]["Nuclei size [um3]"], "NUCLEI SIZE")
-    cyto_rows = labels_df[labels_df["Condition"] == "CYTOPLASM"]
     if "CYTOPLASM" in stain_df.index and not cyto_rows.empty:
         _size_stats_line(cyto_rows.iloc[0]["Cytoplasm size [um3]"], "CYTOPLASM SIZE")
 
@@ -3049,7 +3060,7 @@ def collect_histogram_data(im_segmentation_stack, filtered_img, stain_df, stain_
         condition = stain_complete_df.index[c]
         intensity_img = filtered_img[:, :, :, c]
         intensity_ranges[condition] = (float(intensity_img.min()), float(intensity_img.max()))
-        max_n = int(np.max(im_segmentation_stack["Nuclei"]))
+        max_n = _n_cells(im_segmentation_stack)
 
         for nucleus_id in _progress_iter(range(1, max_n + 1), progress, desc=f"Step 26B - {condition} Nuclei"):
             hist_data.setdefault(nucleus_id, {})
@@ -3266,7 +3277,7 @@ def compute_percell_marker_intensity_df(
     nuclei_img = im_segmentation_stack['Nuclei']
     cyto_img = im_segmentation_stack.get('Cytoplasm')
     pcm_img = im_segmentation_stack.get('PCM')
-    max_label = int(np.max(nuclei_img))
+    max_label = _n_cells(im_segmentation_stack)
 
     # stain_complete_df can carry extra rows with no matching image channel
     # (e.g. segment_cytoplasm appends a placeholder 'CYTOPLASM' row when
@@ -6395,152 +6406,14 @@ def apply_threshold_per_channel(
     return im_out
 
 
-# ── Nuclei / cell-body thresholding (background-noise model) ──────────────
-# Used by Cell 15 from v1.6.2 on. The NUCLEI channel and the cell body (the
-# CYTOPLASM channel and/or the intracellular markers) are thresholded against
-# a model of the background noise instead of the combined global/Sauvola
-# threshold, so dim but real signal is kept.
-
-def _sample_values(arr, max_samples=4_000_000):
-    """Evenly strided sample of *arr*'s voxels (a view, no copy)."""
-    flat = arr.ravel()
-    step = max(1, flat.size // max_samples)
-    return flat[::step]
-
-
-def _estimate_background_map(arr, tile_shape, percentile=5.0):
-    """Slowly varying background level of a 3D channel (uneven illumination,
-    dimming with depth).
-
-    A low percentile is taken in each tile; each tile then takes the lowest
-    value of its XY neighbours (a tile filled with cells would otherwise
-    report cell signal as background), the grid is smoothed and interpolated
-    back to the full volume.
-    """
-    shape = arr.shape
-    tile = [max(4, min(int(t), s)) for t, s in zip(tile_shape, shape)]
-    grid_shape = [int(np.ceil(s / t)) for s, t in zip(shape, tile)]
-    grid = np.empty(grid_shape, dtype=np.float32)
-    for gz in range(grid_shape[0]):
-        for gy in range(grid_shape[1]):
-            for gx in range(grid_shape[2]):
-                block = arr[gz * tile[0]:(gz + 1) * tile[0],
-                            gy * tile[1]:(gy + 1) * tile[1],
-                            gx * tile[2]:(gx + 1) * tile[2]]
-                grid[gz, gy, gx] = np.percentile(_sample_values(block, 200_000), percentile)
-    grid = ndi.minimum_filter(grid, size=(1, 3, 3), mode='nearest')
-    grid = ndi.uniform_filter(grid, size=(1, 3, 3), mode='nearest')
-    zoom = [s / g for s, g in zip(shape, grid_shape)]
-    bg = ndi.zoom(grid, zoom, order=1, mode='nearest', grid_mode=True, output=np.float32)
-    # ndi.zoom rounds the output shape; make it match exactly.
-    pad = [(0, max(0, s - b)) for s, b in zip(shape, bg.shape)]
-    if any(p[1] for p in pad):
-        bg = np.pad(bg, pad, mode='edge')
-    return bg[:shape[0], :shape[1], :shape[2]]
-
-
-def _background_noise_stats(values):
-    """Background level (histogram mode) and noise SD of a 1D sample.
-
-    The mode is searched below the Otsu threshold, so a dominant signal peak
-    (dense tissue) is not taken for background. The noise SD comes from the
-    half of the background peak below the mode, which signal never reaches.
-    """
-    from skimage.filters import threshold_otsu
-
-    values = values[np.isfinite(values)].astype(np.float32)
-    if values.size == 0:
-        return 0.0, 1.0
-    try:
-        otsu = float(threshold_otsu(values))
-        below = values[values < otsu]
-    except ValueError:
-        below = values
-    if below.size < 1000:
-        below = values
-    lo, hi = np.percentile(below, [0.5, 99.5])
-    if hi <= lo:
-        return float(np.median(values)), 0.5
-    hist, edges = np.histogram(below, bins=256, range=(lo, hi))
-    hist = ndi.gaussian_filter1d(hist.astype(np.float64), 2)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    mode = float(centers[np.argmax(hist)])
-
-    left = values[values <= mode] - mode
-    if left.size >= 100:
-        sd = float(np.sqrt(np.mean(left ** 2)))
-    else:
-        sd = 1.4826 * float(np.median(np.abs(below - np.median(below))))
-    # 8-bit data smoothed: the noise can't be meaningfully below ~0.5 levels.
-    return mode, max(sd, 0.5)
-
-
-def _snr_map(channel, smooth_px, tile_shape, correct_background,
-             noise_from_unsmoothed=False):
-    """Convert one channel to background-noise units: 0 = background level,
-    1 = one noise SD above it.
-
-    With ``noise_from_unsmoothed`` the noise SD is measured on the channel
-    *before* smoothing (smoothing shrinks the apparent noise, so an SD
-    threshold on it lands barely above the background and lets the blurred
-    halo of the signal through). The threshold then means "N x the real
-    pixel noise" and raising it clearly shrinks the mask.
-
-    Returns
-    -------
-    snr : ndarray float32 (Z, Y, X)
-    bg_level, noise_sd : float
-        In background-corrected intensity units (unsmoothed when
-        ``noise_from_unsmoothed``, otherwise smoothed).
-    """
-    img = channel.astype(np.float32)
-    if smooth_px > 0:
-        img = ndi.gaussian_filter(img, smooth_px, output=np.float32)
-    bg_map = _estimate_background_map(img, tile_shape) if correct_background else 0.0
-    img -= bg_map
-
-    if noise_from_unsmoothed:
-        stats_img = channel.astype(np.float32)
-        stats_img -= bg_map
-    else:
-        stats_img = img
-    del bg_map
-
-    # Voxels stuck at the channel's minimum (black borders, clipped data)
-    # are not background noise: leave them out of the statistics.
-    sample = _sample_values(stats_img)
-    raw_sample = _sample_values(channel)
-    not_floor = raw_sample > raw_sample.min()
-    if np.count_nonzero(not_floor) >= 1000:
-        sample = sample[not_floor]
-    bg_level, noise_sd = _background_noise_stats(np.array(sample))
-    del stats_img
-
-    img -= bg_level
-    img /= noise_sd
-    return img, bg_level, noise_sd
-
-
-def _hysteresis_mask(snr, low, high, extra_seeds=None):
-    """Voxels above *low* that are connected to a voxel above *high* (or to
-    *extra_seeds*). Dim signal is kept when it belongs to a real object;
-    isolated noise above *low* is dropped."""
-    low_mask = snr > low
-    labels, n = ndi.label(low_mask)
-    if n == 0:
-        return low_mask
-    seeds = snr > high
-    if extra_seeds is not None:
-        seeds |= extra_seeds & low_mask
-    keep = np.zeros(n + 1, dtype=bool)
-    keep[np.unique(labels[seeds])] = True
-    keep[0] = False
-    return keep[labels]
-
+# ── Cytoplasm from the stains (used by Cell 18) ───────────────────────────
+# The cytoplasm is the union of the thresholded intracellular stains and the
+# filled membrane stains (the run_threshold masks of Cell 15), with no growth
+# beyond the stained voxels.
 
 def _fill_small_holes_per_slice(mask, max_hole_area):
-    """Fill XY holes smaller than *max_hole_area* (e.g. dark nucleoli),
-    without closing larger gaps enclosed by a ring of objects."""
+    """Fill XY holes smaller than *max_hole_area*, without closing larger
+    gaps enclosed by a ring of objects."""
     out = mask.copy()
     for z in range(out.shape[0]):
         if not out[z].any():
@@ -6573,292 +6446,42 @@ def _fill_membrane_rings(membrane_mask, max_cell_area, close_radius=2):
     return filled | membrane_mask
 
 
-def _mask_panel(title, snr, mask, low, high):
-    """What `_plot_cell_body_masks` needs from one object, without keeping
-    the full float volume alive."""
-    return (title, np.array(_sample_values(snr, 2_000_000)), snr.max(axis=0),
-            mask.max(axis=0), low, high)
-
-
-def _plot_cell_body_masks(panels):
-    """One row per object (nuclei, cell body): signal-to-noise histogram with
-    the thresholds, and a max projection with the mask outline."""
-    if not panels:
-        return None
-    fig, axs = plt.subplots(len(panels), 2, figsize=(12, 3.2 * len(panels)), squeeze=False)
-    for row, (title, sample, snr_mip, mip, low, high) in enumerate(panels):
-        # high is None when there is no seed threshold (plain threshold).
-        top = 2 * high if high is not None else 3 * low
-        lo = float(np.percentile(sample, 0.1))
-        hi = max(float(np.percentile(sample, 99.9)), top)
-        ax = axs[row, 0]
-        ax.hist(sample, bins=256, range=(lo, hi), color='gray')
-        ax.axvline(low, color='red', label=f'Signal threshold ({low:g} SD)')
-        if high is not None:
-            ax.axvline(high, color='orange', linestyle='--', label=f'Seed threshold ({high:g} SD)')
-        ax.set_yscale('log')
-        ax.set_xlabel('Signal / background noise (SD units)')
-        ax.set_title(f'{title}: intensity above background')
-        ax.legend(fontsize=7)
-
-        ax = axs[row, 1]
-        ax.imshow(np.clip(snr_mip, 0, top), cmap='gray')
-        if mip.any() and not mip.all():
-            ax.contour(mip, levels=[0.5], colors='red', linewidths=0.6)
-        ax.set_title(f'{title}: max projection + mask outline')
-        ax.axis('off')
-    fig.tight_layout()
-    return fig
-
-
-def run_cell_body_threshold(
-    im_final_stack,
-    stain_complete_df,
-    cyto_markers,
-    nuclei_diameter,
-    cell_diameter,
-    r_zX, r_zY, r_zZ,
-    nuclei_min_snr=3.0,
-    cell_min_snr=2.0,
-    seed_factor=2.5,
-    correct_uneven_background=True,
-    source_image='Denoised image',
-    membrane_markers=None,
-    cell_edge_fraction=0.25,
-    progress=None,
-):
-    """Threshold the nuclei and the cell body against a background-noise
-    model, so low-intensity signal still counts as positive.
-
-    Each channel is smoothed, its slowly varying background (uneven
-    illumination, dimming with depth) is subtracted, and it is expressed in
-    units of background noise (SD of the background peak). Then:
-
-    - **Nuclei** (NUCLEI channel): voxels above ``nuclei_min_snr`` SDs,
-      connected to a voxel above ``seed_factor`` x that (hysteresis), with
-      small holes (nucleoli) filled and specks removed.
-    - **Cell body** = nuclei mask U intracellular stain (CYTOPLASM channel
-      and/or ``cyto_markers``), with no growth beyond the stained voxels.
-      Each intracellular channel is lightly smoothed (1 voxel) and kept
-      where it is above ``cell_min_snr`` x the *unsmoothed* pixel noise
-      *and* above ``cell_edge_fraction`` x the local cell brightness (so the
-      optical blur halo of bright cells is not counted); channels united.
-      Only isolated specks are removed and only cavities fully enclosed by
-      the union are filled.
-
-      The membrane stain (``membrane_markers``) is not part of the cell
-      body: it marks the cell borders in the cytoplasm split (Cell 18).
-      Only when there is no intracellular stain at all are its rings
-      closed and filled to stand in for the cell body (see
-      `_fill_membrane_rings`).
-
-    The results are stored as ``im_final_stack['Nuclei mask']`` and
-    ``im_final_stack['Cell body mask']`` (the whole cell, nucleus included)
-    and also replace the NUCLEI / CYTOPLASM channels of 'Threshold image',
-    so the nuclei and cytoplasm segmentation (Cells 17-18) use them. The
-    other marker channels keep the `run_threshold` masks, which decide
-    marker positivity.
-
-    Parameters
-    ----------
-    im_final_stack : dict
-        Must contain 'Threshold image' (run `run_threshold` first) and
-        *source_image*.
-    cyto_markers : list of str
-        Markers ticked as intracellular; they define the cell body together
-        with the CYTOPLASM channel (if any).
-    nuclei_min_snr, cell_min_snr : float
-        Signal threshold in background-noise SDs. Lower = dimmer signal kept
-        (and more noise risk).
-    seed_factor : float
-        Nuclei only: a connected region is kept only if it reaches
-        ``seed_factor`` x ``nuclei_min_snr`` somewhere.
-    correct_uneven_background : bool
-        Subtract the slowly varying background before thresholding.
-    source_image : str
-        Stage of *im_final_stack* to threshold. The default, 'Denoised
-        image', is before the contrast/gamma of Cell 12, so dim signal cut
-        by the display contrast is still seen; use 'Filtered image' to
-        threshold after contrast/gamma and smoothing.
-    membrane_markers : list of str, optional
-        Markers ticked as membrane in the stain table. Usually also in
-        *cyto_markers*; either way they are treated as membrane.
-    cell_edge_fraction : float
-        Intracellular stain only: a voxel must also reach this fraction of
-        the local cell brightness (smoothed max within about one nucleus
-        diameter). Higher = tighter cells, especially bright ones; 0 = SD
-        threshold only (as before).
-    progress : callable, optional
-        Progress wrapper (e.g. tqdm).
-
-    Returns
-    -------
-    im_final_stack : dict
-    """
-    from skimage.morphology import ball
-
-    if 'Threshold image' not in im_final_stack:
-        raise RuntimeError("Run run_threshold() first: 'Threshold image' is missing.")
-    if source_image not in im_final_stack:
-        raise KeyError(f"'{source_image}' is not in im_final_stack.")
-
-    index = list(stain_complete_df.index)
-    nuc_c = index.index('NUCLEI') if 'NUCLEI' in index else None
+def _cytoplasm_stain_channels(stain_complete_df, n_channels, cyto_markers, membrane_markers):
+    """Channel indices of the cytoplasm stains, as ``(intracellular,
+    membrane)``. Intracellular = the CYTOPLASM channel and the markers ticked
+    as intracellular; membrane = the markers ticked as membrane."""
     cyto_markers = list(cyto_markers or [])
     membrane_markers = list(membrane_markers or [])
+    intra, memb = [], []
+    for c, idx in enumerate(stain_complete_df.index[:n_channels]):
+        if idx == 'NUCLEI':
+            continue
+        marker = stain_complete_df.loc[idx, 'Marker']
+        if idx != 'CYTOPLASM' and marker in membrane_markers:
+            memb.append(c)
+        elif idx == 'CYTOPLASM' or marker in cyto_markers:
+            intra.append(c)
+    return intra, memb
 
-    def _marker(idx):
-        return stain_complete_df.loc[idx, 'Marker']
 
-    membrane_channels = [
-        c for c, idx in enumerate(index)
-        if idx not in ('NUCLEI', 'CYTOPLASM') and _marker(idx) in membrane_markers
-    ]
-    body_channels = [
-        c for c, idx in enumerate(index)
-        if c not in membrane_channels
-        and (idx == 'CYTOPLASM' or (idx != 'NUCLEI' and _marker(idx) in cyto_markers))
-    ]
-    if nuc_c is None and not body_channels and not membrane_channels:
-        print("No NUCLEI channel, CYTOPLASM channel, intracellular or membrane "
-              "marker: the masks of run_threshold() are kept.")
-        return im_final_stack
+def build_cytoplasm_mask(threshold_img, intra_channels, membrane_channels, max_cell_area):
+    """Union of the thresholded intracellular stains and the filled membrane
+    stains.
 
-    src = im_final_stack[source_image]
-    thr = im_final_stack['Threshold image']
-    r_xy = float(np.mean([r_zX, r_zY]))
-    nuclei_px = nuclei_diameter / r_xy
-    cell_px = cell_diameter / r_xy
-    tile_shape = (max(8, cell_px), 2 * cell_px, 2 * cell_px)
-    nuclei_area = np.pi * (nuclei_px / 2) ** 2
-    panels = []
-
-    def _report(name, noise_sd, low):
-        where = 'local background' if correct_uneven_background else 'background'
-        print(f"  [{name}] background noise SD = {noise_sd:.2f} grey levels "
-              f"-> positive from {low * noise_sd:.1f} grey levels above the {where} "
-              f"({low:g} SD)")
-
-    nuclei_mask = None
-    if nuc_c is not None:
-        marker = stain_complete_df.loc['NUCLEI', 'Marker']
-        snr, _, noise_sd = _snr_map(
-            src[:, :, :, nuc_c], smooth_px=max(0.5, nuclei_px / 20),
-            tile_shape=tile_shape, correct_background=correct_uneven_background,
-        )
-        _report(marker, noise_sd, nuclei_min_snr)
-        high = nuclei_min_snr * seed_factor
-        nuclei_mask = _hysteresis_mask(snr, nuclei_min_snr, high)
-        nuclei_mask = _fill_small_holes_per_slice(nuclei_mask, 0.5 * nuclei_area)
-        nuclei_mask = ndi.binary_opening(nuclei_mask, structure=ball(1))
-        nuclei_mask = remove_small_islands(nuclei_mask, np.ceil(0.4 * nuclei_area))
-        panels.append(_mask_panel(f'Nuclei ({marker})', snr, nuclei_mask, nuclei_min_snr, high))
-        thr[:, :, :, nuc_c] = nuclei_mask.astype(thr.dtype)
-        im_final_stack['Nuclei mask'] = nuclei_mask
-        n_obj = ndi.label(nuclei_mask)[1]
-        print(f"  Nuclei mask: {100 * nuclei_mask.mean():.1f}% of the volume, "
-              f"{n_obj} connected region(s)")
-        del snr
-
-    def _stain_mask(channels, desc, edge_fraction=0.0):
-        """Union of the per-channel masks (signal > cell_min_snr x real pixel
-        noise, and > edge_fraction x the local cell brightness), plus the
-        per-voxel strongest channel for the plot."""
-        mask = np.zeros(src.shape[:3], dtype=bool)
-        combined, names = None, []
-        for c in _progress_iter(channels, progress, desc=desc):
-            marker = _marker(index[c])
-            names.append(str(marker))
-            # Light smoothing only (against speckle); the noise is measured
-            # before smoothing so the threshold doesn't sink into the halo.
-            snr, _, noise_sd = _snr_map(
-                src[:, :, :, c], smooth_px=1.0,
-                tile_shape=tile_shape, correct_background=correct_uneven_background,
-                noise_from_unsmoothed=True,
-            )
-            _report(marker, noise_sd, cell_min_snr)
-            if edge_fraction > 0:
-                # A fixed SD threshold sits further out in the optical blur
-                # the brighter the cell, so bright cells come out too large.
-                # Also require a fraction of the local cell brightness (the
-                # smoothed signal's max within about one nucleus diameter),
-                # which puts the edge on the stain's own fall-off.
-                local = ndi.gaussian_filter(snr, max(1.0, nuclei_px / 6), output=np.float32)
-                local = ndi.maximum_filter(local, size=max(3, int(round(nuclei_px))))
-                local *= edge_fraction
-                np.maximum(local, cell_min_snr, out=local)
-                cut = snr > local
-                del local
-                print(f"    edge at {edge_fraction:g} x local brightness: "
-                      f"{100 * cut.mean():.1f}% of the volume kept "
-                      f"(vs {100 * (snr > cell_min_snr).mean():.1f}% with the SD threshold alone)")
-                mask |= cut
-                del cut
-            else:
-                mask |= snr > cell_min_snr
-            combined = snr if combined is None else np.maximum(combined, snr, out=combined)
-            del snr
-        # Isolated noise specks only - nothing is added to the mask.
-        mask = remove_small_islands(mask, np.ceil(0.1 * nuclei_area))
-        return mask, combined, names
-
-    if body_channels or membrane_channels:
-        # Cell body = nuclei U intracellular stain. Each stain is a plain
-        # threshold: no hysteresis, closing or other growth beyond the
-        # stained voxels. Membrane stains are not part of it (filling their
-        # rings gives a cell *shape* that overestimates the cells); they
-        # stay the cell borders of the cytoplasm split (Cell 18). Only with
-        # no intracellular stain at all are the membrane rings filled.
-        body_mask = np.zeros(src.shape[:3], dtype=bool)
-        all_names = []
-
-        if body_channels:
-            intra_mask, body_snr, names = _stain_mask(
-                body_channels, 'Step 15B - Intracellular Channels', cell_edge_fraction,
-            )
-            all_names += names
-            panels.append(_mask_panel(
-                f"Intracellular ({' + '.join(names)})", body_snr, intra_mask, cell_min_snr, None
-            ))
-            print(f"  Intracellular stain: {100 * intra_mask.mean():.1f}% of the volume")
-            body_mask |= intra_mask
-            del body_snr, intra_mask
-
-        if membrane_channels and body_channels:
-            print("  Membrane stain ("
-                  + ", ".join(str(_marker(index[c])) for c in membrane_channels)
-                  + ") not added to the cell body: it only marks the cell "
-                  "borders when the cytoplasm is split (Cell 18)")
-        elif membrane_channels:
-            memb_mask, memb_snr, names = _stain_mask(membrane_channels, 'Step 15C - Membrane Channels')
-            all_names += [f'{n} (membrane)' for n in names]
-            memb_filled = _fill_membrane_rings(
-                memb_mask, max_cell_area=1.5 * np.pi * (cell_px / 2) ** 2,
-            )
-            panels.append(_mask_panel(
-                f"Membrane ({' + '.join(names)}), rings filled",
-                memb_snr, memb_filled, cell_min_snr, None,
-            ))
-            print(f"  Membrane stain: {100 * memb_mask.mean():.1f}% of the volume, "
-                  f"{100 * memb_filled.mean():.1f}% with the enclosed cytoplasm")
-            body_mask |= memb_filled
-            del memb_snr, memb_mask, memb_filled
-
-        if nuclei_mask is not None:
-            body_mask |= nuclei_mask
-        # Only cavities fully enclosed by stained voxels are filled (e.g. dark
-        # vesicles); the outer boundary is the stained boundary.
-        body_mask = ndi.binary_fill_holes(body_mask)
-        if 'CYTOPLASM' in index:
-            thr[:, :, :, index.index('CYTOPLASM')] = body_mask.astype(thr.dtype)
-        im_final_stack['Cell body mask'] = body_mask
-        n_obj = ndi.label(body_mask)[1]
-        print(f"  Cell body mask ({' + '.join(all_names)}): "
-              f"{100 * body_mask.mean():.1f}% of the volume, {n_obj} connected region(s)")
-
-    _plot_cell_body_masks(panels)
-    gc.collect()
-    return im_final_stack
+    *threshold_img* is the 'Threshold image' (Z, Y, X, C) of Cell 15. Nothing
+    else is added: no nuclei, no hole filling of the union, no growth.
+    Membrane rings are filled up to *max_cell_area* voxels per XY slice
+    (see `_fill_membrane_rings`).
+    """
+    mask = np.zeros(threshold_img.shape[:3], dtype=bool)
+    for c in intra_channels:
+        mask |= threshold_img[:, :, :, c] > 0
+    if membrane_channels:
+        memb = np.zeros(threshold_img.shape[:3], dtype=bool)
+        for c in membrane_channels:
+            memb |= threshold_img[:, :, :, c] > 0
+        mask |= _fill_membrane_rings(memb, max_cell_area)
+    return mask
 
 
 def segment_nuclei_cellpose(image_3d, nuclei_diameter, voxel_size, model_type='nuclei'):
@@ -8182,80 +7805,78 @@ def segment_cytoplasm(
     intensity_weight=1.0,
     gradient_weight=1.0,
     membrane_markers=None,
+    drop_bare_cells=True,
     progress=None,
 ):
     """
-    Segment cytoplasm from the thresholded image.
+    Segment the cytoplasm, one cell per nucleus.
 
-    If a CYTOPLASM channel is present it is segmented with watershed, or with
-    Cellpose 3D (if ``trig_cellpose_cyto`` is True) to shape cells directly from
-    the CYTOPLASM channel intensity, then relabelled to match nuclei IDs.
-    Otherwise cytoplasm is grown from nuclei labels: with ``cyto_markers``, each
-    marker-positive voxel is assigned to its nearest nucleus by watershed (same
-    proximity logic as the CYTOPLASM-channel case, just seeded from the union of
-    the listed marker channels' thresholds instead of a dedicated channel); with
-    no markers at all, it falls back to a simple label-grow.
+    The cytoplasm is the union of the stains and nothing more
+    (`build_cytoplasm_mask`):
 
-    When cyto_markers are used, each cell's marker-derived cytoplasm volume is
-    compared against 20% of the expected (spherical) cell volume computed from
-    ``cell_diameter``. Cells falling short are replaced with a growth-factor
-    expansion (``cyto_factor``) instead, the same way as fully unsignalled
-    cells.
+    - the intracellular stains: the CYTOPLASM channel (if any) and the
+      ``cyto_markers`` not ticked as membrane, as thresholded in Cell 15
+      ('Threshold image');
+    - the membrane stains (``membrane_markers``), thresholded the same way,
+      with their rings closed and filled (`_fill_membrane_rings`).
 
-    By default, both watershed paths (CYTOPLASM channel and cyto_markers) split
-    touching cells using ``split_by_intensity_gradient=True``: instead of
-    flooding purely by geometric distance-from-background, the watershed
-    elevation also rises where the marker signal itself is dim or drops off
-    steeply (see ``_gradient_watershed_elevation``). This lets two cells whose
-    cytoplasm signal merges into one connected "island" still be split apart
-    at the point where the marker fades between them, rather than only at the
-    geometric midpoint between their nuclei.
+    These voxels (plus the nuclei) are assigned to the nuclei by watershed;
+    nothing is grown beyond them. A cell with no stained cytoplasm (its
+    cytoplasm is only its nucleus) is excluded (``drop_bare_cells``): the
+    cells with cytoplasm are relabelled 1..K in 'Nuclei' and 'Cytoplasm',
+    the excluded nuclei stay in 'Nuclei' as K+1..N with no cytoplasm, and
+    the marker statistics only cover cells 1..K. With ``split_by_intensity_gradient=True`` (default)
+    touching cells are split where the intracellular signal dips or drops
+    steeply and where a membrane is bright, not just at the geometric
+    midpoint between their nuclei (see ``_gradient_watershed_elevation``).
+
+    With ``trig_cellpose_cyto`` (needs a CYTOPLASM channel) the cells are
+    instead shaped by Cellpose 3D from the CYTOPLASM channel. With no
+    CYTOPLASM channel and no ticked marker there is no stain to follow, and
+    the cells are grown from the nuclei (``cyto_factor``).
 
     Parameters
     ----------
     im_final_stack : dict
         Must contain 'Threshold image' and (when
-        ``split_by_intensity_gradient`` is True) 'Filtered image'. If it
-        also holds a 'Cell body mask' (`run_cell_body_threshold`), that mask
-        replaces the union of the cyto_markers thresholds.
+        ``split_by_intensity_gradient`` or ``trig_cellpose_cyto`` is True)
+        'Filtered image'.
     im_segmentation_stack : dict
         Must contain 'Nuclei'.
     stain_df, stain_complete_df : DataFrame
         Staining metadata.
     cyto_markers : list of str
-        Marker labels that contribute to cytoplasm expansion.
+        Markers ticked as intracellular or membrane.
     cyto_factor : float
-        Growth factor for label expansion when no explicit CYTOPLASM channel.
+        Growth factor, only used when there is no stain at all to follow
+        (and for the Cellpose gap-fill).
     nuclei_diameter : float
         Approximate nucleus diameter in micrometers.
     r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
         Isotropic voxel sizes.
     cell_diameter : float, optional
-        Approximate whole-cell diameter in micrometers. Required when
-        ``trig_cellpose_cyto`` is True.
+        Approximate whole-cell diameter in micrometers: sets the largest
+        area a membrane ring is filled over (default ``cyto_factor`` x
+        ``nuclei_diameter``). Required when ``trig_cellpose_cyto`` is True.
     trig_cellpose_cyto : bool
-        If True and a CYTOPLASM channel is present, shape cells with Cellpose 3D
-        instead of the nuclei-seeded watershed. Lets nuclei come from one method
-        (e.g. StarDist) while cell shape comes from Cellpose.
+        If True and a CYTOPLASM channel is present, shape cells with Cellpose
+        3D instead.
     split_by_intensity_gradient : bool
-        If True (default), the CYTOPLASM-channel and cyto_markers watershed
-        paths split touching cells using marker intensity/gradient, not just
-        geometric distance (see above). Set False to restore the original
-        pure-distance watershed.
+        If True (default), split touching cells using marker
+        intensity/gradient, not just geometric distance (see above).
     gradient_smooth_sigma : float
-        Smoothing applied before measuring intensity/gradient for the split
-        (only used when ``split_by_intensity_gradient`` is True). Increase if
-        the split follows noise instead of the marker's real trend.
+        Smoothing applied before measuring intensity/gradient for the split.
     distance_weight, intensity_weight, gradient_weight : float
         Relative weights of the three elevation terms (geometric distance,
-        absolute dimness, and steepness of intensity drop). Only used when
-        ``split_by_intensity_gradient`` is True. Raise ``gradient_weight``
-        relative to the others to make the split more sensitive to fast
-        intensity drops between bright, closely touching cells.
+        absolute dimness, and steepness of intensity drop).
     membrane_markers : list of str, optional
-        Markers ticked as membrane. In the gradient-aware watershed their
-        bright signal marks the border between cells (a ridge), instead of
-        cell interior like the intracellular markers.
+        Markers ticked as membrane: filled into the cytoplasm, and their
+        bright signal marks the border between cells (a ridge) in the
+        gradient-aware watershed.
+    drop_bare_cells : bool
+        If True (default), exclude cells with no stained cytoplasm beyond the
+        nucleus from the marker analysis (nuclei kept, numbered last). If
+        False, keep them as nucleus-only cells.
     progress : callable, optional
         Progress wrapper.
 
@@ -8266,8 +7887,6 @@ def segment_cytoplasm(
     stain_complete_df : DataFrame
         Updated dataframe (CYTOPLASM row added if it was absent).
     """
-    from skimage.measure import label as skimage_label
-
     r_zX, r_zY, r_zZ = r_zxyz
 
     if 'Nuclei' not in im_segmentation_stack:
@@ -8279,191 +7898,128 @@ def segment_cytoplasm(
             or len(cyto_markers) > 0 or cyto_factor > 1):
         return im_segmentation_stack, stain_complete_df
 
-    im_in = im_final_stack['Threshold image'].copy()
-    im_out = np.zeros_like(im_in[:, :, :, 0], dtype=np.int32)
-
+    im_in = im_final_stack['Threshold image']
+    nuclei_labels = im_segmentation_stack['Nuclei']
+    n_channels = im_in.shape[3]
+    channel_index = list(stain_complete_df.index[:n_channels])
     has_cyto_channel = 'CYTOPLASM' in stain_df.index
-    # With the cell body mask of run_cell_body_threshold (Cell 15) the
-    # cytoplasm is that stained union only: no label-grow fallbacks.
-    stain_only = 'Cell body mask' in im_final_stack and not trig_cellpose_cyto
-    membrane_markers = list(membrane_markers or [])
-    membrane_imgs = []
-    if split_by_intensity_gradient and membrane_markers:
-        membrane_imgs = [
-            im_final_stack['Filtered image'][:, :, :, c]
-            for c, idx in enumerate(stain_complete_df.index[:im_in.shape[3]])
-            if idx not in ('NUCLEI', 'CYTOPLASM')
-            and stain_complete_df.loc[idx, 'Marker'] in membrane_markers
-        ]
+    intra_channels, membrane_channels = _cytoplasm_stain_channels(
+        stain_complete_df, n_channels, cyto_markers, membrane_markers,
+    )
+    use_cellpose = has_cyto_channel and trig_cellpose_cyto
+    from_stains = not use_cellpose and bool(intra_channels or membrane_channels)
 
-    if has_cyto_channel:
-        for c in _progress_iter(range(im_in.shape[3]), progress, desc='Step 18A - Segment Cytoplasm'):
-            if stain_df.index[c] == 'CYTOPLASM':
-                if trig_cellpose_cyto:
-                    if cell_diameter is None:
-                        raise ValueError(
-                            "cell_diameter is required when trig_cellpose_cyto=True."
-                        )
-                    im_filt = im_final_stack['Filtered image'].copy()
-                    im_out = segment_cytoplasm_cellpose(
-                        im_filt[:, :, :, c],
-                        cell_diameter=cell_diameter,
-                        voxel_size=(r_zZ, r_zY, r_zX),
-                        nuclei_labels=im_segmentation_stack['Nuclei'],
-                    )
-                    print("Cytoplasm shaped from CYTOPLASM channel via Cellpose 3D")
-                else:
-                    cyto_binary = im_in[:, :, :, c] > 0
-                    nuc_mask = im_segmentation_stack['Nuclei'] > 0
-                    combined_mask = cyto_binary | nuc_mask
-                    if split_by_intensity_gradient:
-                        elevation = _gradient_watershed_elevation(
-                            im_final_stack['Filtered image'][:, :, :, c],
-                            combined_mask,
-                            spacing=(r_zZ, r_zY, r_zX),
-                            smooth_sigma=gradient_smooth_sigma,
-                            w_distance=distance_weight,
-                            w_intensity=intensity_weight,
-                            w_gradient=gradient_weight,
-                            ridge_imgs=membrane_imgs,
-                        )
-                        im_out = watershed(
-                            elevation, im_segmentation_stack['Nuclei'],
-                            mask=combined_mask,
-                        )
-                        print("Cytoplasm segmented from CYTOPLASM channel + nuclei region (gradient-aware watershed)")
-                    else:
-                        distance = ndi.distance_transform_edt(
-                            combined_mask, sampling=[r_zZ, r_zY, r_zX]
-                        )
-                        im_out = watershed(
-                            -distance, im_segmentation_stack['Nuclei'],
-                            mask=combined_mask,
-                        )
-                        print(f"Cytoplasm segmented from CYTOPLASM channel + nuclei region (watershed)")
-                break
-    else:
-        if len(cyto_markers) == 0:
-            im_out = grow_labels(im_segmentation_stack['Nuclei'], cyto_factor)
-            print(f"Cytoplasm grown from nuclei labels (factor={cyto_factor})")
-        else:
-            marker_mask = np.zeros(im_in.shape[:3], dtype=bool)
-            marker_channel_imgs = []
-            for c in _progress_iter(range(im_in.shape[3]), progress, desc='Step 18B - Apply Cyto Markers'):
-                idx = stain_complete_df.index[c]
-                marker = stain_complete_df.loc[idx, 'Marker']
-                if marker in cyto_markers:
-                    marker_mask |= (im_in[:, :, :, c] > 0)
-                    # Membrane channels go in as ridges (membrane_imgs).
-                    if split_by_intensity_gradient and marker not in membrane_markers:
-                        marker_channel_imgs.append(im_final_stack['Filtered image'][:, :, :, c])
-            if 'Cell body mask' in im_final_stack:
-                # Built by run_cell_body_threshold (Cell 15) from the same
-                # markers, keeping their dim signal; the per-marker masks
-                # above stay in use for marker positivity only.
-                marker_mask = im_final_stack['Cell body mask'].copy()
-                print("Cell body taken from the cell body mask of Cell 15")
+    if use_cellpose:
+        if cell_diameter is None:
+            raise ValueError("cell_diameter is required when trig_cellpose_cyto=True.")
+        c = channel_index.index('CYTOPLASM')
+        im_out = segment_cytoplasm_cellpose(
+            im_final_stack['Filtered image'][:, :, :, c],
+            cell_diameter=cell_diameter,
+            voxel_size=(r_zZ, r_zY, r_zX),
+            nuclei_labels=nuclei_labels,
+        )
+        print("Cytoplasm shaped from CYTOPLASM channel via Cellpose 3D")
 
-            nuc_mask = im_segmentation_stack['Nuclei'] > 0
-            combined_mask = marker_mask | nuc_mask
-            if split_by_intensity_gradient:
-                elevation = _gradient_watershed_elevation(
-                    marker_channel_imgs,
-                    combined_mask,
-                    spacing=(r_zZ, r_zY, r_zX),
-                    smooth_sigma=gradient_smooth_sigma,
-                    w_distance=distance_weight,
-                    w_intensity=intensity_weight,
-                    w_gradient=gradient_weight,
-                    ridge_imgs=membrane_imgs,
-                )
-                im_out = watershed(
-                    elevation, im_segmentation_stack['Nuclei'],
-                    mask=combined_mask,
-                )
-            else:
-                distance = ndi.distance_transform_edt(
-                    combined_mask, sampling=[r_zZ, r_zY, r_zX]
-                )
-                im_out = watershed(
-                    -distance, im_segmentation_stack['Nuclei'],
-                    mask=combined_mask,
-                )
-            print(
-                f"Cytoplasm expanded using markers: {cyto_markers} "
-                f"({'gradient-aware' if split_by_intensity_gradient else 'nearest-nucleus'} "
-                "watershed, same as CYTOPLASM-channel path)"
+    elif from_stains:
+        diameter = cell_diameter if cell_diameter is not None else cyto_factor * nuclei_diameter
+        cell_px = diameter / float(np.mean([r_zX, r_zY]))
+        cyto_mask = build_cytoplasm_mask(
+            im_in, intra_channels, membrane_channels,
+            max_cell_area=1.5 * np.pi * (cell_px / 2) ** 2,
+        )
+        combined_mask = cyto_mask | (nuclei_labels > 0)
+        if split_by_intensity_gradient:
+            filt = im_final_stack['Filtered image']
+            elevation = _gradient_watershed_elevation(
+                [filt[:, :, :, c] for c in intra_channels],
+                combined_mask,
+                spacing=(r_zZ, r_zY, r_zX),
+                smooth_sigma=gradient_smooth_sigma,
+                w_distance=distance_weight,
+                w_intensity=intensity_weight,
+                w_gradient=gradient_weight,
+                ridge_imgs=[filt[:, :, :, c] for c in membrane_channels],
             )
+        else:
+            elevation = -ndi.distance_transform_edt(
+                combined_mask, sampling=[r_zZ, r_zY, r_zX]
+            )
+        im_out = watershed(elevation, nuclei_labels, mask=combined_mask)
 
-            if cell_diameter is not None and not stain_only:
-                nuclei_labels = im_segmentation_stack['Nuclei']
-                voxel_volume = r_zX * r_zY * r_zZ
-                expected_cell_volume = (4.0 / 3.0) * np.pi * (cell_diameter / 2.0) ** 3
-                min_cyto_volume = 0.2 * expected_cell_volume
-                max_label = int(nuclei_labels.max())
-                undersized = 0
-                for label_id in _progress_iter(
-                    range(1, max_label + 1), progress,
-                    desc='Step 18B - Check Cell Volumes', leave=False,
-                ):
-                    nuc_mask = nuclei_labels == label_id
-                    if not np.any(nuc_mask):
-                        continue
-                    cyto_mask = im_out == label_id
-                    cyto_volume = np.count_nonzero(cyto_mask) * voxel_volume
-                    if cyto_volume >= min_cyto_volume:
-                        continue
-                    im_out[cyto_mask] = 0
-                    single = np.zeros_like(nuclei_labels, dtype=np.int32)
-                    single[nuc_mask] = label_id
-                    grown = grow_labels(single, cyto_factor)
-                    im_out[(grown == label_id) & (im_out == 0)] = label_id
-                    undersized += 1
-                if undersized > 0:
-                    print(
-                        f"Cytoplasm replaced with growth factor (factor={cyto_factor}) for "
-                        f"{undersized} cells (marker-derived volume < 20% of expected cell size)"
-                    )
+        def _names(channels):
+            return ', '.join(str(stain_complete_df.loc[channel_index[c], 'Marker']) for c in channels)
+
+        parts = []
+        if intra_channels:
+            parts.append(f"intracellular: {_names(intra_channels)}")
+        if membrane_channels:
+            parts.append(f"membrane, rings filled: {_names(membrane_channels)}")
+        print(f"Cytoplasm = union of the thresholded stains ({'; '.join(parts)}) - "
+              f"{100 * cyto_mask.mean():.1f}% of the volume - assigned to the nuclei "
+              f"({'gradient-aware' if split_by_intensity_gradient else 'nearest-nucleus'} "
+              "watershed), no growth")
+        del cyto_mask, combined_mask, elevation
+
+    else:
+        im_out = grow_labels(nuclei_labels, cyto_factor)
+        print("No CYTOPLASM channel or intracellular/membrane marker: cytoplasm "
+              f"grown from nuclei labels (factor={cyto_factor})")
+
+    if not has_cyto_channel:
         stain_complete_df = stain_complete_df.copy()
         stain_complete_df.loc['CYTOPLASM'] = ['', '', '', 0, 255, 1.0]
 
-    nuclei_labels = im_segmentation_stack['Nuclei']
-    max_label = int(nuclei_labels.max())
-    if stain_only:
-        # The cytoplasm is the stained cell body only: cells without stained
-        # cytoplasm keep just their nucleus instead of being grown.
-        bare = sum(
-            1 for label_id in range(1, max_label + 1)
-            if np.any(nuclei_labels == label_id)
-            and not np.any((im_out == label_id) & (nuclei_labels != label_id))
-        )
-        if bare:
+    n_nuclei = np.count_nonzero(np.unique(nuclei_labels))
+    if from_stains:
+        # A cell whose cytoplasm is only its nucleus has no stained cytoplasm.
+        with_cyto = np.unique(im_out[(im_out > 0) & (nuclei_labels == 0)])
+        bare = n_nuclei - with_cyto.size
+        if bare and drop_bare_cells:
+            # Cells with cytoplasm become 1..K, in both Nuclei and Cytoplasm.
+            # The bare nuclei are kept in Nuclei as K+1..N but get no
+            # cytoplasm, so they are left out of PCM and the marker statistics
+            # (which only run over cells 1..K, see `_n_cells`).
+            present = np.unique(nuclei_labels)
+            bare_ids = np.setdiff1d(present[present > 0], with_cyto)
+            n_cells = with_cyto.size
+            lut = np.zeros(int(nuclei_labels.max()) + 1, dtype=np.int32)
+            lut[with_cyto] = np.arange(1, n_cells + 1, dtype=np.int32)
+            lut[bare_ids] = np.arange(n_cells + 1, n_cells + bare_ids.size + 1, dtype=np.int32)
+            nuclei_labels = lut[nuclei_labels]
+            lut[bare_ids] = 0
+            im_out = lut[im_out]
+            print(f"{bare} cell(s) have no stained cytoplasm beyond the nucleus: "
+                  f"excluded from the marker analysis. Cells with cytoplasm are "
+                  f"labels 1-{n_cells}, excluded nuclei {n_cells + 1}-{n_cells + bare}")
+        elif bare:
             print(f"{bare} cell(s) have no stained cytoplasm beyond the nucleus "
                   f"(left as nucleus only, no growth)")
-        max_label = 0  # skip the label-grow gap-fill below
-    filled = 0
-    for label_id in _progress_iter(
-        range(1, max_label + 1), progress, desc='Step 18C - Gap-fill Cytoplasm', leave=False
-    ):
-        nuc_mask = nuclei_labels == label_id
-        if not np.any(nuc_mask):
-            continue
-        cyto_mask = im_out == label_id
-        cyto_beyond_nuc = cyto_mask & ~nuc_mask
-        if np.any(cyto_beyond_nuc):
-            continue
-        im_out[cyto_mask] = 0
-        single = np.zeros_like(nuclei_labels, dtype=np.int32)
-        single[nuc_mask] = label_id
-        grown = grow_labels(single, cyto_factor)
-        fill_mask = (grown == label_id) & (im_out == 0)
-        im_out[fill_mask] = label_id
-        filled += 1
-    if filled > 0:
-        print(f"Cytoplasm gap-filled for {filled} nuclei by label-grow (factor={cyto_factor})")
+    elif use_cellpose:
+        # Cellpose can miss a nucleus: give it a grown cytoplasm instead.
+        filled = 0
+        for label_id in _progress_iter(
+            range(1, int(nuclei_labels.max()) + 1), progress,
+            desc='Step 18C - Gap-fill Cytoplasm', leave=False,
+        ):
+            nuc_mask = nuclei_labels == label_id
+            if not np.any(nuc_mask):
+                continue
+            cyto_mask = im_out == label_id
+            if np.any(cyto_mask & ~nuc_mask):
+                continue
+            im_out[cyto_mask] = 0
+            single = np.zeros_like(nuclei_labels, dtype=np.int32)
+            single[nuc_mask] = label_id
+            grown = grow_labels(single, cyto_factor)
+            im_out[(grown == label_id) & (im_out == 0)] = label_id
+            filled += 1
+        if filled > 0:
+            print(f"Cytoplasm gap-filled for {filled} nuclei by label-grow (factor={cyto_factor})")
 
     im_segmentation_stack = dict(im_segmentation_stack)
-    im_segmentation_stack['Cytoplasm'] = im_out.copy()
+    im_segmentation_stack['Nuclei'] = nuclei_labels
+    im_segmentation_stack['Cytoplasm'] = np.asarray(im_out, dtype=np.int32).copy()
     return im_segmentation_stack, stain_complete_df
 
 
@@ -8656,20 +8212,9 @@ def view_processing_results(
             islands.astype(np.int32),
             name=f'Thresh islands {idx} ({marker})', blending='additive', scale=scale_zoom,
         )
-    # With a CYTOPLASM channel the cell body mask (Cell 15) is already shown
-    # as that channel's islands; without one it has no channel of its own.
-    if 'Cell body mask' in im_final_stack and 'CYTOPLASM' not in stain_df.index:
-        islands, _ = ndi.label(im_final_stack['Cell body mask'])
-        viewer_0.add_labels(
-            islands.astype(np.int32),
-            name='Thresh islands CELL BODY (intracellular/membrane markers)',
-            blending='additive', scale=scale_zoom,
-        )
-    # 'Threshold image' and the masks are also not read by any later cell;
-    # free them (and the local `im_thr` reference used above) the same way.
+    # 'Threshold image' is also not read by any later cell; free it (and the
+    # local `im_thr` reference used above) the same way.
     del im_final_stack['Threshold image']
-    im_final_stack.pop('Nuclei mask', None)
-    im_final_stack.pop('Cell body mask', None)
     del im_thr
     gc.collect()
     viewer_0.scale_bar.visible = True
@@ -9371,9 +8916,10 @@ class StainDictEditor:
     name (text), channel (drop-down of the file's channels, or 'no' if the
     condition isn't used), display color (drop-down), an 'intracellular?'
     tick that adds the marker to ``cyto_markers``, and a 'membrane?' tick for
-    membrane stains: they are in ``cyto_markers`` too, but mark the border
-    between touching cells rather than the cell body (see
-    :attr:`membrane_markers`). The two ticks exclude each
+    membrane stains: they are in ``cyto_markers`` too, their rings are
+    filled to get the cytoplasm and the bright membrane marks the border
+    between touching cells (see :attr:`membrane_markers`). The two ticks
+    exclude each
     other. Clicking 'Confirm' checks
     the table and saves it to ``<name_setup>_stain_dict.json``; a saved table
     is loaded (and counts as confirmed) the next time the notebook runs.
@@ -9567,7 +9113,7 @@ class StainDictEditor:
         if (by_name["CYTOPLASM"]["channel"] != _STAIN_NO_CHANNEL
                 and any(r["intracellular"] or r["membrane"] for r in used)):
             notes.append("A CYTOPLASM channel is set: from v1.6.2 the ticked markers "
-                         "are added to it to build the cell body (before v1.6.2 "
+                         "are added to it to build the cytoplasm (before v1.6.2 "
                          "only the CYTOPLASM channel is used).")
         unused = [c for c in self.channels if c not in used_channels]
         if unused:
@@ -9622,7 +9168,7 @@ class StainDictEditor:
 
     @property
     def cyto_markers(self):
-        """Marker names that define the cell body: ticked as intracellular or
+        """Marker names that make up the cytoplasm: ticked as intracellular or
         as membrane (upper case, as in stain_df)."""
         return [r["marker"].upper() for r in self._values()
                 if r["channel"] != _STAIN_NO_CHANNEL
@@ -9631,8 +9177,8 @@ class StainDictEditor:
     @property
     def membrane_markers(self):
         """Marker names ticked as membrane (a subset of ``cyto_markers``):
-        borders between touching cells; their rings are filled into a cell
-        body only when no intracellular stain is ticked."""
+        their rings are filled to get the cytoplasm, and the membrane marks
+        the border between touching cells."""
         return [r["marker"].upper() for r in self._values()
                 if r["channel"] != _STAIN_NO_CHANNEL and r["membrane"]]
 
@@ -9694,12 +9240,7 @@ def _process_single_image_batch(
     settings,
     napari_module,
     progress,
-    cell_body_threshold=False,
-    nuclei_min_snr=3.0,
-    cell_min_snr=2.0,
-    correct_uneven_background=True,
     membrane_markers=None,
-    cell_edge_fraction=0.25,
 ):
     """Run the notebook pipeline (Cells 4-34) on one file, without viewers,
     plots or PNG subfolders, writing every output file into *output_dir*
@@ -9760,28 +9301,6 @@ def _process_single_image_batch(
         threshold_method=threshold_method,
         progress=progress,
     )
-    if cell_body_threshold:
-        im_final_stack = run_cell_body_threshold(
-            im_final_stack,
-            stain_complete_df=stain_complete_df,
-            cyto_markers=cyto_markers,
-            nuclei_diameter=nuclei_diameter,
-            cell_diameter=cell_diameter,
-            r_zX=r_zX, r_zY=r_zY, r_zZ=r_zZ,
-            nuclei_min_snr=nuclei_min_snr,
-            cell_min_snr=cell_min_snr,
-            correct_uneven_background=correct_uneven_background,
-            membrane_markers=membrane_markers,
-            cell_edge_fraction=cell_edge_fraction,
-            progress=progress,
-        )
-    cell_body_params = (
-        dict(nuclei_min_snr=nuclei_min_snr, cell_min_snr=cell_min_snr,
-             correct_uneven_background=correct_uneven_background,
-             membrane_markers=list(membrane_markers or []),
-             cell_edge_fraction=cell_edge_fraction)
-        if cell_body_threshold else {}
-    )
 
     # Cell 16
     export_channel_histograms(
@@ -9800,7 +9319,7 @@ def _process_single_image_batch(
         aggregate_grow_factor=aggregate_grow_factor,
         progress=progress,
         output_dir=output_dir,
-        **cell_body_params,
+        membrane_markers=list(membrane_markers or []),
     )
 
     # Cells 17-21
@@ -9976,12 +9495,7 @@ def run_batch_folder(
     settings=None,
     napari_module=None,
     progress=None,
-    cell_body_threshold=False,
-    nuclei_min_snr=3.0,
-    cell_min_snr=2.0,
-    correct_uneven_background=True,
     membrane_markers=None,
-    cell_edge_fraction=0.25,
 ):
     """Process every supported image file in *input_folder* with the full
     pipeline and write each image's outputs into its own subfolder,
@@ -10000,11 +9514,8 @@ def run_batch_folder(
     CSV written for the first image is then reused for the following ones
     (as long as ``use_setup`` is True).
 
-    With ``cell_body_threshold=True`` the nuclei and cell body are also
-    thresholded with `run_cell_body_threshold` (``nuclei_min_snr``,
-    ``cell_min_snr``, ``cell_edge_fraction``, ``correct_uneven_background``),
-    as in Cell 15 of v1.6.2. ``membrane_markers`` (from the stain table) are
-    used as cell borders when splitting the cytoplasm.
+    ``membrane_markers`` (from the stain table) are filled as rings into the
+    cytoplasm and used as cell borders when splitting it (Cell 18).
 
     A file that raises an error is reported and skipped; the batch carries on
     with the next one.
@@ -10082,12 +9593,7 @@ def run_batch_folder(
                 settings=settings,
                 napari_module=napari_module,
                 progress=progress,
-                cell_body_threshold=cell_body_threshold,
-                nuclei_min_snr=nuclei_min_snr,
-                cell_min_snr=cell_min_snr,
-                correct_uneven_background=correct_uneven_background,
                 membrane_markers=membrane_markers,
-                cell_edge_fraction=cell_edge_fraction,
             )
             results.append({
                 "File": image_path.name,
