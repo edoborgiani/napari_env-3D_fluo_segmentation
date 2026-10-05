@@ -2148,13 +2148,14 @@ def prepare_stain_settings(
 
     if use_setup and setup_exists:
         stain_setup_df = _read_setup_csv()
-        for idx in _progress_iter(stain_complete_df.index, progress, desc="Step 07A - Load Setup Rows"):
-            if idx in stain_setup_df.index:
-                for col in value_cols:
-                    stain_complete_df.loc[idx, col] = stain_setup_df.loc[idx, col]
-            else:
-                use_setup = False
-                break
+        # One aligned lookup instead of per-row .loc on the (unsorted)
+        # MultiIndex, which pandas warns about for every row.
+        if stain_complete_df.index.isin(stain_setup_df.index).all():
+            saved = stain_setup_df.reindex(stain_complete_df.index)
+            for col in value_cols:
+                stain_complete_df[col] = saved[col].to_numpy()
+        else:
+            use_setup = False
 
     if not use_setup or not setup_exists:
         stain_complete_df = stain_initial_df.copy()
@@ -2283,6 +2284,7 @@ def export_channel_histograms(
     cell_min_snr=None,
     correct_uneven_background=None,
     membrane_markers=None,
+    cell_edge_fraction=None,
 ):
     """
     Export per-channel intensity histograms for every processing stage in
@@ -2351,6 +2353,8 @@ def export_channel_histograms(
         processing_params['Nuclei min SNR (background SDs)'] = str(nuclei_min_snr)
     if cell_min_snr is not None:
         processing_params['Cell body min SNR (background SDs)'] = str(cell_min_snr)
+    if cell_edge_fraction is not None:
+        processing_params['Cell body edge (x local brightness)'] = str(cell_edge_fraction)
     if correct_uneven_background is not None:
         processing_params['Correct uneven background'] = str(correct_uneven_background)
     if membrane_markers is not None:
@@ -6620,6 +6624,7 @@ def run_cell_body_threshold(
     correct_uneven_background=True,
     source_image='Denoised image',
     membrane_markers=None,
+    cell_edge_fraction=0.25,
     progress=None,
 ):
     """Threshold the nuclei and the cell body against a background-noise
@@ -6632,19 +6637,20 @@ def run_cell_body_threshold(
     - **Nuclei** (NUCLEI channel): voxels above ``nuclei_min_snr`` SDs,
       connected to a voxel above ``seed_factor`` x that (hysteresis), with
       small holes (nucleoli) filled and specks removed.
-    - **Cell body** = union of three stainings, with no growth beyond the
-      stained voxels:
-
-      1. the nuclei mask;
-      2. the intracellular stain (CYTOPLASM channel and/or ``cyto_markers``):
-         each channel lightly smoothed (1 voxel) and kept where it is above
-         ``cell_min_snr`` x the *unsmoothed* pixel noise, channels united;
-      3. the membrane stain (``membrane_markers``): thresholded the same way,
-         then its rings are closed and filled so the enclosed cytoplasm is
-         included (see `_fill_membrane_rings`).
-
+    - **Cell body** = nuclei mask U intracellular stain (CYTOPLASM channel
+      and/or ``cyto_markers``), with no growth beyond the stained voxels.
+      Each intracellular channel is lightly smoothed (1 voxel) and kept
+      where it is above ``cell_min_snr`` x the *unsmoothed* pixel noise
+      *and* above ``cell_edge_fraction`` x the local cell brightness (so the
+      optical blur halo of bright cells is not counted); channels united.
       Only isolated specks are removed and only cavities fully enclosed by
       the union are filled.
+
+      The membrane stain (``membrane_markers``) is not part of the cell
+      body: it marks the cell borders in the cytoplasm split (Cell 18).
+      Only when there is no intracellular stain at all are its rings
+      closed and filled to stand in for the cell body (see
+      `_fill_membrane_rings`).
 
     The results are stored as ``im_final_stack['Nuclei mask']`` and
     ``im_final_stack['Cell body mask']`` (the whole cell, nucleus included)
@@ -6677,6 +6683,11 @@ def run_cell_body_threshold(
     membrane_markers : list of str, optional
         Markers ticked as membrane in the stain table. Usually also in
         *cyto_markers*; either way they are treated as membrane.
+    cell_edge_fraction : float
+        Intracellular stain only: a voxel must also reach this fraction of
+        the local cell brightness (smoothed max within about one nucleus
+        diameter). Higher = tighter cells, especially bright ones; 0 = SD
+        threshold only (as before).
     progress : callable, optional
         Progress wrapper (e.g. tqdm).
 
@@ -6749,9 +6760,10 @@ def run_cell_body_threshold(
               f"{n_obj} connected region(s)")
         del snr
 
-    def _stain_mask(channels, desc):
+    def _stain_mask(channels, desc, edge_fraction=0.0):
         """Union of the per-channel masks (signal > cell_min_snr x real pixel
-        noise), plus the per-voxel strongest channel for the plot."""
+        noise, and > edge_fraction x the local cell brightness), plus the
+        per-voxel strongest channel for the plot."""
         mask = np.zeros(src.shape[:3], dtype=bool)
         combined, names = None, []
         for c in _progress_iter(channels, progress, desc=desc):
@@ -6765,7 +6777,25 @@ def run_cell_body_threshold(
                 noise_from_unsmoothed=True,
             )
             _report(marker, noise_sd, cell_min_snr)
-            mask |= snr > cell_min_snr
+            if edge_fraction > 0:
+                # A fixed SD threshold sits further out in the optical blur
+                # the brighter the cell, so bright cells come out too large.
+                # Also require a fraction of the local cell brightness (the
+                # smoothed signal's max within about one nucleus diameter),
+                # which puts the edge on the stain's own fall-off.
+                local = ndi.gaussian_filter(snr, max(1.0, nuclei_px / 6), output=np.float32)
+                local = ndi.maximum_filter(local, size=max(3, int(round(nuclei_px))))
+                local *= edge_fraction
+                np.maximum(local, cell_min_snr, out=local)
+                cut = snr > local
+                del local
+                print(f"    edge at {edge_fraction:g} x local brightness: "
+                      f"{100 * cut.mean():.1f}% of the volume kept "
+                      f"(vs {100 * (snr > cell_min_snr).mean():.1f}% with the SD threshold alone)")
+                mask |= cut
+                del cut
+            else:
+                mask |= snr > cell_min_snr
             combined = snr if combined is None else np.maximum(combined, snr, out=combined)
             del snr
         # Isolated noise specks only - nothing is added to the mask.
@@ -6773,14 +6803,19 @@ def run_cell_body_threshold(
         return mask, combined, names
 
     if body_channels or membrane_channels:
-        # Cell body = nuclei U intracellular stain U filled membrane rings.
-        # Each stain is a plain threshold: no hysteresis, closing or other
-        # growth beyond the stained voxels.
+        # Cell body = nuclei U intracellular stain. Each stain is a plain
+        # threshold: no hysteresis, closing or other growth beyond the
+        # stained voxels. Membrane stains are not part of it (filling their
+        # rings gives a cell *shape* that overestimates the cells); they
+        # stay the cell borders of the cytoplasm split (Cell 18). Only with
+        # no intracellular stain at all are the membrane rings filled.
         body_mask = np.zeros(src.shape[:3], dtype=bool)
         all_names = []
 
         if body_channels:
-            intra_mask, body_snr, names = _stain_mask(body_channels, 'Step 15B - Intracellular Channels')
+            intra_mask, body_snr, names = _stain_mask(
+                body_channels, 'Step 15B - Intracellular Channels', cell_edge_fraction,
+            )
             all_names += names
             panels.append(_mask_panel(
                 f"Intracellular ({' + '.join(names)})", body_snr, intra_mask, cell_min_snr, None
@@ -6789,7 +6824,12 @@ def run_cell_body_threshold(
             body_mask |= intra_mask
             del body_snr, intra_mask
 
-        if membrane_channels:
+        if membrane_channels and body_channels:
+            print("  Membrane stain ("
+                  + ", ".join(str(_marker(index[c])) for c in membrane_channels)
+                  + ") not added to the cell body: it only marks the cell "
+                  "borders when the cytoplasm is split (Cell 18)")
+        elif membrane_channels:
             memb_mask, memb_snr, names = _stain_mask(membrane_channels, 'Step 15C - Membrane Channels')
             all_names += [f'{n} (membrane)' for n in names]
             memb_filled = _fill_membrane_rings(
@@ -7588,6 +7628,99 @@ def merge_undersized_nuclei(
     return labels_out, merge_info
 
 
+def _label_overlap_map(labels_a, labels_b):
+    """For each label of *labels_a*, the sorted list of *labels_b* labels it
+    overlaps (voxel by voxel). Labels with no counterpart map to []."""
+    a = np.asarray(labels_a).ravel()
+    b = np.asarray(labels_b).ravel()
+    inside = (a > 0) & (b > 0)
+    base = int(b.max()) + 1
+    keys = np.unique(a[inside].astype(np.int64) * base + b[inside])
+    out = defaultdict(list)
+    for key in keys:
+        out[int(key // base)].append(int(key % base))
+    return out
+
+
+def _nuclei_refinement_recap(labels_first, labels_merged, labels_final,
+                             reference_vox, merge_info, split_info):
+    """One row per first-pass nucleus: what the merge and split steps did to
+    it (or tried and didn't), and its label number(s) after refinement.
+
+    The merge step works on first-pass labels, the split step on the labels
+    renumbered after merging, and both renumber at the end - this links the
+    three numberings through voxel overlap (merging and splitting only
+    regroup voxels, so the overlap is exact).
+    """
+    first_to_merged = _label_overlap_map(labels_first, labels_merged)
+    merged_to_final = _label_overlap_map(labels_merged, labels_final)
+    merged_members = defaultdict(list)  # post-merge label -> first-pass labels
+    for first_id, merged_ids in first_to_merged.items():
+        for m in merged_ids:
+            merged_members[m].append(first_id)
+
+    fragments = {}
+    absorbed = defaultdict(list)
+    if merge_info is not None and len(merge_info['fragments']):
+        for rec in merge_info['fragments'].to_dict('records'):
+            fragments[int(rec['Label'])] = rec
+            if rec['Result'] == 'merged':
+                absorbed[int(rec['Merged into'])].append(int(rec['Label']))
+
+    split_tried = {}
+    if split_info is not None and len(split_info['assemblies']):
+        # Only the labels present right after the merge step; ids created by
+        # a split are its own pieces and are followed through the overlap.
+        for rec in split_info['assemblies'].to_dict('records'):
+            lab = int(rec['Label'])
+            if lab in merged_members:
+                split_tried[lab] = max(split_tried.get(lab, 0), int(rec['Iteration']))
+
+    volumes = np.bincount(np.asarray(labels_first).ravel())
+    rows = []
+    for first_id in sorted(first_to_merged):
+        merged_ids = first_to_merged[first_id]
+        final_ids = sorted({f for m in merged_ids for f in merged_to_final.get(m, [])})
+        members = sorted({x for m in merged_ids for x in merged_members[m]})
+
+        # Merge step
+        if first_id in fragments:
+            rec = fragments[first_id]
+            merge_txt = (f"merged into {int(rec['Merged into'])}"
+                         if rec['Result'] == 'merged'
+                         else f"fragment, {rec['Result']}")
+        elif absorbed.get(first_id):
+            merge_txt = f"absorbed fragment(s) {', '.join(map(str, sorted(absorbed[first_id])))}"
+        else:
+            merge_txt = '-'
+
+        # Split step
+        tried = [split_tried[m] for m in merged_ids if m in split_tried]
+        if len(final_ids) > 1:
+            split_txt = f"split into {len(final_ids)}"
+        elif tried:
+            split_txt = f"oversized, not split ({max(tried)} level(s) tried)"
+        else:
+            split_txt = '-'
+
+        merged = len(members) > 1
+        split = len(final_ids) > 1
+        outcome = ('merged + split' if merged and split else
+                   'merged' if merged else
+                   'split' if split else 'kept')
+        rows.append({
+            'First-pass label': first_id,
+            'Volume (voxels)': int(volumes[first_id]),
+            'Size (x reference)': round(volumes[first_id] / reference_vox, 2),
+            'Merge step': merge_txt,
+            'Split step': split_txt,
+            'Outcome': outcome,
+            'Merged with': ', '.join(str(x) for x in members if x != first_id) or '-',
+            'Final label(s)': ', '.join(map(str, final_ids)) or '-',
+        })
+    return pd.DataFrame(rows)
+
+
 def refine_nuclei_by_size(
     labels,
     intensity_img,
@@ -7615,16 +7748,22 @@ def refine_nuclei_by_size(
        labels > ``oversize_factor`` x reference are re-split with escalating
        configurations.
 
+    Finally a recap table (`_nuclei_refinement_recap`) lists every
+    first-pass nucleus with what each step did to it (or tried and didn't)
+    and its final label number(s), since both steps renumber the labels.
+
     Returns
     -------
     labels_out : ndarray (Z, Y, X), int32
-    info : dict with keys 'reference', 'merge', 'split' (None if skipped).
+    info : dict with keys 'reference', 'merge', 'split' (None if skipped)
+        and 'recap' (DataFrame).
     """
     reference_vox, ref_info = estimate_reference_nucleus_size(
         labels, r_zxyz, nuclei_diameter,
         size_reference=size_reference, verbose=verbose,
     )
-    labels_out = np.asarray(labels).astype(np.int32, copy=False)
+    labels_first = np.asarray(labels).astype(np.int32, copy=False)
+    labels_out = labels_first
     merge_info = split_info = None
 
     if merge_undersized:
@@ -7633,6 +7772,7 @@ def refine_nuclei_by_size(
             undersize_factor=undersize_factor,
             progress=progress, verbose=verbose,
         )
+    labels_merged = labels_out
     if iterative_split:
         labels_out, split_info = refine_oversized_nuclei(
             labels_out,
@@ -7648,7 +7788,24 @@ def refine_nuclei_by_size(
             progress=progress,
             verbose=verbose,
         )
-    return labels_out, {'reference': ref_info, 'merge': merge_info, 'split': split_info}
+
+    recap_df = _nuclei_refinement_recap(
+        labels_first, labels_merged, labels_out,
+        reference_vox, merge_info, split_info,
+    )
+    if verbose and len(recap_df):
+        counts = recap_df['Outcome'].value_counts()
+        print(
+            "\nRefinement recap (first-pass label -> final label): "
+            + ", ".join(f"{counts.get(k, 0)} {k}" for k in
+                        ('kept', 'merged', 'split', 'merged + split'))
+            + f" -> {int(np.count_nonzero(np.unique(labels_out)))} final nuclei. "
+            "Labels are renumbered: use 'Final label(s)' for the later cells."
+        )
+        with pd.option_context('display.max_rows', None):
+            _display_if_notebook(recap_df)
+    return labels_out, {'reference': ref_info, 'merge': merge_info,
+                        'split': split_info, 'recap': recap_df}
 
 
 def segment_nuclei(
@@ -9214,9 +9371,9 @@ class StainDictEditor:
     name (text), channel (drop-down of the file's channels, or 'no' if the
     condition isn't used), display color (drop-down), an 'intracellular?'
     tick that adds the marker to ``cyto_markers``, and a 'membrane?' tick for
-    membrane stains: they also define the cell body (so they are in
-    ``cyto_markers`` too), but the rings they draw are filled to get the
-    cytoplasm (see :attr:`membrane_markers`). The two ticks exclude each
+    membrane stains: they are in ``cyto_markers`` too, but mark the border
+    between touching cells rather than the cell body (see
+    :attr:`membrane_markers`). The two ticks exclude each
     other. Clicking 'Confirm' checks
     the table and saves it to ``<name_setup>_stain_dict.json``; a saved table
     is loaded (and counts as confirmed) the next time the notebook runs.
@@ -9474,7 +9631,8 @@ class StainDictEditor:
     @property
     def membrane_markers(self):
         """Marker names ticked as membrane (a subset of ``cyto_markers``):
-        their rings are filled to get the cytoplasm."""
+        borders between touching cells; their rings are filled into a cell
+        body only when no intracellular stain is ticked."""
         return [r["marker"].upper() for r in self._values()
                 if r["channel"] != _STAIN_NO_CHANNEL and r["membrane"]]
 
@@ -9541,6 +9699,7 @@ def _process_single_image_batch(
     cell_min_snr=2.0,
     correct_uneven_background=True,
     membrane_markers=None,
+    cell_edge_fraction=0.25,
 ):
     """Run the notebook pipeline (Cells 4-34) on one file, without viewers,
     plots or PNG subfolders, writing every output file into *output_dir*
@@ -9613,12 +9772,14 @@ def _process_single_image_batch(
             cell_min_snr=cell_min_snr,
             correct_uneven_background=correct_uneven_background,
             membrane_markers=membrane_markers,
+            cell_edge_fraction=cell_edge_fraction,
             progress=progress,
         )
     cell_body_params = (
         dict(nuclei_min_snr=nuclei_min_snr, cell_min_snr=cell_min_snr,
              correct_uneven_background=correct_uneven_background,
-             membrane_markers=list(membrane_markers or []))
+             membrane_markers=list(membrane_markers or []),
+             cell_edge_fraction=cell_edge_fraction)
         if cell_body_threshold else {}
     )
 
@@ -9820,6 +9981,7 @@ def run_batch_folder(
     cell_min_snr=2.0,
     correct_uneven_background=True,
     membrane_markers=None,
+    cell_edge_fraction=0.25,
 ):
     """Process every supported image file in *input_folder* with the full
     pipeline and write each image's outputs into its own subfolder,
@@ -9840,9 +10002,9 @@ def run_batch_folder(
 
     With ``cell_body_threshold=True`` the nuclei and cell body are also
     thresholded with `run_cell_body_threshold` (``nuclei_min_snr``,
-    ``cell_min_snr``, ``correct_uneven_background``), as in Cell 15 of
-    v1.6.2. ``membrane_markers`` (from the stain table) are filled as rings
-    there and used as cell borders when splitting the cytoplasm.
+    ``cell_min_snr``, ``cell_edge_fraction``, ``correct_uneven_background``),
+    as in Cell 15 of v1.6.2. ``membrane_markers`` (from the stain table) are
+    used as cell borders when splitting the cytoplasm.
 
     A file that raises an error is reported and skipped; the batch carries on
     with the next one.
@@ -9925,6 +10087,7 @@ def run_batch_folder(
                 cell_min_snr=cell_min_snr,
                 correct_uneven_background=correct_uneven_background,
                 membrane_markers=membrane_markers,
+                cell_edge_fraction=cell_edge_fraction,
             )
             results.append({
                 "File": image_path.name,
