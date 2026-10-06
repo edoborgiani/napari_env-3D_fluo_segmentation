@@ -3150,8 +3150,15 @@ def plot_nucleus_kdes(hist_data, stain_complete_df, progress=None, max_subplots=
     return fig, axes, x_grid
 
 
-def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_final_stack, r_X, r_Y, r_Z, zoom_factors, progress=None):
-    """Plot X/Y/Z spatial distributions for each population."""
+def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_final_stack, r_X, r_Y, r_Z, zoom_factors,
+                               percell_mean_df=None, progress=None):
+    """Plot X/Y/Z spatial distributions for each population.
+
+    With ``percell_mean_df`` (see ``compute_percell_marker_intensity_df``),
+    every analysed cell is also drawn as a dot per marker channel: its
+    nucleus position on X and its mean intensity (all cells) on a secondary
+    y axis, so the intensity can be followed along each direction.
+    """
     im_in = im_final_stack['Filtered image']
     fig, axs = plt.subplots(3, 1, figsize=(15, 15))
 
@@ -3186,18 +3193,39 @@ def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_final_
             axs[1].plot(ybin_centers, ycount, label=str(condition), linestyle=linestyle, color=color)
             axs[2].plot(zbin_centers, zcount, label=str(condition), linestyle=linestyle, color=color)
 
-    axs[0].set_title("NUCLEI X DISTRIBUTION")
-    axs[0].set_xlabel("[μm]")
-    axs[0].legend(loc="upper right")
-    axs[0].set_facecolor("black")
-    axs[1].set_title("NUCLEI Y DISTRIBUTION")
-    axs[1].set_xlabel("[μm]")
-    axs[1].legend(loc="upper right")
-    axs[1].set_facecolor("black")
-    axs[2].set_title("NUCLEI Z DISTRIBUTION")
-    axs[2].set_xlabel("[μm]")
-    axs[2].legend(loc="upper right")
-    axs[2].set_facecolor("black")
+    # Per-cell intensity vs position, on a secondary y axis. percell_mean_df
+    # rows are cell labels 1..K, matching the first K nuclei positions.
+    twin_axs = [None, None, None]
+    if percell_mean_df is not None and len(percell_mean_df):
+        nuclei_rows = labels_df[labels_df["Condition"] == "NUCLEI"]
+        pos_row = nuclei_rows.iloc[0] if not nuclei_rows.empty else labels_df.iloc[0]
+        positions = np.asarray(list(pos_row["Mean nuclei positions [um]"]), dtype=float)
+        labels = np.asarray(percell_mean_df.index, dtype=int)
+        labels = labels[labels <= len(positions)]
+        cell_pos = positions[labels - 1]
+        twin_axs = [ax.twinx() for ax in axs]
+        for condition in percell_mean_df.columns:
+            if condition in ("NUCLEI", "CYTOPLASM", "PCM"):
+                continue
+            values = percell_mean_df.loc[labels, condition].to_numpy(dtype=float)
+            keep = ~np.isnan(values)
+            color = _condition_color(condition, stain_complete_df, stain_df=stain_df)
+            for k, tax in enumerate(twin_axs):
+                tax.scatter(cell_pos[keep, k], values[keep], s=10, alpha=0.5, color=color,
+                            edgecolors="none", label=f"{condition} intensity (cells)")
+        for tax in twin_axs:
+            tax.set_ylabel("Mean intensity, all cells [a.u.]")
+
+    for ax, tax, axis_name in zip(axs, twin_axs, "XYZ"):
+        ax.set_title(f"NUCLEI {axis_name} DISTRIBUTION")
+        ax.set_xlabel("[μm]")
+        ax.set_ylabel("Cell count")
+        ax.set_facecolor("black")
+        handles, names = ax.get_legend_handles_labels()
+        if tax is not None:
+            t_handles, t_names = tax.get_legend_handles_labels()
+            handles, names = handles + t_handles, names + t_names
+        (tax if tax is not None else ax).legend(handles, names, loc="upper right", fontsize="small")
     return fig, axs
 
 
