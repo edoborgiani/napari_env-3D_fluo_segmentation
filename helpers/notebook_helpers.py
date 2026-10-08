@@ -126,6 +126,20 @@ __all__ = [
     "StainDictEditor",
     "StainTableNotConfirmed",
     "run_batch_folder",
+    # LIVE/DEAD notebook (Fluo_3D_LD_seg v1.2.1)
+    "LDStainDictEditor",
+    "edit_ld_stain_dict",
+    "segment_ld_nuclei",
+    "segment_ld_cells",
+    "segment_ld_pcm",
+    "classify_live_dead",
+    "view_ld_results",
+    "print_ld_summary",
+    "plot_live_dead_classification",
+    "plot_ld_spatial_distributions",
+    "plot_ld_size_distributions",
+    "export_live_dead_to_excel",
+    "run_ld_batch_folder",
 ]
 
 
@@ -2297,6 +2311,7 @@ def export_channel_histograms(
     progress=None,
     output_dir=None,
     membrane_markers=None,
+    extra_params=None,
 ):
     """
     Export per-channel intensity histograms for every processing stage in
@@ -2326,6 +2341,9 @@ def export_channel_histograms(
         Progress wrapper (e.g. tqdm).
     output_dir : str or Path, optional
         Folder to write the workbook to (default: current working directory).
+    extra_params : dict, optional
+        More parameter/value pairs for the Parameters sheet (e.g. the
+        LIVE/DEAD settings).
 
     Returns
     -------
@@ -2362,6 +2380,8 @@ def export_channel_histograms(
     }
     if membrane_markers is not None:
         processing_params['Membrane markers'] = str(membrane_markers)
+    for key, value in (extra_params or {}).items():
+        processing_params[str(key)] = str(value)
 
     _stage_abbrev = {
         'Original image':   'Orig',
@@ -5711,11 +5731,16 @@ def run_threshold(im_final_stack, stain_complete_df,
                   threshold_method='otsu',
                   global_threshold_weight=0.15,
                   sauvola_weight=0.60,
-                  progress=None):
+                  progress=None,
+                  nuclear_conditions=None):
     """Apply combined thresholding and store the result in im_final_stack.
 
     Parameters
     ----------
+    nuclear_conditions : list of str, optional
+        Conditions thresholded like the NUCLEI channel (nucleus-sized local
+        window and smallest island). Used by the LIVE/DEAD notebook for the
+        markers set as nuclear; the NUCLEI channel always is.
     threshold_method : str
         Global thresholding algorithm used as one component of the
         combined threshold (the rest is Sauvola local + statistical background).
@@ -5740,6 +5765,7 @@ def run_threshold(im_final_stack, stain_complete_df,
         global_threshold_weight=global_threshold_weight,
         sauvola_weight=sauvola_weight,
         progress=progress,
+        nuclear_conditions=nuclear_conditions,
     )
     return im_final_stack
 
@@ -6332,6 +6358,7 @@ def apply_threshold_per_channel(
     global_threshold_weight=0.15,
     sauvola_weight=0.60,
     progress=None,
+    nuclear_conditions=None,
 ):
     """
     Threshold each channel using a combined global, Sauvola, and statistical
@@ -6366,6 +6393,9 @@ def apply_threshold_per_channel(
         threshold too high.
     progress : callable, optional
         Progress wrapper (e.g. tqdm).
+    nuclear_conditions : list of str, optional
+        Extra conditions thresholded like the NUCLEI channel (LIVE/DEAD
+        markers set as nuclear).
 
     Returns
     -------
@@ -6391,10 +6421,11 @@ def apply_threshold_per_channel(
     statistical_weight = 1.0 - global_threshold_weight - sauvola_weight
     global_thresholds = []
     combined_thresholds = []
+    nuclear_conditions = {"NUCLEI"} | {str(c).upper() for c in (nuclear_conditions or [])}
 
     for c in _progress_iter(range(image_stack.shape[3]), progress, desc='Step 15 - Threshold Channels'):
         marker_name = stain_complete_df.loc[stain_complete_df.index[c], 'Marker']
-        is_nuclei = stain_complete_df.index[c] == "NUCLEI"
+        is_nuclei = str(stain_complete_df.index[c]).upper() in nuclear_conditions
         arr = image_stack[:, :, :, c]
 
         global_thr_value, final_thr, statistical_thr, gain_ass, bg_mean = _compute_channel_threshold_stats(
@@ -6419,7 +6450,7 @@ def apply_threshold_per_channel(
         rescue = (gain > (gain_ass + 3.0)) & (arr > statistical_thr)
         arrayseg = primary | rescue
 
-        if stain_complete_df.index[c] != 'NUCLEI':
+        if not is_nuclei:
             min_size = np.ceil(0.8 * np.pi * ((nuclei_size / 2) ** 2))
         else:
             min_size = np.ceil(0.4 * np.pi * ((nuclei_size / 2) ** 2))
@@ -9645,6 +9676,1760 @@ def run_batch_folder(
             gc.collect()
 
     summary = pd.DataFrame(results)
+    n_ok = int((summary["Status"] == "OK").sum())
+    print("\n" + "=" * 80)
+    print(f"Batch finished: {n_ok}/{len(summary)} file(s) processed successfully.")
+    print(f"Outputs: {output_dir}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# LIVE/DEAD notebook (Fluo_3D_LD_seg v1.2.1)
+# ---------------------------------------------------------------------------
+# The LD notebook follows the nuclei notebook (v1.6.2) step by step. Its stain
+# table has fixed LIVE and DEAD rows (plus optional extra stains) and, instead
+# of the intracellular/membrane ticks, asks whether each marker is NUCLEAR or
+# CYTOPLASMIC. Everything else follows from that:
+#   - the nuclear markers are merged into the nuclei mask (Cell 17);
+#   - the cytoplasmic markers are merged into the cell-body mask (Cell 18),
+#     and nuclei and cell bodies are combined into one label per cell;
+#   - each marker's positivity is measured in its own compartment (nucleus
+#     or whole cell) and every cell gets a binary LIVE/DEAD call (Cell 20).
+
+LD_LOCALIZATIONS = ("nuclear", "cytoplasmic")
+LD_RULES = ("dead_priority", "coverage")
+_LD_FIXED_CONDITIONS = ("LIVE", "DEAD")
+# Keywords in the channel name used to pre-fill the LIVE/DEAD rows.
+_LD_CHANNEL_HINTS = {
+    "LIVE": ("CALCEIN", "SYTO", "488", "GFP", "FITC", "GREEN"),
+    "DEAD": ("ETHD", "ETHIDIUM", "PROPIDIUM", "7-AAD", "561", "555", "568", "594",
+             "CY3", "RFP", "MCHERRY", "TRITC", "TXRED", "RED"),
+}
+_LD_NUCLEAR_HINTS = ("DAPI", "HOECHST", "405", "DRAQ", "SYTO", "ETHD", "PROPIDIUM", "7-AAD")
+
+
+def _guess_ld_channel(channels, condition, taken):
+    free = [c for c in channels if c not in taken]
+    keys = _LD_CHANNEL_HINTS.get(condition, ())
+    for channel in free:
+        if any(key in str(channel).upper() for key in keys):
+            return channel
+    return free[0] if free else _STAIN_NO_CHANNEL
+
+
+def _guess_ld_localization(channel, condition):
+    if condition == "LIVE":
+        return "cytoplasmic"
+    if condition == "DEAD":
+        return "nuclear"
+    name = str(channel).upper()
+    return "nuclear" if any(key in name for key in _LD_NUCLEAR_HINTS) else "cytoplasmic"
+
+
+def _default_ld_stain_rows(channels):
+    """Preliminary LIVE/DEAD stain table: LIVE on a green-like channel
+    (cytoplasmic, e.g. calcein), DEAD on a red-like channel (nuclear, e.g.
+    ethidium homodimer or propidium iodide), and one STAIN_<n> row per
+    remaining channel."""
+    taken, rows = [], []
+    for condition in _LD_FIXED_CONDITIONS:
+        channel = _guess_ld_channel(channels, condition, taken)
+        if channel != _STAIN_NO_CHANNEL:
+            taken.append(channel)
+        rows.append(dict(condition=condition, marker="", channel=channel,
+                         color="green" if condition == "LIVE" else "red",
+                         localization=_guess_ld_localization(channel, condition)))
+    rest = [c for c in channels if c not in taken]
+    for i, channel in enumerate(rest, start=1):
+        rows.append(dict(condition=f"STAIN_{i}", marker="", channel=channel,
+                         color=_guess_channel_color(channel, i + 1),
+                         localization=_guess_ld_localization(channel, "")))
+    return rows
+
+
+class LDStainDictEditor:
+    """Interactive LIVE/DEAD stain table (ipywidgets), the LD counterpart of
+    :class:`StainDictEditor`.
+
+    One row per condition: condition name (fixed for LIVE and DEAD), marker
+    name (text), channel (drop-down of the file's channels, or 'no' if the
+    condition isn't used), display color and **localization**: whether the
+    marker stains the nucleus ('Nuclear', e.g. ethidium homodimer, propidium
+    iodide, Hoechst) or the cytoplasm ('Cytoplasmic', e.g. calcein). Extra
+    stains (e.g. a nuclear counterstain) can be added with 'Add stain': they
+    help the segmentation and are quantified, but don't enter the LIVE/DEAD
+    call. Clicking 'Confirm' checks the table and saves it to
+    ``<name_setup>_ld_stain_dict.json``; a saved table is loaded (and counts
+    as confirmed) the next time the notebook runs. Read the result with
+    :meth:`result`.
+    """
+
+    _COLUMNS = ("Condition", "Marker", "Channel", "Color", "Localization", "")
+    _LOCALIZATION_OPTIONS = (("Nuclear", "nuclear"), ("Cytoplasmic", "cytoplasmic"))
+    _MARKER_HINTS = {"LIVE": "e.g. CALCEIN", "DEAD": "e.g. ETHD-1"}
+
+    def __init__(self, channels, name_setup=None, use_saved=True):
+        try:
+            import ipywidgets as widgets
+        except ImportError as exc:
+            raise ImportError(
+                "The interactive stain table needs ipywidgets: "
+                "uv pip install ipywidgets"
+            ) from exc
+        self._w = widgets
+        self.channels = [str(c) for c in (channels or [])]
+        self.save_path = f"{name_setup}_ld_stain_dict.json" if name_setup else None
+        self._rows = []
+        self._confirmed = False
+        self._load_notes = []
+
+        loaded = self._load_saved() if use_saved else None
+        for row in loaded or _default_ld_stain_rows(self.channels):
+            self._add_row(row, render=False)
+
+        self._grid = widgets.GridBox(layout=widgets.Layout(
+            grid_template_columns="120px 180px 240px 110px 140px 40px",
+            grid_gap="4px 10px",
+            align_items="center",
+        ))
+        add_button = widgets.Button(description="Add stain", icon="plus")
+        add_button.on_click(lambda _: self._add_row(self._new_stain_row()))
+        confirm_button = widgets.Button(description="Confirm", icon="check",
+                                        button_style="success")
+        confirm_button.on_click(self._on_confirm)
+        self._status = widgets.HTML()
+        self._output = widgets.Output()
+        self.widget = widgets.VBox([
+            widgets.HTML("<b>LIVE/DEAD stain table</b> -- pick each condition's channel "
+                         "('no' = not used) and color, type the marker names, choose "
+                         "whether each marker is <b>nuclear</b> or <b>cytoplasmic</b>, "
+                         "then click <b>Confirm</b>."),
+            self._grid,
+            widgets.HBox([add_button, confirm_button]),
+            self._status,
+            self._output,
+        ])
+        self._render()
+        errors, _ = self._validate()
+        self._confirmed = loaded is not None and not errors and not self._load_notes
+        self._update_status()
+
+    # -- saved table --------------------------------------------------------
+    def _load_saved(self):
+        if not self.save_path or not os.path.exists(self.save_path):
+            return None
+        try:
+            with open(self.save_path, encoding="utf-8") as f:
+                rows = json.load(f)["rows"]
+        except Exception as exc:
+            print(f"[LDStainDictEditor] Could not read {self.save_path} ({exc}); "
+                  f"starting from a new table.")
+            return None
+        # LIVE and DEAD always come first, even if missing from the file.
+        saved = {r.get("condition"): r for r in rows}
+        defaults = {r["condition"]: r for r in _default_ld_stain_rows(self.channels)}
+        rows = ([dict(saved.get(c, defaults[c])) for c in _LD_FIXED_CONDITIONS]
+                + [dict(r) for r in rows if r.get("condition") not in _LD_FIXED_CONDITIONS])
+        for row in rows:
+            channel = row.get("channel", _STAIN_NO_CHANNEL)
+            if channel != _STAIN_NO_CHANNEL and channel not in self.channels:
+                self._load_notes.append(
+                    f"{row.get('condition')}: saved channel '{channel}' is not in "
+                    f"this file -- set to 'no'.")
+                row["channel"] = _STAIN_NO_CHANNEL
+            if row.get("localization") not in LD_LOCALIZATIONS:
+                row["localization"] = _guess_ld_localization(channel, row.get("condition", ""))
+        print(f"Stain table loaded from {self.save_path}"
+              + ("" if not self._load_notes else " (needs review, see below)."))
+        return rows
+
+    # -- rows ---------------------------------------------------------------
+    def _new_stain_row(self):
+        taken = {r["condition"] for r in self._values()}
+        n = 1
+        while f"STAIN_{n}" in taken:
+            n += 1
+        return dict(condition=f"STAIN_{n}", marker="", channel=_STAIN_NO_CHANNEL,
+                    color=STAIN_COLORS[n % len(STAIN_COLORS)], localization="nuclear")
+
+    def _add_row(self, row, render=True):
+        w = self._w
+        fixed = row["condition"] in _LD_FIXED_CONDITIONS
+        auto = w.Layout(width="auto")
+        if fixed:
+            condition = w.HTML(f"<b>{row['condition']}</b>")
+        else:
+            condition = w.Text(value=row["condition"], placeholder="e.g. STAIN_1", layout=auto)
+        marker = w.Text(value=row.get("marker", ""), layout=auto,
+                        placeholder=self._MARKER_HINTS.get(row["condition"], "marker name"))
+        options = [_STAIN_NO_CHANNEL] + self.channels
+        channel_value = row.get("channel", _STAIN_NO_CHANNEL)
+        channel = w.Dropdown(options=options, layout=auto,
+                             value=channel_value if channel_value in options else _STAIN_NO_CHANNEL)
+        color_value = row.get("color", "white")
+        color = w.Dropdown(options=list(STAIN_COLORS), layout=auto,
+                           value=color_value if color_value in STAIN_COLORS else "white")
+        loc_value = row.get("localization")
+        localization = w.Dropdown(options=list(self._LOCALIZATION_OPTIONS), layout=auto,
+                                  value=loc_value if loc_value in LD_LOCALIZATIONS else "nuclear")
+        if fixed:
+            remove = w.HTML("")
+        else:
+            remove = w.Button(icon="times", tooltip="Remove this stain",
+                              layout=w.Layout(width="36px"))
+        entry = dict(fixed=fixed, name=row["condition"], condition=condition,
+                     marker=marker, channel=channel, color=color,
+                     localization=localization, remove=remove)
+        if not fixed:
+            remove.on_click(lambda _, e=entry: self._remove_row(e))
+            condition.observe(self._on_change, names="value")
+        for widget in (marker, channel, color, localization):
+            widget.observe(self._on_change, names="value")
+        self._rows.append(entry)
+        if render:
+            self._render()
+            self._on_change()
+
+    def _remove_row(self, entry):
+        self._rows.remove(entry)
+        self._render()
+        self._on_change()
+
+    def _render(self):
+        header = [self._w.HTML(f"<b>{c}</b>") for c in self._COLUMNS]
+        cells = []
+        for e in self._rows:
+            cells += [e["condition"], e["marker"], e["channel"], e["color"],
+                      e["localization"], e["remove"]]
+        self._grid.children = header + cells
+
+    def _values(self):
+        return [
+            dict(condition=(e["name"] if e["fixed"] else e["condition"].value).strip().upper(),
+                 marker=e["marker"].value.strip(),
+                 channel=e["channel"].value,
+                 color=e["color"].value,
+                 localization=e["localization"].value)
+            for e in self._rows
+        ]
+
+    # -- validation / status ------------------------------------------------
+    def _validate(self):
+        rows = self._values()
+        errors, notes = [], list(self._load_notes)
+        names = [r["condition"] for r in rows]
+        if "" in names:
+            errors.append("Every stain needs a condition name.")
+        dup_names = sorted({n for n in names if n and names.count(n) > 1})
+        if dup_names:
+            errors.append(f"Condition name used more than once: {dup_names}")
+        used = [r for r in rows if r["channel"] != _STAIN_NO_CHANNEL]
+        for r in used:
+            if not r["marker"]:
+                errors.append(f"{r['condition'] or '(unnamed)'}: type a marker name.")
+        used_channels = [r["channel"] for r in used]
+        dup_channels = sorted({c for c in used_channels if used_channels.count(c) > 1})
+        if dup_channels:
+            errors.append(f"Channel assigned to more than one condition: {dup_channels}")
+        markers = [r["marker"].upper() for r in used if r["marker"]]
+        dup_markers = sorted({m for m in markers if markers.count(m) > 1})
+        if dup_markers:
+            errors.append(f"Marker name used more than once: {dup_markers}")
+
+        by_name = {r["condition"]: r for r in rows}
+        live_used = by_name["LIVE"]["channel"] != _STAIN_NO_CHANNEL
+        dead_used = by_name["DEAD"]["channel"] != _STAIN_NO_CHANNEL
+        if not (live_used or dead_used):
+            errors.append("Assign a channel to LIVE and/or DEAD: the live/dead call "
+                          "needs at least one of them.")
+        elif not dead_used:
+            notes.append("No DEAD channel: cells that are not LIVE-positive are called DEAD.")
+        elif not live_used:
+            notes.append("No LIVE channel: cells that are not DEAD-positive are called LIVE.")
+        if used and not any(r["localization"] == "nuclear" for r in used):
+            notes.append("No nuclear marker: each cell's nucleus is estimated as a "
+                         "nucleus-sized sphere at the centre of its cell body.")
+        if used and not any(r["localization"] == "cytoplasmic" for r in used):
+            notes.append("No cytoplasmic marker: each cell is its stained nucleus.")
+        unused = [c for c in self.channels if c not in used_channels]
+        if unused:
+            notes.append(f"Channel(s) not used (dropped from the analysis): {unused}")
+        return errors, notes
+
+    def _on_change(self, _change=None):
+        self._confirmed = False
+        self._load_notes = []
+        self._update_status()
+
+    def _update_status(self):
+        import html
+        errors, notes = self._validate()
+        if errors:
+            head = "<span style='color:#d9534f'><b>Fix before confirming:</b></span>"
+            items = errors
+        elif self._confirmed:
+            head = "<span style='color:#2e8b57'><b>Confirmed.</b></span>"
+            items = []
+        else:
+            head = ("<span style='color:#e69500'><b>Not confirmed yet</b> -- "
+                    "click Confirm.</span>")
+            items = []
+        lines = [f"<li>{html.escape(t)}</li>" for t in items]
+        lines += [f"<li><i>{html.escape(t)}</i></li>" for t in notes]
+        self._status.value = head + (f"<ul>{''.join(lines)}</ul>" if lines else "")
+
+    def _on_confirm(self, _button):
+        errors, _ = self._validate()
+        if errors:
+            self._update_status()
+            return
+        self._confirmed = True
+        self._update_status()
+        self._output.clear_output()
+        with self._output:
+            if self.save_path:
+                with open(self.save_path, "w", encoding="utf-8") as f:
+                    json.dump({"rows": self._values()}, f, indent=2)
+                print(f"Saved to {self.save_path}")
+            print(f"stain_dict = {self.stain_dict}")
+            print(f"localization = {self.localization}")
+
+    # -- results ------------------------------------------------------------
+    @property
+    def stain_dict(self):
+        """``{condition: [marker, channel, color]}`` for every used condition."""
+        return {r["condition"]: [r["marker"], r["channel"], r["color"]]
+                for r in self._values() if r["channel"] != _STAIN_NO_CHANNEL}
+
+    @property
+    def localization(self):
+        """``{condition: 'nuclear' | 'cytoplasmic'}`` for every used condition."""
+        return {r["condition"]: r["localization"]
+                for r in self._values() if r["channel"] != _STAIN_NO_CHANNEL}
+
+    def result(self):
+        """Return ``(stain_dict, localization)``; raise StainTableNotConfirmed
+        if the table has not been confirmed (or has been edited since)."""
+        errors, _ = self._validate()
+        if errors or not self._confirmed:
+            raise StainTableNotConfirmed(
+                "The stain table in Cell 4 is not confirmed yet: fill it in, "
+                "click 'Confirm', then run the notebook again from Cell 5."
+            )
+        return self.stain_dict, self.localization
+
+
+def edit_ld_stain_dict(channels, name_setup=None, use_saved=True):
+    """Display the interactive LIVE/DEAD stain table for *channels* and return
+    the :class:`LDStainDictEditor` (read it later with ``.result()``)."""
+    from IPython.display import display
+    editor = LDStainDictEditor(channels, name_setup=name_setup, use_saved=use_saved)
+    display(editor.widget)
+    return editor
+
+
+def _ld_localization_map(localization):
+    return {str(k).upper(): str(v).lower() for k, v in (localization or {}).items()}
+
+
+def _ld_channel_groups(stain_df, localization):
+    """Channel indices ``(nuclear, cytoplasmic)`` -- channel c of the image is
+    row c of *stain_df*."""
+    loc = _ld_localization_map(localization)
+    nuclear, cytoplasmic = [], []
+    for c, cond in enumerate(stain_df.index):
+        value = loc.get(str(cond).upper())
+        if value == "nuclear":
+            nuclear.append(c)
+        elif value == "cytoplasmic":
+            cytoplasmic.append(c)
+        else:
+            raise ValueError(
+                f"No localization ('nuclear' or 'cytoplasmic') for condition '{cond}'. "
+                "Confirm the stain table in Cell 4 and re-run Cell 5."
+            )
+    return nuclear, cytoplasmic
+
+
+def _ld_marker_names(stain_df, channels):
+    return ", ".join(f"{stain_df.index[c]} ({stain_df['Marker'].iloc[c]})" for c in channels)
+
+
+def _ld_merged_substack(im_final_stack, channels):
+    """One-channel stack (Z, Y, X, 1) merging *channels*: union of their
+    threshold masks, per-voxel max of their filtered and denoised
+    intensities. Lets `segment_nuclei` run on a group of markers as if they
+    were one NUCLEI channel."""
+    thr = im_final_stack['Threshold image']
+    merged = {
+        'Threshold image': np.any(thr[..., channels] > 0, axis=-1)[..., None].astype(np.uint8),
+    }
+    for key in ('Filtered image', 'Denoised image'):
+        merged[key] = np.max(im_final_stack[key][..., channels], axis=-1)[..., None]
+    return merged
+
+
+def _ld_single_channel_df(marker):
+    return pd.DataFrame({'Marker': [marker], 'Laser': [''], 'Color': ['']},
+                        index=pd.Index(['NUCLEI'], name='Condition'))
+
+
+def segment_ld_nuclei(
+    im_final_stack,
+    stain_df,
+    localization,
+    r_zxyz,
+    nuclei_diameter,
+    nuclei_split_config=None,
+    trig_stardist=False,
+    trig_cellpose=False,
+    iterative_split=True,
+    oversize_factor=2.0,
+    max_split_iterations=3,
+    merge_undersized=True,
+    undersize_factor=0.5,
+    size_reference="blend",
+    progress=None,
+):
+    """LD Cell 17: segment the nuclei from the markers set as **nuclear**.
+
+    Their threshold masks (Cell 15) are merged into one nuclei mask, which is
+    segmented exactly like the NUCLEI channel of the nuclei notebook
+    (`segment_nuclei`: watershed, Cellpose or StarDist, then the size
+    refinement). Without nuclear markers no nuclei are segmented here: the
+    nucleus of each cell is then estimated in Cell 18.
+
+    Returns
+    -------
+    im_segmentation_stack : dict with 'Nuclei' (Z, Y, X) int32.
+    """
+    nuclear, _ = _ld_channel_groups(stain_df, localization)
+    shape = im_final_stack['Threshold image'].shape[:3]
+    if not nuclear:
+        print("No nuclear marker: no nuclei segmented here. Each cell's nucleus is "
+              "estimated from its cell body in Cell 18.")
+        return {'Nuclei': np.zeros(shape, dtype=np.int32)}
+
+    print(f"Nuclei segmented from the nuclear marker(s): {_ld_marker_names(stain_df, nuclear)}")
+    sub_df = _ld_single_channel_df('+'.join(str(stain_df['Marker'].iloc[c]) for c in nuclear))
+    seg = segment_nuclei(
+        _ld_merged_substack(im_final_stack, nuclear),
+        stain_df=sub_df,
+        stain_complete_df=sub_df,
+        r_zxyz=r_zxyz,
+        nuclei_diameter=nuclei_diameter,
+        nuclei_split_config=nuclei_split_config,
+        trig_stardist=trig_stardist,
+        trig_cellpose=trig_cellpose,
+        iterative_split=iterative_split,
+        oversize_factor=oversize_factor,
+        max_split_iterations=max_split_iterations,
+        merge_undersized=merge_undersized,
+        undersize_factor=undersize_factor,
+        size_reference=size_reference,
+        progress=progress,
+    )
+    return {'Nuclei': np.asarray(seg['Nuclei'], dtype=np.int32)}
+
+
+def _ld_union_slices(slices):
+    slices = [s for s in slices if s is not None]
+    return tuple(
+        slice(min(s[d].start for s in slices), max(s[d].stop for s in slices))
+        for d in range(3)
+    )
+
+
+def _ld_combine_nuclei_and_bodies(nuclei, bodies, spacing, nuclei_diameter,
+                                  min_nucleus_overlap=0.5, progress=None):
+    """Combine the nuclei (nuclear markers) and the cell bodies (cytoplasmic
+    markers) into one label per cell:
+
+    - a nucleus lying for at least ``min_nucleus_overlap`` of its volume in a
+      cell body belongs to that cell;
+    - a body holding two or more nuclei is split between them (watershed on
+      the distance map, seeded by the nuclei);
+    - a nucleus outside every body is a cell without stained cytoplasm: the
+      cell is the nucleus;
+    - a body with no nucleus is a cell whose nucleus is not stained: its
+      nucleus is *estimated* as a sphere of ``nuclei_diameter`` around the
+      innermost point of the body. It gives the cell a position and the
+      compartment where the nuclear markers are measured.
+
+    Returns
+    -------
+    cells : (Z, Y, X) int32 -- whole cells, nucleus included, labels 1..K
+    nuclei_out : (Z, Y, X) int32 -- stained or estimated nucleus, same labels
+    stained : (Z, Y, X) int32 -- stained nuclei only, same labels
+    info : dict of counts
+    """
+    shape = nuclei.shape
+    cells = np.zeros(shape, dtype=np.int32)
+    nuc_out = np.zeros(shape, dtype=np.int32)
+    n_nuc = int(nuclei.max()) if nuclei.size else 0
+    n_body = int(bodies.max()) if bodies.size else 0
+
+    # Each nucleus -> the body it overlaps most (if enough of it lies inside).
+    owner = np.zeros(n_nuc + 1, dtype=np.int64)
+    if n_nuc and n_body:
+        both = (nuclei > 0) & (bodies > 0)
+        pairs = nuclei[both].astype(np.int64) * (n_body + 1) + bodies[both]
+        del both
+        pair_ids, pair_counts = np.unique(pairs, return_counts=True)
+        del pairs
+        nuc_size = np.bincount(nuclei.ravel(), minlength=n_nuc + 1)
+        best = {}
+        for pid, count in zip(pair_ids.tolist(), pair_counts.tolist()):
+            n, b = divmod(pid, n_body + 1)
+            if n not in best or count > best[n][1]:
+                best[n] = (b, count)
+        for n, (b, count) in best.items():
+            if count >= min_nucleus_overlap * nuc_size[n]:
+                owner[n] = b
+
+    nuclei_of_body = defaultdict(list)
+    for n in range(1, n_nuc + 1):
+        if owner[n]:
+            nuclei_of_body[int(owner[n])].append(n)
+    nuc_slices = ndi.find_objects(nuclei) if n_nuc else []
+    body_slices = ndi.find_objects(bodies) if n_body else []
+
+    next_id = 1
+    n_split_bodies = 0
+    for b in _progress_iter(range(1, n_body + 1), progress,
+                            desc='Step 18B - Combine Nuclei And Cell Bodies', leave=False):
+        if body_slices[b - 1] is None:
+            continue
+        owned = nuclei_of_body.get(b, [])
+        sl = _ld_union_slices([body_slices[b - 1]] + [nuc_slices[n - 1] for n in owned])
+        body = bodies[sl] == b
+        nuc_sub = nuclei[sl]
+        cell_view = cells[sl]
+        nuc_view = nuc_out[sl]
+        if len(owned) <= 1:
+            region = body
+            if owned:
+                nuc_mask = nuc_sub == owned[0]
+                region = body | nuc_mask
+                nuc_view[nuc_mask] = next_id
+            cell_view[region] = next_id
+            next_id += 1
+            continue
+        # Several nuclei in one body: split it between them.
+        markers = np.zeros(body.shape, dtype=np.int32)
+        for k, n in enumerate(owned, start=1):
+            markers[nuc_sub == n] = k
+        region = body | (markers > 0)
+        distance = ndi.distance_transform_edt(np.pad(region, 1), sampling=spacing)[1:-1, 1:-1, 1:-1]
+        parts = watershed(-distance, markers, mask=region)
+        for k in range(1, len(owned) + 1):
+            cell_view[parts == k] = next_id
+            nuc_view[markers == k] = next_id
+            next_id += 1
+        n_split_bodies += 1
+
+    n_nucleus_only = 0
+    for n in range(1, n_nuc + 1):
+        if owner[n] or nuc_slices[n - 1] is None:
+            continue
+        sl = nuc_slices[n - 1]
+        nuc_mask = nuclei[sl] == n
+        cells[sl][nuc_mask] = next_id
+        nuc_out[sl][nuc_mask] = next_id
+        next_id += 1
+        n_nucleus_only += 1
+
+    # A nucleus always belongs to its own cell (a neighbouring body may have
+    # been written over it), then renumber the cells 1..K.
+    has_nuc = nuc_out > 0
+    cells[has_nuc] = nuc_out[has_nuc]
+    del has_nuc
+    present = np.unique(cells)
+    present = present[present > 0]
+    lut = np.zeros(next_id, dtype=np.int32)
+    lut[present] = np.arange(1, present.size + 1, dtype=np.int32)
+    cells = lut[cells]
+    nuc_out = lut[nuc_out]
+    stained = nuc_out.copy()
+    n_cells = int(present.size)
+
+    # Cells without a stained nucleus: nucleus-sized sphere at the innermost
+    # point of the cell.
+    with_nucleus = np.zeros(n_cells + 1, dtype=bool)
+    with_nucleus[np.unique(nuc_out)] = True
+    missing = np.flatnonzero(~with_nucleus)
+    radius = nuclei_diameter / 2.0
+    cell_slices = ndi.find_objects(cells)
+    for j in _progress_iter(missing.tolist(), progress,
+                            desc='Step 18C - Estimate Unstained Nuclei', leave=False):
+        sl = cell_slices[j - 1]
+        if sl is None:
+            continue
+        region = cells[sl] == j
+        distance = ndi.distance_transform_edt(np.pad(region, 1), sampling=spacing)[1:-1, 1:-1, 1:-1]
+        center = np.unravel_index(int(np.argmax(distance)), distance.shape)
+        zz, yy, xx = np.ogrid[:region.shape[0], :region.shape[1], :region.shape[2]]
+        d2 = (((zz - center[0]) * spacing[0]) ** 2
+              + ((yy - center[1]) * spacing[1]) ** 2
+              + ((xx - center[2]) * spacing[2]) ** 2)
+        nuc_out[sl][region & (d2 <= radius ** 2)] = j
+
+    info = {
+        'nuclei': n_nuc,
+        'bodies': n_body,
+        'cells': n_cells,
+        'estimated nuclei': int(missing.size),
+        'nucleus only': n_nucleus_only,
+        'bodies split': n_split_bodies,
+    }
+    return cells, nuc_out, stained, info
+
+
+def segment_ld_cells(
+    im_final_stack,
+    im_segmentation_stack,
+    stain_df,
+    stain_complete_df,
+    localization,
+    r_zxyz,
+    nuclei_diameter,
+    cell_diameter,
+    trig_cellpose_cyto=False,
+    nuclei_split_config=None,
+    iterative_split=True,
+    oversize_factor=2.0,
+    max_split_iterations=3,
+    merge_undersized=True,
+    undersize_factor=0.5,
+    size_reference="blend",
+    min_nucleus_overlap=0.5,
+    progress=None,
+):
+    """LD Cell 18: segment the cell bodies from the markers set as
+    **cytoplasmic** and combine them with the nuclei of Cell 17 into one
+    label per cell.
+
+    The cytoplasmic threshold masks (Cell 15) are merged and segmented like
+    the nuclei, at the scale of ``cell_diameter`` (watershed and size
+    refinement; Cellpose 'cyto3' with ``trig_cellpose_cyto``). Nuclei and
+    bodies are then combined (`_ld_combine_nuclei_and_bodies`): a body with
+    several nuclei is split between them, a nucleus outside every body is a
+    cell on its own, and a body without a stained nucleus gets an estimated
+    one (a nucleus-sized sphere at its centre).
+
+    Adds to ``im_segmentation_stack``:
+
+    - 'Cytoplasm': the whole cells (nucleus included), labels 1..K -- the
+      same layout as the cytoplasm of the nuclei notebook;
+    - 'Nuclei': each cell's nucleus, stained or estimated, same labels;
+    - 'Nuclei (stained)': the stained nuclei only.
+
+    A placeholder CYTOPLASM row is added to ``stain_complete_df`` (as
+    `segment_cytoplasm` does when there is no CYTOPLASM channel).
+    """
+    r_zX, r_zY, r_zZ = r_zxyz
+    _, cytoplasmic = _ld_channel_groups(stain_df, localization)
+    if 'Nuclei' not in im_segmentation_stack:
+        raise RuntimeError("Run Cell 17 first so im_segmentation_stack contains 'Nuclei'.")
+    nuclei = np.asarray(im_segmentation_stack['Nuclei'], dtype=np.int32)
+
+    if cytoplasmic:
+        print(f"Cell bodies segmented from the cytoplasmic marker(s): "
+              f"{_ld_marker_names(stain_df, cytoplasmic)}")
+        merged = _ld_merged_substack(im_final_stack, cytoplasmic)
+        if trig_cellpose_cyto:
+            intensity = merged['Filtered image'][..., 0]
+            bodies = segment_nuclei_cellpose(
+                intensity,
+                nuclei_diameter=cell_diameter,
+                voxel_size=(r_zZ, r_zY, r_zX),
+                model_type='cyto3',
+            )
+            if iterative_split or merge_undersized:
+                bodies, _ = refine_nuclei_by_size(
+                    bodies,
+                    intensity_img=intensity,
+                    intensity_img_raw=merged['Denoised image'][..., 0],
+                    r_zxyz=r_zxyz,
+                    nuclei_diameter=cell_diameter,
+                    base_split_config=nuclei_split_config,
+                    size_reference=size_reference,
+                    merge_undersized=merge_undersized,
+                    undersize_factor=undersize_factor,
+                    iterative_split=iterative_split,
+                    oversize_factor=oversize_factor,
+                    max_split_iterations=max_split_iterations,
+                    progress=progress,
+                )
+        else:
+            sub_df = _ld_single_channel_df(
+                '+'.join(str(stain_df['Marker'].iloc[c]) for c in cytoplasmic))
+            bodies = segment_nuclei(
+                merged,
+                stain_df=sub_df,
+                stain_complete_df=sub_df,
+                r_zxyz=r_zxyz,
+                nuclei_diameter=cell_diameter,
+                nuclei_split_config=nuclei_split_config,
+                iterative_split=iterative_split,
+                oversize_factor=oversize_factor,
+                max_split_iterations=max_split_iterations,
+                merge_undersized=merge_undersized,
+                undersize_factor=undersize_factor,
+                size_reference=size_reference,
+                progress=progress,
+            )['Nuclei']
+        del merged
+        bodies = np.asarray(bodies, dtype=np.int32)
+    else:
+        print("No cytoplasmic marker: each cell is its stained nucleus.")
+        bodies = np.zeros_like(nuclei)
+
+    cells, nuclei_out, stained, info = _ld_combine_nuclei_and_bodies(
+        nuclei, bodies,
+        spacing=(r_zZ, r_zY, r_zX),
+        nuclei_diameter=nuclei_diameter,
+        min_nucleus_overlap=min_nucleus_overlap,
+        progress=progress,
+    )
+    n_cells = info['cells']
+    n_both = n_cells - info['estimated nuclei'] - info['nucleus only']
+    print(f"{info['nuclei']} nuclei + {info['bodies']} cell bodies -> {n_cells} cells:")
+    print(f"  {n_both} with a stained nucleus inside a cell body "
+          f"({info['bodies split']} bodies split between 2+ nuclei)")
+    print(f"  {info['nucleus only']} stained nucleus only (no cytoplasmic signal)")
+    print(f"  {info['estimated nuclei']} cell body only (nucleus estimated at the cell centre)")
+
+    if 'CYTOPLASM' not in stain_complete_df.index:
+        stain_complete_df = stain_complete_df.copy()
+        stain_complete_df.loc['CYTOPLASM'] = ['', '', '', 0, 255, 1.0]
+
+    im_segmentation_stack = dict(im_segmentation_stack)
+    im_segmentation_stack['Nuclei'] = nuclei_out
+    im_segmentation_stack['Nuclei (stained)'] = stained
+    im_segmentation_stack['Cytoplasm'] = cells
+    return im_segmentation_stack, stain_complete_df
+
+
+def segment_ld_pcm(im_segmentation_stack, cyto_factor, PCM_factor):
+    """LD Cell 19: the pericellular shell around each cell, as in the nuclei
+    notebook (`segment_pcm`): the cells of Cell 18 grown by
+    ``PCM_factor - cyto_factor``, minus the cells themselves. It is not used
+    for the LIVE/DEAD call."""
+    cells = im_segmentation_stack['Cytoplasm']
+    pcm = grow_labels(cells, int(PCM_factor - cyto_factor)) - cells
+    im_segmentation_stack = dict(im_segmentation_stack)
+    im_segmentation_stack['PCM'] = pcm.copy()
+    return im_segmentation_stack
+
+
+def _ld_z_chunk(shape, max_voxels=20_000_000):
+    return max(1, int(max_voxels // max(1, int(shape[1]) * int(shape[2]))))
+
+
+def _ld_label_sums(labels, values, n_labels):
+    """Per-label sum of *values* over labels 0..n_labels (voxel count if
+    *values* is None), computed in Z slabs to bound memory."""
+    out = np.zeros(n_labels + 1, dtype=np.float64)
+    chunk = _ld_z_chunk(labels.shape)
+    for z0 in range(0, labels.shape[0], chunk):
+        lab = labels[z0:z0 + chunk].ravel()
+        weights = None if values is None else values[z0:z0 + chunk].ravel().astype(np.float64)
+        out += np.bincount(lab, weights=weights, minlength=n_labels + 1)[:n_labels + 1]
+    return out
+
+
+def _ld_label_centroids(labels, n_labels):
+    """Mean (z, y, x) voxel position of labels 1..n_labels, shape (n, 3)."""
+    counts = np.zeros(n_labels + 1, dtype=np.float64)
+    sums = np.zeros((3, n_labels + 1), dtype=np.float64)
+    nz, ny, nx = labels.shape
+    chunk = _ld_z_chunk(labels.shape)
+    for z0 in range(0, nz, chunk):
+        lab = labels[z0:z0 + chunk]
+        flat = lab.ravel()
+        n_planes = lab.shape[0]
+        coords = (
+            np.repeat(np.arange(z0, z0 + n_planes, dtype=np.float64), ny * nx),
+            np.tile(np.repeat(np.arange(ny, dtype=np.float64), nx), n_planes),
+            np.tile(np.arange(nx, dtype=np.float64), n_planes * ny),
+        )
+        counts += np.bincount(flat, minlength=n_labels + 1)[:n_labels + 1]
+        for d in range(3):
+            sums[d] += np.bincount(flat, weights=coords[d], minlength=n_labels + 1)[:n_labels + 1]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return (sums / counts).T[1:]
+
+
+def _ld_intensity_column(condition, compartment):
+    return f"{condition} mean int. ({'nucleus' if compartment == 'nuclear' else 'cell'})"
+
+
+def _ld_rule_text(rule, has_live, has_dead):
+    if rule == "coverage":
+        return ("positive for one marker only -> that one; for both or neither -> "
+                "the marker covering more of its compartment")
+    if has_dead:
+        return "DEAD-positive -> DEAD, otherwise LIVE"
+    return "LIVE-positive -> LIVE, otherwise DEAD"
+
+
+def classify_live_dead(
+    im_final_stack,
+    im_segmentation_stack,
+    stain_df,
+    localization,
+    r_zxyz,
+    min_positive_fraction=0.2,
+    ld_rule="dead_priority",
+    progress=None,
+):
+    """LD Cell 20: marker positivity of every cell and the binary LIVE/DEAD call.
+
+    Each marker is measured in its own compartment: a nuclear marker in the
+    cell's nucleus ('Nuclei', stained or estimated), a cytoplasmic marker in
+    the whole cell ('Cytoplasm', nucleus included). A cell is positive for a
+    marker when the marker's threshold mask (Cell 15) covers at least
+    ``min_positive_fraction`` of that compartment (0 = any voxel, as in the
+    nuclei notebook).
+
+    The call (``ld_rule``) uses the LIVE and DEAD conditions only:
+
+    - ``"dead_priority"`` (default): DEAD-positive -> DEAD, otherwise LIVE
+      (a cell whose membrane lets the dead stain in is dead, even with some
+      calcein left). Without a DEAD channel: LIVE-positive -> LIVE,
+      otherwise DEAD.
+    - ``"coverage"``: positive for one of the two only -> that one; positive
+      for both or neither -> the marker covering the larger fraction of its
+      compartment. Needs both channels (otherwise "dead_priority" is used).
+
+    Adds to ``im_segmentation_stack`` one label layer per condition -- the
+    marker's voxels in the compartment of its positive cells, also stored as
+    '<condition>_cyto' for the shared quantification -- and 'Status' (each
+    cell's voxels: 1 = LIVE, 2 = DEAD).
+
+    Returns
+    -------
+    im_segmentation_stack : dict
+    ld_cells_df : DataFrame
+        One row per cell (index 'Cell label' 1..K): status, position and
+        volume of the cell, nucleus (stained/estimated) and, per condition,
+        coverage, positivity and mean intensity. The settings are stored in
+        ``ld_cells_df.attrs``.
+    """
+    if ld_rule not in LD_RULES:
+        raise ValueError(f"ld_rule must be one of {LD_RULES}, got '{ld_rule}'")
+    loc = _ld_localization_map(localization)
+    r_zX, r_zY, r_zZ = r_zxyz
+    voxel_um3 = float(r_zX) * float(r_zY) * float(r_zZ)
+    thr = im_final_stack['Threshold image']
+    filt = im_final_stack['Filtered image']
+    cells = im_segmentation_stack['Cytoplasm']
+    nuclei = im_segmentation_stack['Nuclei']
+    stained = im_segmentation_stack.get('Nuclei (stained)', nuclei)
+    n_cells = int(cells.max())
+    if n_cells == 0:
+        raise RuntimeError("No cells were segmented: check the thresholds (Cell 15) "
+                           "and the segmentation (Cells 17-18).")
+
+    cell_vox = _ld_label_sums(cells, None, n_cells)
+    nuc_vox = _ld_label_sums(nuclei, None, n_cells)
+    stained_vox = _ld_label_sums(stained, None, n_cells)[1:]
+    centroids = _ld_label_centroids(cells, n_cells)
+
+    df = pd.DataFrame(index=pd.RangeIndex(1, n_cells + 1, name='Cell label'))
+    df['X [um]'] = centroids[:, 2] * r_zX
+    df['Y [um]'] = centroids[:, 1] * r_zY
+    df['Z [um]'] = centroids[:, 0] * r_zZ
+    df['Cell volume [um3]'] = cell_vox[1:] * voxel_um3
+    df['Nucleus'] = np.where(stained_vox > 0, 'stained', 'estimated')
+    df['Nucleus volume [um3]'] = np.where(stained_vox > 0, stained_vox * voxel_um3, np.nan)
+
+    seg = dict(im_segmentation_stack)
+    coverage, positive = {}, {}
+    for c, cond in _progress_iter(list(enumerate(stain_df.index)), progress,
+                                  desc='Step 20 - Marker Positivity Per Cell'):
+        compartment = loc.get(str(cond).upper())
+        if compartment not in LD_LOCALIZATIONS:
+            raise ValueError(f"No localization ('nuclear' or 'cytoplasmic') for condition '{cond}'.")
+        lab = nuclei if compartment == 'nuclear' else cells
+        denom = nuc_vox if compartment == 'nuclear' else cell_vox
+        mask = thr[..., c] > 0
+        intensity = filt[..., c]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            cov = np.where(denom > 0, _ld_label_sums(lab, mask, n_cells) / denom, 0.0)[1:]
+            mean_comp = np.where(denom > 0, _ld_label_sums(lab, intensity, n_cells) / denom, np.nan)[1:]
+            mean_cell = np.where(cell_vox > 0, _ld_label_sums(cells, intensity, n_cells) / cell_vox, np.nan)[1:]
+        pos = (cov > 0) & (cov >= min_positive_fraction)
+
+        df[f'{cond} coverage'] = cov
+        df[f'{cond} positive'] = pos
+        df[_ld_intensity_column(cond, compartment)] = mean_comp
+        if compartment == 'nuclear':
+            df[f'{cond} mean int. (cell)'] = mean_cell
+        coverage[cond] = cov
+        positive[cond] = pos
+
+        pos_lut = np.zeros(n_cells + 1, dtype=bool)
+        pos_lut[1:] = pos
+        layer = np.where(mask & pos_lut[lab], lab, 0).astype(np.int32)
+        seg[cond] = layer
+        seg[cond + '_cyto'] = layer
+        del mask, layer
+
+    has_live, has_dead = 'LIVE' in positive, 'DEAD' in positive
+    if not (has_live or has_dead):
+        raise ValueError("The stain table needs a LIVE and/or a DEAD condition.")
+    rule = ld_rule
+    if rule == 'coverage' and not (has_live and has_dead):
+        print("ld_rule='coverage' needs both a LIVE and a DEAD channel: "
+              "using 'dead_priority' instead.")
+        rule = 'dead_priority'
+    if rule == 'coverage':
+        live_pos, dead_pos = positive['LIVE'], positive['DEAD']
+        is_dead = np.where(live_pos != dead_pos, dead_pos, coverage['DEAD'] > coverage['LIVE'])
+    elif has_dead:
+        is_dead = positive['DEAD']
+    else:
+        is_dead = ~positive['LIVE']
+
+    if has_live and has_dead:
+        live_pos, dead_pos = positive['LIVE'], positive['DEAD']
+        markers = np.full(n_cells, 'neither', dtype=object)
+        markers[live_pos & ~dead_pos] = 'LIVE only'
+        markers[dead_pos & ~live_pos] = 'DEAD only'
+        markers[live_pos & dead_pos] = 'both'
+    elif has_dead:
+        markers = np.where(positive['DEAD'], 'DEAD+', 'DEAD-')
+    else:
+        markers = np.where(positive['LIVE'], 'LIVE+', 'LIVE-')
+    df.insert(0, 'Status', np.where(is_dead, 'DEAD', 'LIVE'))
+    df.insert(1, 'LIVE/DEAD markers', markers)
+
+    status_lut = np.zeros(n_cells + 1, dtype=np.uint8)
+    status_lut[1:] = np.where(is_dead, 2, 1)
+    seg['Status'] = status_lut[cells]
+
+    df.attrs = {
+        'ld_rule': rule,
+        'rule_text': _ld_rule_text(rule, has_live, has_dead),
+        'min_positive_fraction': float(min_positive_fraction),
+        'localization': {str(c): loc.get(str(c).upper()) for c in stain_df.index},
+        'markers': {str(c): str(stain_df.loc[c, 'Marker']) for c in stain_df.index},
+    }
+    n_dead = int(np.count_nonzero(is_dead))
+    print(f"LIVE/DEAD call ({df.attrs['rule_text']}; positive = marker covers >= "
+          f"{100 * min_positive_fraction:.0f}% of its compartment): "
+          f"{n_cells - n_dead} LIVE, {n_dead} DEAD of {n_cells} cells "
+          f"({100.0 * (n_cells - n_dead) / n_cells:.1f}% viability)")
+    return seg, df
+
+
+def view_ld_results(
+    im_final_stack,
+    im_segmentation_stack,
+    stain_df,
+    stain_complete_df,
+    r_xyz,
+    r_zxyz,
+    napari_module,
+    progress=None,
+):
+    """LD Cell 22: the viewers of the nuclei notebook (`view_processing_results`:
+    processing stages, threshold islands, marker labels, cells, PCM,
+    aggregates) plus the LIVE/DEAD layers: stained and estimated nuclei, and
+    the LIVE and DEAD cells of the call."""
+    viewer_0, viewer_1 = view_processing_results(
+        im_final_stack,
+        im_segmentation_stack=im_segmentation_stack,
+        stain_df=stain_df,
+        stain_complete_df=stain_complete_df,
+        r_xyz=r_xyz,
+        r_zxyz=r_zxyz,
+        napari_module=napari_module,
+        progress=progress,
+    )
+    if viewer_1 is None:
+        return viewer_0, viewer_1
+
+    r_zX, r_zY, r_zZ = r_zxyz
+    scale = (r_zZ, r_zY, r_zX)
+    nuclei = im_segmentation_stack['Nuclei']
+    stained = im_segmentation_stack.get('Nuclei (stained)')
+    if stained is not None:
+        viewer_1.add_labels(stained.astype(np.int32), name='NUCLEI (stained)',
+                            blending='additive', scale=scale)
+        estimated = np.where(stained > 0, 0, nuclei).astype(np.int32)
+        if np.any(estimated):
+            viewer_1.add_labels(estimated, name='NUCLEI (estimated)',
+                                blending='additive', scale=scale)
+    else:
+        viewer_1.add_labels(nuclei.astype(np.int32), name='NUCLEI',
+                            blending='additive', scale=scale)
+    status = im_segmentation_stack.get('Status')
+    if status is not None:
+        for value, name, colormap in ((1, 'LIVE', 'green'), (2, 'DEAD', 'red')):
+            viewer_1.add_image((status == value).astype(np.uint8), name=f'{name} cells (call)',
+                               colormap=colormap, blending='additive', opacity=0.5,
+                               contrast_limits=(0, 1), scale=scale)
+    for layer in viewer_1.layers:
+        layer.units = ('um', 'um', 'um')
+    return viewer_0, viewer_1
+
+
+def _ld_conditions(ld_cells_df):
+    return [c for c in ld_cells_df.attrs.get('localization', {})
+            if f'{c} positive' in ld_cells_df.columns]
+
+
+def _ld_status_table(ld_cells_df):
+    """Population table: one row per status (LIVE, DEAD) and ALL cells."""
+    loc = ld_cells_df.attrs.get('localization', {})
+    total = len(ld_cells_df)
+    rows = {}
+    for name in ('LIVE', 'DEAD', 'ALL'):
+        sub = ld_cells_df if name == 'ALL' else ld_cells_df[ld_cells_df['Status'] == name]
+        n = len(sub)
+        nuc = sub['Nucleus volume [um3]'].dropna()
+        row = {
+            'Cells': n,
+            '% of cells': 100.0 * n / total if total else np.nan,
+            'Cell volume mean [um3]': sub['Cell volume [um3]'].mean() if n else np.nan,
+            'Cell volume SD [um3]': sub['Cell volume [um3]'].std(ddof=0) if n else np.nan,
+            'Stained nuclei': int(len(nuc)),
+            'Nucleus volume mean [um3]': nuc.mean() if len(nuc) else np.nan,
+            'Nucleus volume SD [um3]': nuc.std(ddof=0) if len(nuc) else np.nan,
+        }
+        for cond in _ld_conditions(ld_cells_df):
+            int_col = _ld_intensity_column(cond, loc.get(cond))
+            row[f'{cond} positive cells'] = int(sub[f'{cond} positive'].sum())
+            row[f'{cond} mean coverage'] = sub[f'{cond} coverage'].mean() if n else np.nan
+            row[int_col.replace('mean int.', 'mean intensity')] = sub[int_col].mean() if n else np.nan
+        rows[name] = row
+    table = pd.DataFrame.from_dict(rows, orient='index')
+    table.index.name = 'Population'
+    return table
+
+
+def _ld_stats_line(values, label, unit):
+    arr = np.asarray(values, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return
+    print(f"{label}:  mean = {np.mean(arr):.2f} {unit}  |  std = {np.std(arr):.2f} {unit}"
+          f"  |  median = {np.median(arr):.2f} {unit}"
+          f"  |  [min = {np.min(arr):.2f},  max = {np.max(arr):.2f}]")
+
+
+def print_ld_summary(ld_cells_df, stain_df):
+    """LD Cell 24: the LIVE/DEAD call (counts, percentages, viability), how
+    the marker combinations were called, the positivity of every marker and,
+    per population, cell/nucleus size and marker intensity."""
+    attrs = ld_cells_df.attrs
+    loc = attrs.get('localization', {})
+    total = len(ld_cells_df)
+
+    print("CHANNELS:")
+    for i, cond in enumerate(stain_df.index):
+        row = stain_df.loc[cond]
+        print(f"  [{i}] {cond:<12} {row['Marker']:<16} ({row['Laser']})  {loc.get(cond, '?')}")
+    print("_" * 80)
+    n_stained = int((ld_cells_df['Nucleus'] == 'stained').sum())
+    print(f"TOT CELLS = {total}  ({n_stained} with a stained nucleus, "
+          f"{total - n_stained} with the nucleus estimated from the cell body)")
+    if total == 0:
+        print("_" * 80)
+        return
+    print(f"LIVE/DEAD call: {attrs.get('rule_text', '')}")
+    print(f"  (positive = marker covers >= {100 * attrs.get('min_positive_fraction', 0):.0f}% "
+          "of its compartment: nucleus for nuclear, whole cell for cytoplasmic markers)")
+    print(" ")
+    counts = ld_cells_df['Status'].value_counts()
+    for status in ('LIVE', 'DEAD'):
+        n = int(counts.get(status, 0))
+        print(f"  {status:<5} = {n:>6} cells  ({100.0 * n / total:.1f} %)")
+    print(f"  VIABILITY = {100.0 * counts.get('LIVE', 0) / total:.1f} %")
+    print(" ")
+    print("  Marker combination -> call:")
+    for combo, sub in ld_cells_df.groupby('LIVE/DEAD markers', sort=False):
+        calls = ", ".join(f"{k} {v}" for k, v in sub['Status'].value_counts().items())
+        print(f"    {combo:<10} {len(sub):>6} cells -> {calls}")
+    print("_" * 80)
+
+    print("MARKER POSITIVITY:")
+    for cond in _ld_conditions(ld_cells_df):
+        marker = attrs.get('markers', {}).get(cond, '')
+        n_pos = int(ld_cells_df[f'{cond} positive'].sum())
+        print(f"  {cond} ({marker}, {loc.get(cond)}) = {100.0 * n_pos / total:.1f} %  "
+              f"({n_pos} cells)  |  mean coverage = {ld_cells_df[f'{cond} coverage'].mean():.2f}")
+    print("_" * 80)
+
+    for status in ('LIVE', 'DEAD'):
+        sub = ld_cells_df[ld_cells_df['Status'] == status]
+        if sub.empty:
+            continue
+        print(f"\n {status}  —  {len(sub)} cells  ({100.0 * len(sub) / total:.1f} %)")
+        _ld_stats_line(sub['Cell volume [um3]'], "   Cell volume", "um³")
+        _ld_stats_line(sub['Nucleus volume [um3]'], "   Nucleus volume (stained)", "um³")
+        for cond in _ld_conditions(ld_cells_df):
+            col = _ld_intensity_column(cond, loc.get(cond))
+            _ld_stats_line(sub[col], f"   {col}", "a.u.")
+    print("_" * 80)
+
+
+def _ld_status_colors(stain_complete_df):
+    colors = {}
+    for status, default in (('LIVE', 'green'), ('DEAD', 'red')):
+        if status in stain_complete_df.index:
+            colors[status] = _condition_color(status, stain_complete_df)
+        else:
+            colors[status] = default
+    return colors
+
+
+def plot_live_dead_classification(ld_cells_df, stain_complete_df, input_file=None,
+                                  output_dir=None, show=True):
+    """LD Cell 29: how the cells were called. Left: LIVE/DEAD counts. Right:
+    each cell's LIVE vs DEAD coverage (fraction of its compartment covered by
+    the marker), coloured by the call, with the positivity threshold as
+    dashed lines (a histogram of the coverage when only one of the two
+    channels is used). Saved as ``<file>_live_dead.png`` when *input_file*
+    is given."""
+    colors = _ld_status_colors(stain_complete_df)
+    thr = ld_cells_df.attrs.get('min_positive_fraction', 0.0)
+    total = len(ld_cells_df)
+    fig, (ax_bar, ax) = plt.subplots(1, 2, figsize=(14, 5.5),
+                                     gridspec_kw={'width_ratios': (1, 2.2)})
+
+    counts = ld_cells_df['Status'].value_counts()
+    statuses = ['LIVE', 'DEAD']
+    values = [int(counts.get(s, 0)) for s in statuses]
+    bars = ax_bar.bar(statuses, values, color=[colors[s] for s in statuses], edgecolor='black')
+    for bar, value in zip(bars, values):
+        pct = 100.0 * value / total if total else 0.0
+        ax_bar.annotate(f"{value}\n({pct:.1f} %)", (bar.get_x() + bar.get_width() / 2, value),
+                        ha='center', va='bottom', fontsize=10)
+    ax_bar.set_ylabel("Cells")
+    ax_bar.set_ylim(0, max(values + [1]) * 1.25)
+    ax_bar.set_title(f"LIVE/DEAD call ({total} cells)")
+
+    has = [c for c in ('LIVE', 'DEAD') if f'{c} coverage' in ld_cells_df.columns]
+    if len(has) == 2:
+        for status in statuses:
+            sub = ld_cells_df[ld_cells_df['Status'] == status]
+            ax.scatter(sub['LIVE coverage'], sub['DEAD coverage'], s=12, alpha=0.6,
+                       color=colors[status], edgecolors='none', label=f"{status} ({len(sub)})")
+        ax.axvline(thr, color='0.3', linestyle='--', linewidth=1.2)
+        ax.axhline(thr, color='0.3', linestyle='--', linewidth=1.2)
+        ax.set_xlabel("LIVE coverage (fraction of compartment)")
+        ax.set_ylabel("DEAD coverage (fraction of compartment)")
+        ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(-0.02, 1.02)
+    elif has:
+        cond = has[0]
+        bins = np.linspace(0, 1, 41)
+        for status in statuses:
+            sub = ld_cells_df[ld_cells_df['Status'] == status]
+            ax.hist(sub[f'{cond} coverage'], bins=bins, color=colors[status], alpha=0.6,
+                    label=f"{status} ({len(sub)})")
+        ax.axvline(thr, color='0.3', linestyle='--', linewidth=1.2)
+        ax.set_xlabel(f"{cond} coverage (fraction of compartment)")
+        ax.set_ylabel("Cells")
+    ax.set_title(f"Per-cell coverage -- positive >= {thr:.2f} (dashed)")
+    ax.grid(alpha=0.2)
+    ax.legend(title="Call", loc="upper right")
+    plt.tight_layout()
+    if input_file is not None:
+        png_path = _stem_output_path(input_file, "_live_dead.png", output_dir)
+        fig.savefig(png_path, dpi=150, bbox_inches="tight")
+        print(f"LIVE/DEAD plot saved to: {png_path}")
+    if show:
+        plt.show()
+    return fig, (ax_bar, ax)
+
+
+def plot_ld_spatial_distributions(ld_cells_df, stain_complete_df, volume_shape, r_zxyz, bins=30):
+    """LD Cell 27: where the LIVE and DEAD cells are along X, Y and Z (number of
+    cells, left axis) and the viability along each direction (% LIVE, dashed,
+    right axis) -- e.g. viability vs depth in a 3D construct."""
+    colors = _ld_status_colors(stain_complete_df)
+    r_zX, r_zY, r_zZ = r_zxyz
+    extents = {'X': volume_shape[2] * r_zX, 'Y': volume_shape[1] * r_zY, 'Z': volume_shape[0] * r_zZ}
+    fig, axs = plt.subplots(3, 1, figsize=(15, 15))
+    for ax, axis_name in zip(axs, 'XYZ'):
+        edges = np.linspace(0, extents[axis_name], bins + 1)
+        centers = (edges[:-1] + edges[1:]) / 2
+        counts = {}
+        for status in ('LIVE', 'DEAD'):
+            values = ld_cells_df.loc[ld_cells_df['Status'] == status, f'{axis_name} [um]']
+            counts[status], _ = np.histogram(values, bins=edges)
+            ax.plot(centers, counts[status], color=colors[status], label=f'{status} cells')
+        total = counts['LIVE'] + counts['DEAD']
+        with np.errstate(invalid='ignore', divide='ignore'):
+            viability = np.where(total > 0, 100.0 * counts['LIVE'] / total, np.nan)
+        tax = ax.twinx()
+        tax.plot(centers, viability, color='white', linestyle='--', marker='o', markersize=3,
+                 label='Viability (% LIVE)')
+        tax.set_ylim(0, 105)
+        tax.set_ylabel("Viability [%]")
+        ax.set_title(f"LIVE/DEAD {axis_name} DISTRIBUTION")
+        ax.set_xlabel("[μm]")
+        ax.set_ylabel("Cell count")
+        ax.set_facecolor("black")
+        handles, names = ax.get_legend_handles_labels()
+        t_handles, t_names = tax.get_legend_handles_labels()
+        tax.legend(handles + t_handles, names + t_names, loc="upper right", fontsize="small")
+    return fig, axs
+
+
+def plot_ld_size_distributions(ld_cells_df, stain_complete_df, bins=30):
+    """LD Cell 28: cell volume and (stained) nucleus volume of the LIVE and
+    DEAD cells."""
+    colors = _ld_status_colors(stain_complete_df)
+    fig, axs = plt.subplots(2, 1, figsize=(15, 10))
+    for ax, col, title in ((axs[0], 'Cell volume [um3]', 'CELL SIZE DISTRIBUTION'),
+                           (axs[1], 'Nucleus volume [um3]', 'NUCLEUS SIZE DISTRIBUTION (stained nuclei)')):
+        values = ld_cells_df[col].dropna()
+        if values.empty:
+            ax.text(0.5, 0.5, "no data", ha='center', va='center', transform=ax.transAxes)
+        else:
+            edges = np.linspace(0, float(values.max()), bins + 1)
+            for status in ('LIVE', 'DEAD'):
+                sub = ld_cells_df.loc[ld_cells_df['Status'] == status, col].dropna()
+                if len(sub):
+                    ax.hist(sub, bins=edges, color=colors[status], alpha=0.5,
+                            label=f"{status} ({len(sub)})")
+            ax.legend(loc="upper right")
+        ax.set_title(title)
+        ax.set_xlabel("[μm3]")
+        ax.set_ylabel("Cells")
+    return fig, axs
+
+
+def export_live_dead_to_excel(input_file, original_stain_complete_df, ld_cells_df,
+                              parameters=None, output_dir=None):
+    """LD Cell 34: write the LIVE/DEAD results to ``<file>_live_dead.xlsx``
+    (next to *input_file*, or inside *output_dir*):
+
+    * **Summary** -- the call (counts, %, viability, settings) and the
+      population table (LIVE, DEAD, ALL: size, positivity, intensity).
+    * **Cells** -- one row per cell (``ld_cells_df``).
+    * **Setup** -- stain table with each marker's localization, and the
+      parameters (*parameters*, a dict).
+
+    Returns
+    -------
+    output_path : str
+    """
+    from pathlib import Path as _Path
+
+    if output_dir is not None:
+        output_path = _stem_output_path(input_file, '_live_dead.xlsx', output_dir)
+    else:
+        output_path = (_Path(input_file).parent / _image_stem(input_file)).as_posix() + '_live_dead.xlsx'
+
+    attrs = ld_cells_df.attrs
+    total = len(ld_cells_df)
+    counts = ld_cells_df['Status'].value_counts()
+    n_live, n_dead = int(counts.get('LIVE', 0)), int(counts.get('DEAD', 0))
+    summary_rows = [
+        ('Total cells', total),
+        ('LIVE cells', n_live),
+        ('DEAD cells', n_dead),
+        ('LIVE [%]', round(100.0 * n_live / total, 2) if total else ''),
+        ('DEAD [%]', round(100.0 * n_dead / total, 2) if total else ''),
+        ('Viability [%]', round(100.0 * n_live / total, 2) if total else ''),
+        ('Cells with a stained nucleus', int((ld_cells_df['Nucleus'] == 'stained').sum())),
+        ('Cells with an estimated nucleus', int((ld_cells_df['Nucleus'] == 'estimated').sum())),
+        ('Call rule', attrs.get('rule_text', '')),
+        ('Positive = coverage of compartment >=', attrs.get('min_positive_fraction', '')),
+    ]
+    for combo, n in ld_cells_df['LIVE/DEAD markers'].value_counts().items():
+        summary_rows.append((f'Markers: {combo}', int(n)))
+    summary_df = pd.DataFrame(summary_rows, columns=['Item', 'Value'])
+    status_table = _ld_status_table(ld_cells_df).reset_index()
+
+    setup = original_stain_complete_df.copy()
+    setup.insert(0, 'Localization', [attrs.get('localization', {}).get(str(c), '') for c in setup.index])
+    setup = setup.reset_index()
+    params_df = pd.DataFrame(list((parameters or {}).items()), columns=['Parameter', 'Value'])
+    params_df['Value'] = params_df['Value'].astype(str)
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        wb = writer.book
+        title_fmt = wb.add_format({'bold': True, 'font_size': 12})
+        live_fmt = wb.add_format({'bg_color': '#C6EFCE'})
+        dead_fmt = wb.add_format({'bg_color': '#FFC7CE'})
+
+        summary_df.to_excel(writer, sheet_name='Summary', index=False, startrow=1)
+        start = len(summary_df) + 4
+        status_table.to_excel(writer, sheet_name='Summary', index=False, startrow=start)
+        ws = writer.sheets['Summary']
+        ws.write(0, 0, 'LIVE/DEAD CALL', title_fmt)
+        ws.write(start - 1, 0, 'POPULATIONS', title_fmt)
+        ws.set_column(0, 0, 38)
+        ws.set_column(1, status_table.shape[1], 18)
+
+        cells_out = ld_cells_df.reset_index()
+        cells_out.to_excel(writer, sheet_name='Cells', index=False)
+        ws = writer.sheets['Cells']
+        ws.set_column(0, cells_out.shape[1], 16)
+        ws.freeze_panes(1, 1)
+        if total:
+            col = cells_out.columns.get_loc('Status')
+            for value, fmt in (('LIVE', live_fmt), ('DEAD', dead_fmt)):
+                ws.conditional_format(1, col, total, col, {
+                    'type': 'cell', 'criteria': '==', 'value': f'"{value}"', 'format': fmt,
+                })
+
+        setup.to_excel(writer, sheet_name='Setup', index=False, startrow=1)
+        p_start = len(setup) + 4
+        params_df.to_excel(writer, sheet_name='Setup', index=False, startrow=p_start)
+        ws = writer.sheets['Setup']
+        ws.write(0, 0, 'STAIN TABLE', title_fmt)
+        ws.write(p_start - 1, 0, 'PARAMETERS', title_fmt)
+        ws.set_column(0, 0, 32)
+        ws.set_column(1, setup.shape[1], 16)
+
+    print(f"LIVE/DEAD report saved to: {output_path}")
+    return output_path
+
+
+def _ld_parameters(
+    nuclei_diameter, cell_diameter, cyto_factor, PCM_factor, trig_cellpose,
+    trig_stardist, trig_cellpose_cyto, localization, min_positive_fraction,
+    ld_rule, size_reference, iterative_split, oversize_factor,
+    max_split_iterations, merge_undersized, undersize_factor,
+):
+    loc = _ld_localization_map(localization)
+    return {
+        'Nuclei diameter (um)': nuclei_diameter,
+        'Cell diameter (um)': cell_diameter,
+        'Cyto factor': cyto_factor,
+        'PCM factor': PCM_factor,
+        'Use Cellpose (nuclei)': trig_cellpose,
+        'Use StarDist (nuclei)': trig_stardist,
+        'Use Cellpose (cell bodies)': trig_cellpose_cyto,
+        'Nuclear markers': [c for c, v in loc.items() if v == 'nuclear'],
+        'Cytoplasmic markers': [c for c, v in loc.items() if v == 'cytoplasmic'],
+        'Min positive fraction': min_positive_fraction,
+        'LIVE/DEAD rule': ld_rule,
+        'Size reference': size_reference,
+        'Iterative split': iterative_split,
+        'Oversize factor': oversize_factor,
+        'Max split iterations': max_split_iterations,
+        'Merge undersized': merge_undersized,
+        'Undersize factor': undersize_factor,
+    }
+
+
+def _process_single_image_ld_batch(
+    input_file,
+    output_dir,
+    roi_coords,
+    stain_dict,
+    localization,
+    name_setup,
+    use_setup,
+    automatic_contrast,
+    interactive_roi,
+    nuclei_diameter,
+    cell_diameter,
+    scale_factor,
+    zoom_factors,
+    trig_cellpose,
+    trig_stardist,
+    trig_cellpose_cyto,
+    multilabel,
+    aggregate_grow_factor,
+    min_positive_fraction,
+    ld_rule,
+    iterative_split,
+    oversize_factor,
+    max_split_iterations,
+    merge_undersized,
+    undersize_factor,
+    size_reference,
+    sigma,
+    num_plateaus,
+    plateau_factor,
+    threshold_method,
+    export_vtk,
+    export_stl,
+    export_fea,
+    settings,
+    napari_module,
+    progress,
+):
+    """Run the LIVE/DEAD notebook (Cells 4-35) on one file, without viewers,
+    inline plots or PNG subfolders, writing every output file into
+    *output_dir*. Returns this image's LIVE/DEAD counts."""
+    roi = list(roi_coords)
+    if interactive_roi:
+        roi = select_roi_interactively(input_file, roi, napari_module=napari_module)
+
+    # Cell 4
+    (meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
+     cyto_factor, PCM_factor, zooms, used_lazy_loading) = initialize_dataset(
+        input_file, roi,
+        nuclei_diameter=nuclei_diameter,
+        cell_diameter=cell_diameter,
+        scale_factor=scale_factor,
+        zoom_factors=list(zoom_factors),
+    )
+
+    # Cells 6-7
+    im_final_stack, _, _, _, _, stain_df, _ = prepare_and_preview(
+        img,
+        nuclei_diameter, cell_diameter,
+        stain_dict, file_meta,
+        napari_module=napari_module, r_xyz=(r_X, r_Y, r_Z), progress=progress,
+        show_viewer=False,
+    )
+    del img
+    stain_df, stain_complete_df, original_stain_complete_df = prepare_stain_settings(
+        im_final_stack['Original image'],
+        stain_df=stain_df,
+        name_setup=name_setup,
+        use_setup=use_setup,
+        automatic_contrast=automatic_contrast,
+        settings=settings,
+        napari_module=napari_module,
+        r_xyz=(r_X, r_Y, r_Z),
+        progress=progress,
+    )
+
+    # Cells 9-15
+    nuclear_conditions = [c for c, v in _ld_localization_map(localization).items() if v == 'nuclear']
+    im_final_stack = run_normalize(im_final_stack, stain_complete_df=stain_complete_df)
+    im_final_stack, r_zX, r_zY, r_zZ = run_resample(
+        im_final_stack, stain_complete_df=stain_complete_df, zoom_factors=zooms, meta=meta,
+    )
+    im_final_stack = run_denoise(im_final_stack, stain_complete_df=stain_complete_df)
+    im_final_stack = run_contrast_gamma(im_final_stack, stain_complete_df=stain_complete_df)
+    im_final_stack = run_smooth(im_final_stack, stain_complete_df=stain_complete_df, sigma=sigma)
+    im_final_stack = run_equalize(
+        im_final_stack, stain_complete_df=stain_complete_df,
+        num_plateaus=num_plateaus, plateau_factor=plateau_factor,
+    )
+    im_final_stack = run_threshold(
+        im_final_stack,
+        stain_complete_df=stain_complete_df,
+        nuclei_diameter=nuclei_diameter,
+        cell_diameter=cell_diameter,
+        r_zX=r_zX, r_zY=r_zY, r_zZ=r_zZ,
+        threshold_method=threshold_method,
+        nuclear_conditions=nuclear_conditions,
+        progress=progress,
+    )
+
+    # Cell 16
+    ld_params = _ld_parameters(
+        nuclei_diameter, cell_diameter, cyto_factor, PCM_factor, trig_cellpose,
+        trig_stardist, trig_cellpose_cyto, localization, min_positive_fraction,
+        ld_rule, size_reference, iterative_split, oversize_factor,
+        max_split_iterations, merge_undersized, undersize_factor,
+    )
+    export_channel_histograms(
+        im_final_stack, stain_complete_df, input_file,
+        ROI_print=ROI_print, lazy_loading_used=used_lazy_loading,
+        name_setup=name_setup,
+        nuclei_diameter=nuclei_diameter, cell_diameter=cell_diameter,
+        cyto_factor=cyto_factor, PCM_factor=PCM_factor,
+        zoom_factors=zooms, scale_factor=scale_factor,
+        trig_cellpose=trig_cellpose, trig_stardist=trig_stardist,
+        trig_cellpose_cyto=trig_cellpose_cyto,
+        multilabel=multilabel,
+        sigma=sigma, num_plateaus=num_plateaus, plateau_factor=plateau_factor,
+        threshold_method=threshold_method,
+        aggregate_grow_factor=aggregate_grow_factor,
+        progress=progress,
+        output_dir=output_dir,
+        extra_params=ld_params,
+    )
+
+    # Cells 17-21
+    size_kwargs = dict(
+        iterative_split=iterative_split,
+        oversize_factor=oversize_factor,
+        max_split_iterations=max_split_iterations,
+        merge_undersized=merge_undersized,
+        undersize_factor=undersize_factor,
+        size_reference=size_reference,
+        progress=progress,
+    )
+    im_segmentation_stack = segment_ld_nuclei(
+        im_final_stack,
+        stain_df=stain_df,
+        localization=localization,
+        r_zxyz=(r_zX, r_zY, r_zZ),
+        nuclei_diameter=nuclei_diameter,
+        trig_stardist=trig_stardist,
+        trig_cellpose=trig_cellpose,
+        **size_kwargs,
+    )
+    im_segmentation_stack, stain_complete_df = segment_ld_cells(
+        im_final_stack,
+        im_segmentation_stack=im_segmentation_stack,
+        stain_df=stain_df,
+        stain_complete_df=stain_complete_df,
+        localization=localization,
+        r_zxyz=(r_zX, r_zY, r_zZ),
+        nuclei_diameter=nuclei_diameter,
+        cell_diameter=cell_diameter,
+        trig_cellpose_cyto=trig_cellpose_cyto,
+        **size_kwargs,
+    )
+    im_segmentation_stack = segment_ld_pcm(
+        im_segmentation_stack, cyto_factor=cyto_factor, PCM_factor=PCM_factor,
+    )
+    im_segmentation_stack, ld_cells_df = classify_live_dead(
+        im_final_stack,
+        im_segmentation_stack=im_segmentation_stack,
+        stain_df=stain_df,
+        localization=localization,
+        r_zxyz=(r_zX, r_zY, r_zZ),
+        min_positive_fraction=min_positive_fraction,
+        ld_rule=ld_rule,
+        progress=progress,
+    )
+    im_segmentation_stack = detect_aggregates(
+        im_segmentation_stack,
+        stain_df=stain_complete_df,
+        aggregate_grow_factor=aggregate_grow_factor,
+    )
+
+    # _context() looks at this module's globals first, which may still hold
+    # the previous image's tables -- register this image's before quantifying.
+    set_notebook_context(stain_df=stain_df, stain_complete_df=stain_complete_df)
+
+    # Cells 23 and 25
+    percell_mean_df, percell_std_df = compute_percell_marker_intensity_df(
+        im_segmentation_stack, im_final_stack,
+        stain_complete_df=stain_complete_df,
+        progress=progress,
+    )
+    labels_full_df = build_full_labels_df(
+        im_segmentation_stack, im_final_stack,
+        stain_complete_df=stain_complete_df,
+        r_zX=r_zX, r_zY=r_zY, r_zZ=r_zZ,
+        zooms=zooms,
+        percell_mean_df=percell_mean_df,
+        percell_std_df=percell_std_df,
+        progress=progress,
+    )
+
+    # Cells 29-30 -- saved as PNG only, not displayed
+    plot_live_dead_classification(
+        ld_cells_df, stain_complete_df,
+        input_file=input_file, output_dir=output_dir, show=False,
+    )
+    plot_marker_intensity_clouds(
+        percell_mean_df,
+        stain_complete_df=stain_complete_df,
+        im_segmentation_stack=im_segmentation_stack,
+        r_xyz=(r_zX, r_zY, r_zZ),
+        stain_df=stain_df,
+        progress=progress,
+        input_file=input_file,
+        output_dir=output_dir,
+        show=False,
+    )
+    plt.close("all")
+
+    # Cell 34 (written first: it is the main result and the cheapest export)
+    export_live_dead_to_excel(
+        input_file, original_stain_complete_df, ld_cells_df,
+        parameters=ld_params, output_dir=output_dir,
+    )
+
+    # Cell 26 -- PDF only, PNGs go to a temporary folder
+    build_histogram_report(
+        im_segmentation_stack, im_final_stack,
+        stain_df=stain_df,
+        stain_complete_df=stain_complete_df,
+        input_file=input_file,
+        progress=progress,
+        output_dir=output_dir,
+        keep_png=False,
+        show_plot=False,
+    )
+
+    # Cells 31, 32, 35
+    if export_vtk:
+        build_vtk_volumes(
+            im_segmentation_stack,
+            labels_full_df=labels_full_df,
+            stain_complete_df=stain_complete_df,
+            input_file=input_file,
+            r_xyz=(r_X, r_Y, r_Z),
+            zoom_factors=zooms,
+            progress=progress,
+            output_dir=output_dir,
+            live_counter=False,
+        )
+    if export_stl:
+        export_marker_stl(
+            im_segmentation_stack,
+            stain_df=stain_df,
+            stain_complete_df=stain_complete_df,
+            input_file=input_file,
+            r_xyz=(r_X, r_Y, r_Z),
+            zoom_factors=zooms,
+            progress=progress,
+            output_dir=output_dir,
+        )
+    if export_fea:
+        export_fea_mesh(
+            {'Nuclei': im_segmentation_stack['Cytoplasm']},
+            input_file=input_file,
+            progress=progress,
+            output_dir=output_dir,
+        )
+
+    counts = ld_cells_df['Status'].value_counts()
+    n_cells = len(ld_cells_df)
+    return {
+        'Cells': n_cells,
+        'LIVE': int(counts.get('LIVE', 0)),
+        'DEAD': int(counts.get('DEAD', 0)),
+        'Viability [%]': round(100.0 * counts.get('LIVE', 0) / n_cells, 2) if n_cells else np.nan,
+    }
+
+
+def run_ld_batch_folder(
+    input_folder,
+    roi_coords,
+    stain_dict,
+    localization,
+    name_setup,
+    use_setup=True,
+    automatic_contrast=False,
+    interactive_roi=False,
+    nuclei_diameter=10.0,
+    cell_diameter=30.0,
+    scale_factor=1.0,
+    zoom_factors=None,
+    trig_cellpose=False,
+    trig_stardist=False,
+    trig_cellpose_cyto=False,
+    multilabel=True,
+    aggregate_grow_factor=2.0,
+    min_positive_fraction=0.2,
+    ld_rule="dead_priority",
+    iterative_split=True,
+    oversize_factor=2.0,
+    max_split_iterations=3,
+    merge_undersized=True,
+    undersize_factor=0.5,
+    size_reference="blend",
+    sigma=0.5,
+    num_plateaus=2,
+    plateau_factor=0.7,
+    threshold_method='otsu',
+    export_vtk=True,
+    export_stl=True,
+    export_fea=True,
+    settings=None,
+    napari_module=None,
+    progress=None,
+):
+    """Process every supported image file in *input_folder* with the full
+    LIVE/DEAD pipeline and write each image's outputs into its own
+    subfolder, ``<input_folder>_output/<image stem>/`` -- the LD counterpart
+    of `run_batch_folder` (same rules for the contrast setup, failed files
+    and outputs).
+
+    Returns
+    -------
+    summary : DataFrame
+        One row per file: status ('OK'/'FAILED'), cells, LIVE, DEAD,
+        viability, output subfolder and error message. Also saved as
+        ``live_dead_batch_summary.xlsx`` in the output folder.
+    """
+    import traceback
+
+    image_files = list_image_files(input_folder)
+    if not image_files:
+        raise FileNotFoundError(
+            f"No supported image files ({', '.join(SUPPORTED_IMAGE_EXTENSIONS)}) "
+            f"found in {input_folder}"
+        )
+
+    output_dir = get_batch_output_dir(input_folder)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if zoom_factors is None:
+        zoom_factors = [1.0, 1.0, 1.0]
+
+    print(f"Batch mode: {len(image_files)} image file(s) found in {input_folder}")
+    print(f"Outputs are written to: {output_dir}")
+
+    results = []
+    for n, image_path in enumerate(image_files, start=1):
+        print("\n" + "=" * 80)
+        print(f"[{n}/{len(image_files)}] {image_path.name}")
+        print("=" * 80)
+        image_output_dir = output_dir / _image_stem(image_path)
+        row = {'File': image_path.name, 'Status': 'OK', 'Cells': np.nan, 'LIVE': np.nan,
+               'DEAD': np.nan, 'Viability [%]': np.nan,
+               'Output folder': str(image_output_dir), 'Error': ''}
+        try:
+            image_output_dir.mkdir(parents=True, exist_ok=True)
+            row.update(_process_single_image_ld_batch(
+                str(image_path),
+                image_output_dir,
+                roi_coords=roi_coords,
+                stain_dict=stain_dict,
+                localization=localization,
+                name_setup=name_setup,
+                use_setup=use_setup,
+                automatic_contrast=automatic_contrast,
+                interactive_roi=interactive_roi,
+                nuclei_diameter=nuclei_diameter,
+                cell_diameter=cell_diameter,
+                scale_factor=scale_factor,
+                zoom_factors=zoom_factors,
+                trig_cellpose=trig_cellpose,
+                trig_stardist=trig_stardist,
+                trig_cellpose_cyto=trig_cellpose_cyto,
+                multilabel=multilabel,
+                aggregate_grow_factor=aggregate_grow_factor,
+                min_positive_fraction=min_positive_fraction,
+                ld_rule=ld_rule,
+                iterative_split=iterative_split,
+                oversize_factor=oversize_factor,
+                max_split_iterations=max_split_iterations,
+                merge_undersized=merge_undersized,
+                undersize_factor=undersize_factor,
+                size_reference=size_reference,
+                sigma=sigma,
+                num_plateaus=num_plateaus,
+                plateau_factor=plateau_factor,
+                threshold_method=threshold_method,
+                export_vtk=export_vtk,
+                export_stl=export_stl,
+                export_fea=export_fea,
+                settings=settings,
+                napari_module=napari_module,
+                progress=progress,
+            ))
+        except Exception as exc:
+            traceback.print_exc()
+            print(f"[run_ld_batch_folder] {image_path.name} FAILED -- continuing with the next file.")
+            row['Status'] = 'FAILED'
+            row['Error'] = f"{type(exc).__name__}: {exc}"
+        finally:
+            plt.close("all")
+            gc.collect()
+        results.append(row)
+
+    summary = pd.DataFrame(results)
+    try:
+        summary_path = output_dir / 'live_dead_batch_summary.xlsx'
+        summary.to_excel(summary_path, index=False)
+        print(f"Batch summary saved to: {summary_path}")
+    except Exception as exc:
+        print(f"[run_ld_batch_folder] Could not save the batch summary: {exc}")
     n_ok = int((summary["Status"] == "OK").sum())
     print("\n" + "=" * 80)
     print(f"Batch finished: {n_ok}/{len(summary)} file(s) processed successfully.")
