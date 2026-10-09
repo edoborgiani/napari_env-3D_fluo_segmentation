@@ -10373,11 +10373,15 @@ def _ld_single_channel_df(marker):
 # labels) with every size measured as an area.
 
 _LD_SPLIT_LEVELS_2D = (
-    # (name, peak spacing as a fraction of the radius, intensity weight)
-    ("aggressive", 0.4, 1.0),
-    ("very aggressive", 0.3, 1.5),
-    ("extreme", 0.2, 2.0),
+    # (name, peak spacing as a fraction of the radius, intensity weight,
+    #  minimum intensity dip between two seeds)
+    ("aggressive", 0.4, 1.0, 0.06),
+    ("very aggressive", 0.3, 1.5, 0.04),
+    ("extreme", 0.2, 2.0, 0.02),
 )
+# First pass: two intensity maxima become separate seeds when the signal
+# between them dips by at least this fraction of the object's intensity range.
+_LD_INTENSITY_DIP_2D = 0.1
 
 
 def _ld_edt(region, spacing):
@@ -10402,31 +10406,70 @@ def _ld_disk_area_px(diameter_um, pixel_yx):
 
 
 def _ld_watershed_2d(mask, intensity, pixel_yx, diameter_um, peak_fraction=0.5,
-                     intensity_weight=0.5):
-    """Split a 2D mask into objects of about *diameter_um*: one marker per
-    peak of the distance map (peaks at least ``peak_fraction`` x the radius
-    apart, and at least one per island), flooded on a surface combining the
-    distance and the intensity, so touching objects split along the dimmer
-    seam between them."""
+                     intensity_weight=1.0, intensity_dip=_LD_INTENSITY_DIP_2D):
+    """Split a 2D mask into objects of about *diameter_um* and flood them on
+    a surface combining the distance and the intensity, so touching objects
+    split along the dimmer seam between them.
+
+    Seeds, per island of the mask:
+
+    - **intensity maxima**: when the island holds two or more maxima of the
+      (smoothed) intensity separated by a dip of at least ``intensity_dip``
+      x the intensity range inside the mask (the object itself, when a
+      single label is re-split), each maximum is a seed. Touching cells
+      that form one round blob have a single distance peak but one bright
+      centre each, so this is what splits them; a higher split gamma deepens
+      the dips and gives more seeds;
+    - otherwise **distance peaks**: one per peak of the distance map (at
+      least ``peak_fraction`` x the radius apart), at least one per island.
+    """
+    from skimage.morphology import h_maxima
+
     mask = np.asarray(mask, dtype=bool)
     labels = np.zeros(mask.shape, dtype=np.int32)
     if not mask.any():
         return labels
     radius_px = diameter_um / 2.0 / float(np.mean(pixel_yx))
     distance = ndi.gaussian_filter(_ld_edt(mask, pixel_yx), sigma=1.0)
+    smoothed = ndi.gaussian_filter(np.asarray(intensity, dtype=np.float32), sigma=1.0)
     islands, n_islands = ndi.label(mask)
+
+    # Intensity maxima separated by a dip of at least intensity_dip, per island.
+    inten_norm = np.where(mask, _ld_norm_in_mask(smoothed, mask), 0.0)
+    maxima, n_max = ndi.label(h_maxima(inten_norm.astype(np.float64), float(intensity_dip)) > 0)
+    maxima[~mask] = 0
+    max_island = np.zeros(n_max + 1, dtype=np.int64)
+    if n_max:
+        max_island[1:] = np.asarray(
+            ndi.maximum(islands, labels=maxima, index=np.arange(1, n_max + 1)), dtype=np.int64
+        )
+    maxima_per_island = np.bincount(max_island[1:], minlength=n_islands + 1)
+    use_intensity = maxima_per_island >= 2
+    use_intensity[0] = False
+
+    markers = np.zeros(mask.shape, dtype=np.int32)
+    next_id = 1
+    if n_max:
+        lut = np.zeros(n_max + 1, dtype=np.int32)
+        for k in range(1, n_max + 1):
+            if use_intensity[max_island[k]]:
+                lut[k] = next_id
+                next_id += 1
+        markers = lut[maxima]
+
+    # Distance peaks for the islands without several intensity maxima.
     peaks = peak_local_max(
         distance,
         min_distance=max(1, int(round(peak_fraction * radius_px))),
         labels=islands,
         exclude_border=False,
     )
-    markers = np.zeros(mask.shape, dtype=np.int32)
-    if len(peaks):
-        markers[tuple(np.asarray(peaks).T)] = np.arange(1, len(peaks) + 1, dtype=np.int32)
+    for coord in np.asarray(peaks).reshape(-1, 2):
+        if not use_intensity[islands[tuple(coord)]]:
+            markers[tuple(coord)] = next_id
+            next_id += 1
     has_marker = np.zeros(n_islands + 1, dtype=bool)
     has_marker[np.unique(islands[markers > 0])] = True
-    next_id = len(peaks) + 1
     island_slices = ndi.find_objects(islands)
     for i in np.flatnonzero(~has_marker[1:]) + 1:
         sl = island_slices[i - 1]
@@ -10434,7 +10477,6 @@ def _ld_watershed_2d(mask, intensity, pixel_yx, diameter_um, peak_fraction=0.5,
         pos = np.unravel_index(int(np.argmax(local)), local.shape)
         markers[sl][pos] = next_id
         next_id += 1
-    smoothed = ndi.gaussian_filter(np.asarray(intensity, dtype=np.float32), sigma=1.0)
     elevation = -(_ld_norm_in_mask(distance, mask)
                   + intensity_weight * _ld_norm_in_mask(smoothed, mask))
     return watershed(elevation, markers, mask=mask).astype(np.int32)
@@ -10488,7 +10530,7 @@ def _ld_split_oversized_2d(labels, intensity, pixel_yx, reference_px, oversize_f
     next_id = int(labels.max()) + 1
     n_levels = int(np.clip(max_iterations, 1, len(_LD_SPLIT_LEVELS_2D)))
     for level in range(n_levels):
-        name, peak_fraction, weight = _LD_SPLIT_LEVELS_2D[level]
+        name, peak_fraction, weight, dip = _LD_SPLIT_LEVELS_2D[level]
         gamma = level_gammas[min(level, len(level_gammas) - 1)] if level_gammas else None
         areas = np.bincount(labels.ravel())
         big = np.flatnonzero(areas > oversize_factor * reference_px)
@@ -10505,7 +10547,8 @@ def _ld_split_oversized_2d(labels, intensity, pixel_yx, reference_px, oversize_f
             region = labels[sl] == lab
             parts = _ld_watershed_2d(region, apply_split_gamma(intensity[sl], gamma),
                                      pixel_yx, ref_diameter,
-                                     peak_fraction=peak_fraction, intensity_weight=weight)
+                                     peak_fraction=peak_fraction, intensity_weight=weight,
+                                     intensity_dip=dip)
             ids = np.unique(parts[parts > 0])
             if ids.size < 2:
                 continue
@@ -10749,14 +10792,19 @@ def _ld_union_slices(slices):
 
 
 def _ld_combine_nuclei_and_bodies(nuclei, bodies, spacing, nuclei_diameter,
-                                  min_nucleus_overlap=0.5, progress=None):
+                                  min_nucleus_overlap=0.5, progress=None,
+                                  body_intensity=None):
     """Combine the nuclei (nuclear markers) and the cell bodies (cytoplasmic
     markers) into one label per cell:
 
     - a nucleus lying for at least ``min_nucleus_overlap`` of its volume in a
       cell body belongs to that cell;
-    - a body holding two or more nuclei is split between them (watershed on
-      the distance map, seeded by the nuclei);
+    - a body holding two or more nuclei is split between them by a watershed
+      seeded by the nuclei. With ``body_intensity`` (the cytoplasmic signal,
+      gamma-adjusted by the caller) the border follows the cytoplasm, as in
+      the nuclei notebook's cytoplasm split (`_gradient_watershed_elevation`:
+      distance + dim signal + steep intensity change); without it, the
+      distance map alone;
     - a nucleus outside every body is a cell without stained cytoplasm: the
       cell is the nucleus;
     - a body with no nucleus is a cell whose nucleus is not stained: its
@@ -10828,7 +10876,17 @@ def _ld_combine_nuclei_and_bodies(nuclei, bodies, spacing, nuclei_diameter,
         for k, n in enumerate(owned, start=1):
             markers[nuc_sub == n] = k
         region = body | (markers > 0)
-        parts = watershed(-_ld_edt(region, spacing), markers, mask=region)
+        if body_intensity is not None:
+            # Padded by one voxel so the crop edge isn't taken as inside the body.
+            inner = tuple(slice(1, -1) for _ in range(region.ndim))
+            region_p = np.pad(region, 1)
+            elevation = _gradient_watershed_elevation(
+                [np.pad(np.asarray(body_intensity[sl], dtype=np.float32), 1, mode='edge')],
+                region_p, spacing=spacing,
+            )
+            parts = watershed(elevation, np.pad(markers, 1), mask=region_p)[inner]
+        else:
+            parts = watershed(-_ld_edt(region, spacing), markers, mask=region)
         for k in range(1, len(owned) + 1):
             cell_view[parts == k] = next_id
             nuc_view[markers == k] = next_id
@@ -10921,7 +10979,8 @@ def segment_ld_cells(
     refinement; Cellpose 'cyto3' with ``trig_cellpose_cyto``), with the same
     ``split_gamma`` / ``split_gamma_step`` as the nuclei (Cell 17). Nuclei and
     bodies are then combined (`_ld_combine_nuclei_and_bodies`): a body with
-    several nuclei is split between them, a nucleus outside every body is a
+    several nuclei is split between them along the cytoplasm border (the
+    cytoplasmic intensity with ``split_gamma``), a nucleus outside every body is a
     cell on its own, and a body without a stained nucleus gets an estimated
     one (a nucleus-sized sphere at its centre).
 
@@ -10947,6 +11006,11 @@ def segment_ld_cells(
         print(f"Cell bodies segmented from the cytoplasmic marker(s): "
               f"{_ld_marker_names(stain_df, cytoplasmic)}")
         merged = _ld_merged_substack(im_final_stack, cytoplasmic)
+        # Cytoplasmic signal (with the first-pass split gamma) used to split a
+        # body between several nuclei along the cytoplasm border.
+        body_intensity = apply_split_gamma(
+            merged['Filtered image'][..., 0], _ld_split_gammas(split_gamma, split_gamma_step)[0]
+        )
         if is_2d:
             bodies = _ld_segment_objects_2d(
                 merged['Threshold image'][0, ..., 0] > 0,
@@ -11026,6 +11090,7 @@ def segment_ld_cells(
     else:
         print("No cytoplasmic marker: each cell is its stained nucleus.")
         bodies = np.zeros_like(nuclei)
+        body_intensity = None
 
     if is_2d:
         # Combine in the image plane (a 3D distance map would see the empty
@@ -11036,6 +11101,7 @@ def segment_ld_cells(
             nuclei_diameter=nuclei_diameter,
             min_nucleus_overlap=min_nucleus_overlap,
             progress=progress,
+            body_intensity=None if body_intensity is None else body_intensity[0],
         )
         cells, nuclei_out, stained = (a[np.newaxis] for a in (cells, nuclei_out, stained))
     else:
@@ -11045,7 +11111,9 @@ def segment_ld_cells(
             nuclei_diameter=nuclei_diameter,
             min_nucleus_overlap=min_nucleus_overlap,
             progress=progress,
+            body_intensity=body_intensity,
         )
+    del body_intensity
     n_cells = info['cells']
     n_both = n_cells - info['estimated nuclei'] - info['nucleus only']
     print(f"{info['nuclei']} nuclei + {info['bodies']} cell bodies -> {n_cells} cells:")
