@@ -126,8 +126,10 @@ __all__ = [
     "StainDictEditor",
     "StainTableNotConfirmed",
     "run_batch_folder",
-    # LIVE/DEAD notebook (Fluo_3D_LD_seg v1.2.1)
+    # Splitting improvements (LD v1.2.1, nuclei v1.6.3)
     "apply_split_gamma",
+    "absorb_small_split_pieces",
+    # LIVE/DEAD notebook (Fluo_3D_LD_seg v1.2.1)
     "LDStainDictEditor",
     "edit_ld_stain_dict",
     "segment_ld_nuclei",
@@ -3080,8 +3082,22 @@ def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None, is_2d=F
     return labels_df, truncated_df
 
 
+def _volume_column_names(df):
+    """``(df, is_2d)``: a labels table built with ``is_2d=True`` has its size
+    columns as '[um2]' (areas). They are renamed back to the '[um3]' names
+    the readers below use, and ``is_2d`` tells them to label areas."""
+    is_2d = any("[um2]" in str(c) for c in df.columns)
+    if is_2d:
+        df = df.rename(columns={c: str(c).replace("[um2]", "[um3]")
+                                for c in df.columns if "[um2]" in str(c)})
+    return df, is_2d
+
+
 def print_population_summary(labels_df, stain_complete_df, stain_df, progress=None):
     """Print the compact summary block used in the analysis section.
+
+    Sizes are areas (um²) when ``labels_df`` comes from a 2D image
+    (``build_labels_df(..., is_2d=True)``), volumes (um³) otherwise.
 
     When ``labels_df`` was built with ``percell_mean_df`` (see
     ``build_labels_df`` / ``compute_percell_marker_intensity_df``), prints a
@@ -3092,6 +3108,9 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
     combination rows, since that column only exists for single marker
     channels.
     """
+    labels_df, is_2d = _volume_column_names(labels_df)
+    size_unit = "um²" if is_2d else "um³"
+    size_word = "AREA" if is_2d else "SIZE"
     nuclei_rows = labels_df[labels_df["Condition"] == "NUCLEI"]
     cyto_rows = labels_df[labels_df["Condition"] == "CYTOPLASM"]
     total_nuclei = float(nuclei_rows.iloc[0]["Number"]) if not nuclei_rows.empty else float(labels_df.iloc[0]["Number"])
@@ -3102,6 +3121,8 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
         total_cells = float(cyto_rows.iloc[0]["Number"])
 
     # --- Channel overview ---
+    if is_2d:
+        print("2D IMAGE: nucleus and cytoplasm sizes are areas [um²].")
     print("CHANNELS:")
     for i, cond in enumerate(stain_complete_df.index):
         row = stain_complete_df.loc[cond]
@@ -3128,7 +3149,7 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
     print("_" * 80)
 
     # --- Nuclei and cytoplasm population size statistics ---
-    def _size_stats_line(sizes_tuple, label, unit="um\u00b3"):
+    def _size_stats_line(sizes_tuple, label, unit=size_unit):
         arr = np.array(sizes_tuple, dtype=float)
         arr = arr[~np.isnan(arr)]
         if arr.size == 0:
@@ -3141,9 +3162,9 @@ def print_population_summary(labels_df, stain_complete_df, stain_df, progress=No
         )
 
     if not nuclei_rows.empty:
-        _size_stats_line(nuclei_rows.iloc[0]["Nuclei size [um3]"], "NUCLEI SIZE")
+        _size_stats_line(nuclei_rows.iloc[0]["Nuclei size [um3]"], f"NUCLEI {size_word}")
     if "CYTOPLASM" in stain_df.index and not cyto_rows.empty:
-        _size_stats_line(cyto_rows.iloc[0]["Cytoplasm size [um3]"], "CYTOPLASM SIZE")
+        _size_stats_line(cyto_rows.iloc[0]["Cytoplasm size [um3]"], f"CYTOPLASM {size_word}")
 
     print("_" * 80)
 
@@ -3376,10 +3397,12 @@ def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_final_
     With ``percell_mean_df`` (see ``compute_percell_marker_intensity_df``),
     every analysed cell is also drawn as a dot per marker channel: its
     nucleus position on X and its mean intensity (all cells) on a secondary
-    y axis, so the intensity can be followed along each direction.
+    y axis, so the intensity can be followed along each direction. A 2D
+    image (single plane) has X and Y only.
     """
     im_in = im_final_stack['Filtered image']
-    fig, axs = plt.subplots(3, 1, figsize=(15, 15))
+    n_axes = 2 if im_in.shape[0] == 1 else 3
+    fig, axs = plt.subplots(n_axes, 1, figsize=(15, 5 * n_axes))
 
     for idx, marker in _progress_iter(
         enumerate(labels_df.index),
@@ -3402,19 +3425,14 @@ def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_final_
         if condition == "CYTOPLASM":
             continue
         color = _condition_color(condition, stain_complete_df, stain_df=stain_df)
-        if np.size(marker) == 1:
-            axs[0].plot(xbin_centers, xcount, label=str(condition), color=color)
-            axs[1].plot(ybin_centers, ycount, label=str(condition), color=color)
-            axs[2].plot(zbin_centers, zcount, label=str(condition), color=color)
-        elif np.size(marker) != 1:
-            linestyle = (0, (2, max(np.size(marker) - 1, 1)))
-            axs[0].plot(xbin_centers, xcount, label=str(condition), linestyle=linestyle, color=color)
-            axs[1].plot(ybin_centers, ycount, label=str(condition), linestyle=linestyle, color=color)
-            axs[2].plot(zbin_centers, zcount, label=str(condition), linestyle=linestyle, color=color)
+        linestyle = '-' if np.size(marker) == 1 else (0, (2, max(np.size(marker) - 1, 1)))
+        curves = [(xbin_centers, xcount), (ybin_centers, ycount), (zbin_centers, zcount)]
+        for ax, (centers, counts) in zip(axs, curves[:n_axes]):
+            ax.plot(centers, counts, label=str(condition), linestyle=linestyle, color=color)
 
     # Per-cell intensity vs position, on a secondary y axis. percell_mean_df
     # rows are cell labels 1..K, matching the first K nuclei positions.
-    twin_axs = [None, None, None]
+    twin_axs = [None] * n_axes
     if percell_mean_df is not None and len(percell_mean_df):
         nuclei_rows = labels_df[labels_df["Condition"] == "NUCLEI"]
         pos_row = nuclei_rows.iloc[0] if not nuclei_rows.empty else labels_df.iloc[0]
@@ -3449,7 +3467,10 @@ def plot_spatial_distributions(labels_df, stain_complete_df, stain_df, im_final_
 
 
 def plot_size_distributions(labels_df, stain_complete_df, stain_df, progress=None):
-    """Plot nuclei and cytoplasm size histograms for each population."""
+    """Plot nuclei and cytoplasm size histograms for each population (areas
+    for a 2D image, see ``build_labels_df(..., is_2d=True)``)."""
+    labels_df, is_2d = _volume_column_names(labels_df)
+    size_word, size_unit = ("AREA", "[μm²]") if is_2d else ("SIZE", "[μm3]")
     fig, axs = plt.subplots(2, 1, figsize=(15, 10))
     nuclei_max_size = max(x for values in labels_df["Nuclei size [um3]"] for x in values)
     cytoplasm_max_size = max(x for values in labels_df["Cytoplasm size [um3]"] for x in values)
@@ -3484,11 +3505,11 @@ def plot_size_distributions(labels_df, stain_complete_df, stain_df, progress=Non
                 color=color,
             )
 
-    axs[0].set_title("NUCLEI SIZE DISTRIBUTION")
-    axs[0].set_xlabel("[μm3]")
+    axs[0].set_title(f"NUCLEI {size_word} DISTRIBUTION")
+    axs[0].set_xlabel(size_unit)
     axs[0].legend(loc="upper right")
-    axs[1].set_title("CELL SIZE DISTRIBUTION")
-    axs[1].set_xlabel("[μm3]")
+    axs[1].set_title(f"CELL {size_word} DISTRIBUTION")
+    axs[1].set_xlabel(size_unit)
     axs[1].legend(loc="upper right")
     return fig, axs
 
@@ -3722,6 +3743,12 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
     else:
         output_path = (_Path(input_file).parent / _image_stem(input_file)).as_posix() + '_segmentation.xlsx'
 
+    # 2D image (table built with is_2d=True): sizes are areas.
+    labels_full_df, is_2d = _volume_column_names(labels_full_df)
+    U = 'μm²' if is_2d else 'μm³'           # size unit in the headers
+    SIZE = 'Area' if is_2d else 'Volume'
+    size = 'area' if is_2d else 'vol.'
+
     # ── Colour palette (matches histogram workbook) ──────────────────────
     _channel_bg = {
         'BLUE':    '#BDD7EE', 'GREEN':   '#C6EFCE', 'RED':     '#FFC7CE',
@@ -3833,7 +3860,7 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
         r = _write_sheet_title(ws_nuc, r, 0, 'NUCLEI — Position and Size', 5, _COL_NUC)
 
         nuc_cols = ['Nucleus ID', 'X position [μm]', 'Y position [μm]',
-                    'Z position [μm]', 'Volume [μm³]']
+                    'Z position [μm]', f'{SIZE} [{U}]']
         for c, col in enumerate(nuc_cols):
             ws_nuc.write(r, c, col, f_hdr)
         r += 1
@@ -3872,8 +3899,9 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
         # Title row: merged spanning each group
         base_cols  = ['Cell ID',
                       'X pos [μm]', 'Y pos [μm]', 'Z pos [μm]',
-                      'Nuc. vol. [μm³]', 'Cyto vol. [μm³]']
-        marker_sub = ['Vol. total [μm³]', 'Vol. cyto [μm³]', 'Vol. PCM [μm³]',
+                      f'Nuc. {size} [{U}]', f'Cyto {size} [{U}]']
+        SZ = 'Area' if is_2d else 'Vol.'
+        marker_sub = [f'{SZ} total [{U}]', f'{SZ} cyto [{U}]', f'{SZ} PCM [{U}]',
                       'Avg int. total', 'STD total',
                       'Avg int. cyto', 'STD cyto',
                       'Avg int. PCM', 'STD PCM',
@@ -3971,13 +3999,13 @@ def export_quantification_to_excel(input_file, original_stain_complete_df, label
 
         sum_cols = ['Condition', 'Marker', 'Laser', 'Color',
                     'Count', '% of total',
-                    'Mean nuc. vol. [μm³]', 'SD nuc. vol. [μm³]',
-                    'Mean cyto. vol. [μm³]', 'SD cyto. vol. [μm³]']
+                    f'Mean nuc. {size} [{U}]', f'SD nuc. {size} [{U}]',
+                    f'Mean cyto. {size} [{U}]', f'SD cyto. {size} [{U}]']
 
         # Add marker-specific mean columns
         for _, m_name, _ in single_markers:
             sum_cols += [f'{m_name} mean int. (positive cells)', f'{m_name} SD int. (positive cells)',
-                         f'{m_name} mean vol. [μm³]',
+                         f'{m_name} mean {size} [{U}]',
                          f'{m_name} mean int. (all cells)', f'{m_name} SD int. (all cells)']
 
         for c, col in enumerate(sum_cols):
@@ -6735,8 +6763,14 @@ def _fill_membrane_rings(membrane_mask, max_cell_area, close_radius=2):
     fill alone misses it). Larger enclosed areas - e.g. empty space ringed by
     several cells - are left empty.
     """
-    from skimage.morphology import ball
+    from skimage.morphology import ball, disk
 
+    if membrane_mask.shape[0] == 1:
+        # 2D image: close in the plane (a 3D ball would erode the single
+        # plane away against the empty planes around it).
+        closed = ndi.binary_closing(membrane_mask[0], structure=disk(close_radius))
+        filled = _fill_small_holes_per_slice(closed[np.newaxis], max_cell_area)
+        return filled | membrane_mask
     filled = ndi.binary_closing(membrane_mask, structure=ball(close_radius))
     filled = ndi.binary_fill_holes(filled)
     filled = _fill_small_holes_per_slice(filled, max_cell_area)
@@ -6855,13 +6889,20 @@ def segment_cytoplasm_cellpose(image_3d, cell_diameter, voxel_size, nuclei_label
     diameter_px = cell_diameter / xy_spacing
     anisotropy = float(voxel_size[0] / xy_spacing)
 
-    cell_labels, _, _, _ = model.eval(
-        image_3d,
-        diameter=diameter_px,
-        anisotropy=anisotropy,
-        do_3D=True,
-        channels=[0, 0],
-    )
+    if image_3d.shape[0] == 1:
+        # 2D image: Cellpose in 2D mode on the single plane.
+        cell_labels_2d, _, _, _ = model.eval(
+            image_3d[0], diameter=diameter_px, channels=[0, 0],
+        )
+        cell_labels = np.asarray(cell_labels_2d)[np.newaxis]
+    else:
+        cell_labels, _, _, _ = model.eval(
+            image_3d,
+            diameter=diameter_px,
+            anisotropy=anisotropy,
+            do_3D=True,
+            channels=[0, 0],
+        )
 
     labels = np.zeros_like(cell_labels, dtype=np.int32)
     for cell_id in np.unique(cell_labels):
@@ -7761,6 +7802,41 @@ def refine_nuclei_by_size(
                         'split': split_info, 'recap': recap_df}
 
 
+def _segment_nuclei_2d(mask, intensity, r_zxyz, nuclei_diameter, trig_cellpose=False,
+                       trig_stardist=False, size_reference="blend", iterative_split=True,
+                       oversize_factor=2.0, max_split_iterations=3, merge_undersized=True,
+                       undersize_factor=0.5, split_gamma=1.0, split_gamma_step=0.0,
+                       min_piece_fraction=0.0, progress=None):
+    """Nuclei of a 2D image (single plane), for `segment_nuclei`: the 2D
+    segmentation of the LIVE/DEAD notebook (`_ld_segment_objects_2d`) --
+    watershed seeded at the bright centres separated by an intensity dip
+    (or Cellpose / StarDist in 2D), split gamma, merge of tiny split pieces
+    and size refinement on areas. Returns the labels as (1, Y, X)."""
+    r_zX, r_zY, _ = r_zxyz
+    method = 'cellpose' if trig_cellpose else ('stardist' if trig_stardist else 'watershed')
+    print("2D image: nuclei segmented in the image plane.")
+    labels = _ld_segment_objects_2d(
+        mask,
+        intensity,
+        pixel_yx=(r_zY, r_zX),
+        diameter_um=nuclei_diameter,
+        what="nuclei",
+        method=method,
+        cellpose_model='nuclei',
+        size_reference=size_reference,
+        iterative_split=iterative_split,
+        oversize_factor=oversize_factor,
+        max_split_iterations=max_split_iterations,
+        merge_undersized=merge_undersized,
+        undersize_factor=undersize_factor,
+        split_gamma=split_gamma,
+        split_gamma_step=split_gamma_step,
+        min_piece_fraction=min_piece_fraction,
+        progress=progress,
+    )
+    return np.asarray(labels, dtype=np.int32)[np.newaxis]
+
+
 def segment_nuclei(
     im_final_stack,
     stain_df,
@@ -7778,6 +7854,9 @@ def segment_nuclei(
     size_reference="blend",
     progress=None,
     refine_gamma_levels=None,
+    split_gamma=1.0,
+    split_gamma_step=0.0,
+    min_piece_fraction=0.0,
 ):
     """
     Segment nuclei from the image using watershed, StarDist, or Cellpose.
@@ -7849,7 +7928,22 @@ def segment_nuclei(
         Progress wrapper (e.g. tqdm).
     refine_gamma_levels : sequence of float, optional
         Extra intensity gamma per re-split level of the size refinement (see
-        `refine_oversized_nuclei`). None (default) = no gamma.
+        `refine_oversized_nuclei`). None (default) = no gamma. Overrides the
+        levels derived from ``split_gamma``/``split_gamma_step``.
+    split_gamma : float
+        NUCLEI-channel path (nuclei notebook v1.6.3): gamma applied to the
+        intensity used to split touching nuclei (`apply_split_gamma`) -- the
+        watershed and the fragment-merge seam test, not the Cellpose/StarDist
+        input. > 1 makes the dark seams between nuclei darker faster than the
+        nuclei. Default 1.0 = off.
+    split_gamma_step : float
+        Added to the gamma at each re-split level of the size refinement
+        (level n uses ``split_gamma + n * split_gamma_step``). Default 0 = off.
+    min_piece_fraction : float
+        NUCLEI-channel watershed: after the first pass, pieces of each split
+        island smaller than this x a nucleus of ``nuclei_diameter`` are merged
+        into the closest big piece of the same island
+        (`absorb_small_split_pieces`). Default 0 = off.
 
     Returns
     -------
@@ -7858,13 +7952,14 @@ def segment_nuclei(
     """
     from skimage.measure import label as skimage_label
     from skimage import morphology
+    from skimage.segmentation import relabel_sequential
 
     r_zX, r_zY, r_zZ = r_zxyz
     im_segmentation_stack = {}
     if nuclei_split_config is None:
         nuclei_split_config = get_nuclei_split_config(profile="balanced")
 
-    def _refine(labels, intensity_img, intensity_img_raw):
+    def _refine(labels, intensity_img, intensity_img_raw, gamma_levels=refine_gamma_levels):
         if not (iterative_split or merge_undersized):
             return labels
         labels, _ = refine_nuclei_by_size(
@@ -7881,10 +7976,41 @@ def segment_nuclei(
             oversize_factor=oversize_factor,
             max_split_iterations=max_split_iterations,
             progress=progress,
-            intensity_gamma_levels=refine_gamma_levels,
+            intensity_gamma_levels=gamma_levels,
         )
         print(f"Total nuclei after size refinement: {int(labels.max())}")
         return labels
+
+    # Split gamma of the NUCLEI-channel path (v1.6.3).
+    base_gamma = float(split_gamma or 1.0)
+    gamma_on = abs(base_gamma - 1.0) > 1e-6 or bool(split_gamma_step)
+    level_gammas_abs = [base_gamma + float(split_gamma_step or 0.0) * (lvl + 1) for lvl in range(3)]
+
+    if 'NUCLEI' not in stain_df.index and im_final_stack['Threshold image'].shape[0] == 1:
+        # LD-style on a 2D image: union of all channels, segmented in 2D.
+        thr = im_final_stack['Threshold image'][0]
+        im_out = _segment_nuclei_2d(
+            np.any(thr > 0, axis=-1),
+            np.max(im_final_stack['Filtered image'][0], axis=-1),
+            r_zxyz=r_zxyz,
+            nuclei_diameter=nuclei_diameter,
+            trig_cellpose=trig_cellpose,
+            trig_stardist=trig_stardist,
+            size_reference=size_reference,
+            iterative_split=iterative_split,
+            oversize_factor=oversize_factor,
+            max_split_iterations=max_split_iterations,
+            merge_undersized=merge_undersized,
+            undersize_factor=undersize_factor,
+            split_gamma=split_gamma,
+            split_gamma_step=split_gamma_step,
+            min_piece_fraction=min_piece_fraction,
+            progress=progress,
+        )
+        im_segmentation_stack['Nuclei'] = im_out
+        im_segmentation_stack['Cytoplasm'] = np.zeros_like(im_out)
+        im_segmentation_stack['PCM'] = np.zeros_like(im_out)
+        return im_segmentation_stack
 
     if 'NUCLEI' not in stain_df.index:
         # LD-style: union all channels.
@@ -7940,6 +8066,43 @@ def segment_nuclei(
         if stain_complete_df.index[c] != 'NUCLEI':
             continue
 
+        if im_in.shape[0] == 1:
+            # 2D image: watershed / Cellpose / StarDist and size refinement in
+            # the image plane (the 3D erosion-based split would erase it).
+            im_segmentation_stack['Nuclei'] = _segment_nuclei_2d(
+                im_in[0, :, :, c] > 0,
+                im_final_stack['Filtered image'][0, :, :, c],
+                r_zxyz=r_zxyz,
+                nuclei_diameter=nuclei_diameter,
+                trig_cellpose=trig_cellpose,
+                trig_stardist=trig_stardist,
+                size_reference=size_reference,
+                iterative_split=iterative_split,
+                oversize_factor=oversize_factor,
+                max_split_iterations=max_split_iterations,
+                merge_undersized=merge_undersized,
+                undersize_factor=undersize_factor,
+                split_gamma=split_gamma,
+                split_gamma_step=split_gamma_step,
+                min_piece_fraction=min_piece_fraction,
+                progress=progress,
+            )
+            continue
+
+        # Intensity used to split touching nuclei: gamma-adjusted for the
+        # watershed; Cellpose/StarDist get the original image, and their
+        # refinement uses the absolute level gammas instead.
+        deep_learning = trig_cellpose or trig_stardist
+        applied_gamma = 1.0 if deep_learning else base_gamma
+        split_intensity = apply_split_gamma(im_final_stack['Filtered image'][:, :, :, c], applied_gamma)
+        split_intensity_raw = apply_split_gamma(im_final_stack['Denoised image'][:, :, :, c], applied_gamma)
+        gamma_levels = refine_gamma_levels
+        if gamma_levels is None and gamma_on:
+            gamma_levels = [g / applied_gamma for g in level_gammas_abs]
+            print(("Split gamma: " + (f"{base_gamma:g} on the nuclei intensity used for the split"
+                                      if not deep_learning else "not applied to the deep-learning input"))
+                  + "; re-split levels: " + ", ".join(f"{g:g}" for g in level_gammas_abs))
+
         if trig_cellpose:
             im_filt = im_final_stack['Filtered image'].copy()
             im_out = segment_nuclei_cellpose(
@@ -7965,16 +8128,14 @@ def segment_nuclei(
 
         else:
             binary_mask = im_in[:, :, :, c].astype(bool)
-            im_filt = im_final_stack['Filtered image']
-            im_denoised = im_final_stack['Denoised image']
             im_out, debug_info = segment_nuclei_watershed(
                 binary_mask=binary_mask,
                 r_zX=r_zX,
                 r_zY=r_zY,
                 r_zZ=r_zZ,
                 nuclei_diameter=nuclei_diameter,
-                intensity_img=im_filt[:, :, :, c],
-                intensity_img_raw=im_denoised[:, :, :, c],
+                intensity_img=split_intensity,
+                intensity_img_raw=split_intensity_raw,
                 progress=progress,
                 **split_cfg,
             )
@@ -7982,11 +8143,21 @@ def segment_nuclei(
             print(f"Total nuclei found: {int(im_out.max())}")
             _display_nuclei_roundness_size_table(debug_info)
 
-        im_out = _refine(
-            im_out,
-            im_final_stack['Filtered image'][:, :, :, c],
-            im_final_stack['Denoised image'][:, :, :, c],
-        )
+            # Second merge round, limited to the pieces of each split island.
+            if min_piece_fraction:
+                min_vox = max(1.0, float(min_piece_fraction) * _sphere_volume_um3(nuclei_diameter)
+                              / (r_zX * r_zY * r_zZ))
+                islands, _ = ndi.label(binary_mask)
+                im_out, n_absorbed = absorb_small_split_pieces(im_out, islands, min_vox)
+                del islands
+                if n_absorbed:
+                    im_out, _, _ = relabel_sequential(im_out)
+                    print(f"Split pieces smaller than {min_piece_fraction:g}x a nucleus "
+                          f"({min_vox:.0f} voxels) merged back into a neighbouring piece: "
+                          f"{n_absorbed} -> {int(im_out.max())} nuclei")
+
+        im_out = _refine(im_out, split_intensity, split_intensity_raw, gamma_levels)
+        del split_intensity, split_intensity_raw
         im_segmentation_stack['Nuclei'] = im_out
 
     return im_segmentation_stack
@@ -8142,6 +8313,7 @@ def segment_cytoplasm(
     membrane_markers=None,
     drop_bare_cells=True,
     progress=None,
+    split_gamma=1.0,
 ):
     """
     Segment the cytoplasm, one cell per nucleus.
@@ -8214,6 +8386,14 @@ def segment_cytoplasm(
         False, keep them as nucleus-only cells.
     progress : callable, optional
         Progress wrapper.
+    split_gamma : float
+        Gamma applied to the intracellular and membrane intensities that
+        decide the border between touching cells (`apply_split_gamma`): > 1
+        makes the dim zone between two cells darker faster than the
+        cytoplasm, and keeps a bright membrane bright against its dimmer
+        surroundings, so the border is more distinct. Only the split uses
+        it, not the cytoplasm mask. Default 1.0 = off (nuclei notebook
+        v1.6.3 setting).
 
     Returns
     -------
@@ -8266,15 +8446,19 @@ def segment_cytoplasm(
         combined_mask = cyto_mask | (nuclei_labels > 0)
         if split_by_intensity_gradient:
             filt = im_final_stack['Filtered image']
+            if abs(float(split_gamma or 1.0) - 1.0) > 1e-6:
+                print(f"Split gamma {split_gamma:g} on the cytoplasm intensities used "
+                      "to split touching cells")
             elevation = _gradient_watershed_elevation(
-                [filt[:, :, :, c] for c in intra_channels],
+                [apply_split_gamma(filt[:, :, :, c], split_gamma) for c in intra_channels],
                 combined_mask,
                 spacing=(r_zZ, r_zY, r_zX),
                 smooth_sigma=gradient_smooth_sigma,
                 w_distance=distance_weight,
                 w_intensity=intensity_weight,
                 w_gradient=gradient_weight,
-                ridge_imgs=[filt[:, :, :, c] for c in membrane_channels],
+                ridge_imgs=[apply_split_gamma(filt[:, :, :, c], split_gamma)
+                            for c in membrane_channels],
             )
         else:
             elevation = -ndi.distance_transform_edt(
@@ -9589,10 +9773,15 @@ def _process_single_image_batch(
     napari_module,
     progress,
     membrane_markers=None,
+    split_gamma=1.0,
+    split_gamma_step=0.0,
+    min_piece_fraction=0.0,
 ):
     """Run the notebook pipeline (Cells 4-34) on one file, without viewers,
     plots or PNG subfolders, writing every output file into *output_dir*
-    (this image's own subfolder of the batch output folder)."""
+    (this image's own subfolder of the batch output folder).
+    ``split_gamma``, ``split_gamma_step`` and ``min_piece_fraction`` are the
+    nuclei notebook v1.6.3 splitting settings (defaults: off, as in v1.6.2)."""
     roi = list(roi_coords)
     if interactive_roi:
         roi = select_roi_interactively(input_file, roi, napari_module=napari_module,
@@ -9608,6 +9797,8 @@ def _process_single_image_batch(
         scale_factor=scale_factor,
         zoom_factors=list(zoom_factors),
     )
+    # 2D image (single plane): segmented in 2D, sizes are areas, no 3D exports.
+    is_2d = img.shape[0] == 1
 
     # Cells 6-7
     im_final_stack, _, _, _, _, stain_df, _ = prepare_and_preview(
@@ -9670,6 +9861,11 @@ def _process_single_image_batch(
         progress=progress,
         output_dir=output_dir,
         membrane_markers=list(membrane_markers or []),
+        extra_params={
+            'Split gamma': split_gamma,
+            'Split gamma step': split_gamma_step,
+            'Min split piece fraction': min_piece_fraction,
+        },
     )
 
     # Cells 17-21
@@ -9689,6 +9885,9 @@ def _process_single_image_batch(
         undersize_factor=undersize_factor,
         size_reference=size_reference,
         progress=progress,
+        split_gamma=split_gamma,
+        split_gamma_step=split_gamma_step,
+        min_piece_fraction=min_piece_fraction,
     )
     im_segmentation_stack, stain_complete_df = segment_cytoplasm(
         im_final_stack,
@@ -9703,6 +9902,7 @@ def _process_single_image_batch(
         r_zxyz=(r_zX, r_zY, r_zZ),
         membrane_markers=membrane_markers,
         progress=progress,
+        split_gamma=split_gamma,
         **cyto_split_config,
     )
     im_segmentation_stack = segment_pcm(
@@ -9742,6 +9942,7 @@ def _process_single_image_batch(
         percell_mean_df=percell_mean_df,
         percell_std_df=percell_std_df,
         progress=progress,
+        is_2d=is_2d,
     )
 
     # Cell 29 -- saved as PNG only, not displayed
@@ -9755,6 +9956,7 @@ def _process_single_image_batch(
         input_file=input_file,
         output_dir=output_dir,
         show=False,
+        is_2d=is_2d,
     )
     plt.close("all")
 
@@ -9776,8 +9978,10 @@ def _process_single_image_batch(
         show_plot=False,
     )
 
-    # Cells 30, 31, 34
-    if export_vtk:
+    # Cells 30, 31, 34 -- 3D meshes, not made for a 2D image
+    if is_2d and (export_vtk or export_stl or export_fea):
+        print("2D image: VTK, STL and FEA mesh exports skipped (3D only).")
+    if export_vtk and not is_2d:
         build_vtk_volumes(
             im_segmentation_stack,
             labels_full_df=labels_full_df,
@@ -9789,7 +9993,7 @@ def _process_single_image_batch(
             output_dir=output_dir,
             live_counter=False,
         )
-    if export_stl:
+    if export_stl and not is_2d:
         export_marker_stl(
             im_segmentation_stack,
             stain_df=stain_df,
@@ -9800,7 +10004,7 @@ def _process_single_image_batch(
             progress=progress,
             output_dir=output_dir,
         )
-    if export_fea:
+    if export_fea and not is_2d:
         export_fea_mesh(
             im_segmentation_stack,
             input_file=input_file,
@@ -9846,6 +10050,9 @@ def run_batch_folder(
     napari_module=None,
     progress=None,
     membrane_markers=None,
+    split_gamma=1.0,
+    split_gamma_step=0.0,
+    min_piece_fraction=0.0,
 ):
     """Process every supported image file in *input_folder* with the full
     pipeline and write each image's outputs into its own subfolder,
@@ -9944,6 +10151,9 @@ def run_batch_folder(
                 napari_module=napari_module,
                 progress=progress,
                 membrane_markers=membrane_markers,
+                split_gamma=split_gamma,
+                split_gamma_step=split_gamma_step,
+                min_piece_fraction=min_piece_fraction,
             )
             results.append({
                 "File": image_path.name,
@@ -10405,8 +10615,80 @@ def _ld_disk_area_px(diameter_um, pixel_yx):
     return max(1.0, np.pi * (diameter_um / 2.0) ** 2 / (pixel_yx[0] * pixel_yx[1]))
 
 
+def absorb_small_split_pieces(labels, parents, min_size):
+    """Second merge round, limited to the children of each split (2D or 3D).
+
+    *parents* labels the regions each split came from (e.g. the connected
+    islands of the threshold mask). Within every parent, the pieces of
+    *labels* smaller than *min_size* pixels/voxels are merged into the
+    closest big piece of the same parent (`_absorb_small_pieces`); pieces of
+    different parents are never merged. Label ids are kept (no renumbering).
+
+    Returns ``(labels, n_absorbed)``.
+    """
+    labels = np.array(labels, dtype=np.int32, copy=True)
+    n_absorbed = 0
+    for i, sl in enumerate(ndi.find_objects(parents), start=1):
+        if sl is None:
+            continue
+        inside = parents[sl] == i
+        crop = np.where(inside, labels[sl], 0)
+        if np.count_nonzero(np.unique(crop)) < 2:
+            continue
+        crop, n = _absorb_small_pieces(crop, min_size)
+        if n:
+            labels[sl][inside] = crop[inside]
+            n_absorbed += n
+    return labels, n_absorbed
+
+
+def _absorb_small_pieces(pieces, min_size):
+    """Second merge round, limited to the children of one split.
+
+    *pieces* holds the pieces of ONE split object (0 = outside). Every piece
+    smaller than *min_size* pixels -- a one- or two-pixel sliver left by an
+    over-eager split -- is merged, smallest first, into the closest big
+    piece: the big piece it shares the longest border with, or, if it touches
+    none, the nearest big piece. (If no piece is big enough, the biggest
+    touching one is used.) Unlike the fragment merge of the size refinement
+    there is no seam test: pieces this small are never a cell on their own.
+    Label ids are kept (no renumbering). Returns ``(pieces, n_absorbed)``.
+    """
+    pieces = np.array(pieces, dtype=np.int32, copy=True)
+    ids, counts = np.unique(pieces[pieces > 0], return_counts=True)
+    area = dict(zip(ids.tolist(), counts.tolist()))
+    if len(area) < 2:
+        return pieces, 0
+    struct = ndi.generate_binary_structure(pieces.ndim, 1)
+    n_absorbed = 0
+    while len(area) > 1:
+        small = [i for i in sorted(area, key=area.get) if area[i] < min_size]
+        if not small:
+            break
+        a = small[0]
+        mask_a = pieces == a
+        ring = ndi.binary_dilation(mask_a, structure=struct) & ~mask_a & (pieces > 0)
+        nb_ids, contact = np.unique(pieces[ring], return_counts=True)
+        if nb_ids.size:
+            touching = list(zip(contact.tolist(), nb_ids.tolist()))
+            big = [(c, n) for c, n in touching if area[n] >= min_size]
+            target = max(big or touching)[1]
+        else:
+            others = [i for i in area if i != a]
+            candidates = [i for i in others if area[i] >= min_size] or others
+            dist, idx = ndi.distance_transform_edt(~np.isin(pieces, candidates),
+                                                   return_indices=True)
+            pos = np.unravel_index(int(np.argmin(np.where(mask_a, dist, np.inf))), pieces.shape)
+            target = int(pieces[tuple(i[pos] for i in idx)])
+        pieces[mask_a] = target
+        area[target] += area.pop(a)
+        n_absorbed += 1
+    return pieces, n_absorbed
+
+
 def _ld_watershed_2d(mask, intensity, pixel_yx, diameter_um, peak_fraction=0.5,
-                     intensity_weight=1.0, intensity_dip=_LD_INTENSITY_DIP_2D):
+                     intensity_weight=1.0, intensity_dip=_LD_INTENSITY_DIP_2D,
+                     min_piece_px=None):
     """Split a 2D mask into objects of about *diameter_um* and flood them on
     a surface combining the distance and the intensity, so touching objects
     split along the dimmer seam between them.
@@ -10422,13 +10704,20 @@ def _ld_watershed_2d(mask, intensity, pixel_yx, diameter_um, peak_fraction=0.5,
       the dips and gives more seeds;
     - otherwise **distance peaks**: one per peak of the distance map (at
       least ``peak_fraction`` x the radius apart), at least one per island.
+
+    With ``min_piece_px``, the pieces of each island smaller than that are
+    then merged into the closest big piece of the same island
+    (`absorb_small_split_pieces`).
+
+    Returns ``(labels, n_absorbed)``.
     """
     from skimage.morphology import h_maxima
+    from skimage.segmentation import relabel_sequential
 
     mask = np.asarray(mask, dtype=bool)
     labels = np.zeros(mask.shape, dtype=np.int32)
     if not mask.any():
-        return labels
+        return labels, 0
     radius_px = diameter_um / 2.0 / float(np.mean(pixel_yx))
     distance = ndi.gaussian_filter(_ld_edt(mask, pixel_yx), sigma=1.0)
     smoothed = ndi.gaussian_filter(np.asarray(intensity, dtype=np.float32), sigma=1.0)
@@ -10479,7 +10768,14 @@ def _ld_watershed_2d(mask, intensity, pixel_yx, diameter_um, peak_fraction=0.5,
         next_id += 1
     elevation = -(_ld_norm_in_mask(distance, mask)
                   + intensity_weight * _ld_norm_in_mask(smoothed, mask))
-    return watershed(elevation, markers, mask=mask).astype(np.int32)
+    labels = watershed(elevation, markers, mask=mask).astype(np.int32)
+
+    # Second merge round: only the pieces of each split island are involved.
+    n_absorbed = 0
+    if min_piece_px:
+        labels, n_absorbed = absorb_small_split_pieces(labels, islands, min_piece_px)
+        labels, _, _ = relabel_sequential(labels)
+    return labels.astype(np.int32), n_absorbed
 
 
 def _ld_reference_area_2d(labels, diameter_um, pixel_yx, size_reference="blend",
@@ -10517,17 +10813,22 @@ def _ld_reference_area_2d(labels, diameter_um, pixel_yx, size_reference="blend",
 
 
 def _ld_split_oversized_2d(labels, intensity, pixel_yx, reference_px, oversize_factor=2.0,
-                           max_iterations=3, progress=None, level_gammas=None):
+                           max_iterations=3, progress=None, level_gammas=None,
+                           min_piece_fraction=0.2):
     """Re-split labels bigger than ``oversize_factor`` x the reference area
     with increasingly aggressive settings (`_LD_SPLIT_LEVELS_2D`). With
     ``level_gammas`` the intensity crop of each label gets that level's gamma
-    (`apply_split_gamma`), so the seams darken more at every level. Labels
-    that can't be split are kept."""
+    (`apply_split_gamma`), so the seams darken more at every level. Pieces of
+    a split smaller than ``min_piece_fraction`` x the reference area are
+    merged back into the closest big piece of the same split
+    (`absorb_small_split_pieces`); a label left with one piece is not split.
+    Labels that can't be split are kept."""
     from skimage.segmentation import relabel_sequential
 
     labels = np.asarray(labels, dtype=np.int32).copy()
     ref_diameter = 2.0 * np.sqrt(reference_px * pixel_yx[0] * pixel_yx[1] / np.pi)
     next_id = int(labels.max()) + 1
+    min_piece_px = max(1.0, float(min_piece_fraction or 0.0) * reference_px)
     n_levels = int(np.clip(max_iterations, 1, len(_LD_SPLIT_LEVELS_2D)))
     for level in range(n_levels):
         name, peak_fraction, weight, dip = _LD_SPLIT_LEVELS_2D[level]
@@ -10539,16 +10840,19 @@ def _ld_split_oversized_2d(labels, intensity, pixel_yx, reference_px, oversize_f
             break
         slices = ndi.find_objects(labels)
         n_split = 0
+        n_absorbed = 0
         for lab in _progress_iter(big.tolist(), progress,
                                   desc=f'Split oversized ({name})', leave=False):
             sl = slices[lab - 1]
             if sl is None:
                 continue
             region = labels[sl] == lab
-            parts = _ld_watershed_2d(region, apply_split_gamma(intensity[sl], gamma),
-                                     pixel_yx, ref_diameter,
-                                     peak_fraction=peak_fraction, intensity_weight=weight,
-                                     intensity_dip=dip)
+            parts, absorbed = _ld_watershed_2d(
+                region, apply_split_gamma(intensity[sl], gamma), pixel_yx, ref_diameter,
+                peak_fraction=peak_fraction, intensity_weight=weight, intensity_dip=dip,
+                min_piece_px=min_piece_px,
+            )
+            n_absorbed += absorbed
             ids = np.unique(parts[parts > 0])
             if ids.size < 2:
                 continue
@@ -10560,7 +10864,8 @@ def _ld_split_oversized_2d(labels, intensity, pixel_yx, reference_px, oversize_f
         print(f"  Split level {level + 1} ('{name}'"
               + (f", intensity gamma {gamma:.2f}" if gamma else "")
               + f"): {big.size} oversized label(s) "
-              f"(> {oversize_factor:g}x reference), {n_split} split")
+              f"(> {oversize_factor:g}x reference), {n_split} split"
+              + (f", {n_absorbed} tiny piece(s) merged back" if n_absorbed else ""))
     labels, _, _ = relabel_sequential(labels)
     return labels.astype(np.int32)
 
@@ -10625,6 +10930,7 @@ def _ld_segment_objects_2d(
     undersize_factor=0.5,
     split_gamma=1.0,
     split_gamma_step=0.0,
+    min_piece_fraction=0.2,
     progress=None,
 ):
     """Segment a 2D image into objects of about *diameter_um* (nuclei or cell
@@ -10637,7 +10943,12 @@ def _ld_segment_objects_2d(
     ``split_gamma`` is applied to the intensity used by the watershed split
     and by the merge test (dark seams between objects get darker), and grows
     by ``split_gamma_step`` at each re-split level. The deep-learning models
-    get the original intensity."""
+    get the original intensity.
+
+    After every watershed split, the pieces of one split smaller than
+    ``min_piece_fraction`` x the expected size (the input diameter for the
+    first pass, the reference size for the re-split levels) are merged into
+    the closest big piece of the same split (`absorb_small_split_pieces`)."""
     base_gamma, level_gammas = _ld_split_gammas(split_gamma, split_gamma_step)
     split_intensity = apply_split_gamma(intensity, base_gamma)
     _ld_print_split_gamma(what, split_gamma, split_gamma_step)
@@ -10649,7 +10960,13 @@ def _ld_segment_objects_2d(
         filled = _fill_small_holes_per_slice(
             np.asarray(mask, dtype=bool)[np.newaxis], _ld_disk_area_px(diameter_um, pixel_yx)
         )[0]
-        labels = _ld_watershed_2d(filled, split_intensity, pixel_yx, diameter_um)
+        min_piece_px = max(1.0, float(min_piece_fraction or 0.0)
+                           * _ld_disk_area_px(diameter_um, pixel_yx))
+        labels, n_absorbed = _ld_watershed_2d(filled, split_intensity, pixel_yx, diameter_um,
+                                              min_piece_px=min_piece_px)
+        if n_absorbed:
+            print(f"Split pieces smaller than {min_piece_fraction:g}x the expected size "
+                  f"({min_piece_px:.0f} px) merged back into a neighbouring piece: {n_absorbed}")
     print(f"Total {what} found: {int(np.count_nonzero(np.unique(labels)))}")
     if not (iterative_split or merge_undersized) or not labels.any():
         return labels
@@ -10666,6 +10983,7 @@ def _ld_segment_objects_2d(
             labels, intensity, pixel_yx, reference_px,
             oversize_factor=oversize_factor, max_iterations=max_split_iterations,
             progress=progress, level_gammas=level_gammas,
+            min_piece_fraction=min_piece_fraction,
         )
     print(f"Total {what} after size refinement: {int(np.count_nonzero(np.unique(labels)))}")
     return labels
@@ -10688,6 +11006,7 @@ def segment_ld_nuclei(
     size_reference="blend",
     split_gamma=1.0,
     split_gamma_step=0.0,
+    min_piece_fraction=0.2,
     progress=None,
 ):
     """LD Cell 17: segment the nuclei from the markers set as **nuclear**.
@@ -10702,6 +11021,10 @@ def segment_ld_nuclei(
     nuclei (watershed and merge test; not the deep-learning input), so the
     dark seams between them get darker faster than the nuclei; it grows by
     ``split_gamma_step`` at each re-split level of the size refinement.
+
+    On a 2D image, the pieces of each split smaller than
+    ``min_piece_fraction`` x the expected nucleus size are merged into the
+    closest big piece of the same split.
 
     Returns
     -------
@@ -10735,6 +11058,7 @@ def segment_ld_nuclei(
             undersize_factor=undersize_factor,
             split_gamma=split_gamma,
             split_gamma_step=split_gamma_step,
+            min_piece_fraction=min_piece_fraction,
             progress=progress,
         )
         return {'Nuclei': labels[np.newaxis]}
@@ -10761,6 +11085,7 @@ def segment_ld_nuclei(
         size_reference=size_reference,
         progress=progress,
         refine_gamma_levels=refine_gammas,
+        min_piece_fraction=min_piece_fraction,
     )
     return {'Nuclei': np.asarray(seg['Nuclei'], dtype=np.int32)}
 
@@ -10968,6 +11293,7 @@ def segment_ld_cells(
     min_nucleus_overlap=0.5,
     split_gamma=1.0,
     split_gamma_step=0.0,
+    min_piece_fraction=0.2,
     progress=None,
 ):
     """LD Cell 18: segment the cell bodies from the markers set as
@@ -11028,6 +11354,7 @@ def segment_ld_cells(
                 undersize_factor=undersize_factor,
                 split_gamma=split_gamma,
                 split_gamma_step=split_gamma_step,
+                min_piece_fraction=min_piece_fraction,
                 progress=progress,
             )[np.newaxis]
         elif trig_cellpose_cyto:
@@ -11084,6 +11411,7 @@ def segment_ld_cells(
                 size_reference=size_reference,
                 progress=progress,
                 refine_gamma_levels=refine_gammas,
+                min_piece_fraction=min_piece_fraction,
             )['Nuclei']
         del merged
         bodies = np.asarray(bodies, dtype=np.int32)
@@ -11801,6 +12129,7 @@ def _process_single_image_ld_batch(
     progress,
     split_gamma=1.0,
     split_gamma_step=0.0,
+    min_piece_fraction=0.2,
 ):
     """Run the LIVE/DEAD notebook (Cells 4-33) on one file, without viewers,
     inline plots or PNG subfolders, writing every output file into
@@ -11878,6 +12207,7 @@ def _process_single_image_ld_batch(
     )
     ld_params['Split gamma'] = split_gamma
     ld_params['Split gamma step'] = split_gamma_step
+    ld_params['Min split piece fraction'] = min_piece_fraction
     export_channel_histograms(
         im_final_stack, stain_complete_df, input_file,
         ROI_print=ROI_print, lazy_loading_used=used_lazy_loading,
@@ -11905,6 +12235,7 @@ def _process_single_image_ld_batch(
         size_reference=size_reference,
         split_gamma=split_gamma,
         split_gamma_step=split_gamma_step,
+        min_piece_fraction=min_piece_fraction,
         progress=progress,
     )
     im_segmentation_stack = segment_ld_nuclei(
@@ -12080,6 +12411,7 @@ def run_ld_batch_folder(
     progress=None,
     split_gamma=1.0,
     split_gamma_step=0.0,
+    min_piece_fraction=0.2,
 ):
     """Process every supported image file in *input_folder* with the full
     LIVE/DEAD pipeline and write each image's outputs into its own
@@ -12144,6 +12476,7 @@ def run_ld_batch_folder(
                 ld_rule=ld_rule,
                 split_gamma=split_gamma,
                 split_gamma_step=split_gamma_step,
+                min_piece_fraction=min_piece_fraction,
                 iterative_split=iterative_split,
                 oversize_factor=oversize_factor,
                 max_split_iterations=max_split_iterations,
