@@ -357,6 +357,133 @@ class _OifFileReader:
         )
 
 
+class _PlainTiffReader:
+    """AICSImage-compatible reader for plain (non-OME) TIFF files.
+
+    Without OME metadata aicsimageio guesses the axes, and reads a 2D
+    two-channel picture stored as a (2, Y, X) array as a 2-plane Z stack
+    with one channel. Here the axes come from the array itself:
+
+    - axes stated in the file (ImageJ hyperstack 'C', or RGB samples 'S')
+      are used as they are;
+    - otherwise, after dropping singleton axes: 2 dims = (Y, X), one channel;
+      **3 dims = 2D image + channels** (the extra axis is the channel axis);
+      **4 dims = 3D stack + channels** -- of the two extra axes the smaller
+      is taken as the channel axis (on a tie, the second one, as in ImageJ's
+      Z, C, Y, X order).
+
+    Extra axes (e.g. time) are reduced to their first index. Voxel sizes come
+    from aicsimageio when it can read them; a missing one is asked for later
+    (``_prompt_missing_voxel_sizes``). The image is read fully into memory.
+    """
+
+    def __init__(self, path: str):
+        import tifffile
+
+        with tifffile.TiffFile(path) as tif:
+            series = tif.series[0]
+            data = np.asarray(series.asarray())
+            axes = str(series.axes).upper()
+            labels = (tif.imagej_metadata or {}).get('Labels') if tif.is_imagej else None
+
+        self._data_zyxc = self._to_zyxc(data, axes)
+        z, y, x, c = self._data_zyxc.shape
+        self.shape = (1, c, z, y, x)
+        self.dtype = self._data_zyxc.dtype
+        if labels and len(labels) == c:
+            self.channel_names = [str(l) for l in labels]
+        else:
+            self.channel_names = [f"Channel {i + 1}" for i in range(c)]
+
+        r_x = r_y = r_z = None
+        try:
+            from aicsimageio import AICSImage
+            sizes = AICSImage(path).physical_pixel_sizes
+            r_x, r_y = sizes.X, sizes.Y
+            r_z = sizes.Z if z > 1 else None
+        except Exception as exc:
+            print(f"[_PlainTiffReader] Could not read the voxel size ({exc}).")
+        self._pixel_sizes = _PhysicalPixelSizesOverride(r_x, r_y, r_z)
+        print(f"[_PlainTiffReader] TIFF axes '{axes}' {tuple(data.shape)} -> "
+              f"{'2D' if z == 1 else '3D'} image, {c} channel(s), (Z, Y, X, C) = {self._data_zyxc.shape}")
+
+    @staticmethod
+    def _to_zyxc(data, axes):
+        if len(axes) != data.ndim:
+            axes = 'Q' * (data.ndim - 2) + 'YX'
+        axes = list(axes)
+        # Channel axis stated in the file: ImageJ 'C' or RGB samples 'S'.
+        if 'S' in axes and 'C' not in axes:
+            axes[axes.index('S')] = 'C'
+        # Drop singleton axes (except Y/X), keep the first index of time.
+        for i in reversed(range(len(axes))):
+            if axes[i] in 'YX':
+                continue
+            if data.shape[i] == 1 or axes[i] == 'T':
+                data = np.take(data, 0, axis=i)
+                del axes[i]
+        extra = [i for i, a in enumerate(axes) if a not in 'YX']
+        if 'C' not in axes:
+            # No channel axis in the metadata: decide from the dimensions.
+            if len(extra) == 1:        # 2D + C
+                axes[extra[0]] = 'C'
+            elif len(extra) == 2:      # 3D + C: smaller extra axis = channels
+                a, b = extra
+                c_axis = a if data.shape[a] < data.shape[b] else b
+                z_axis = b if c_axis == a else a
+                axes[c_axis], axes[z_axis] = 'C', 'Z'
+            elif len(extra) > 2:
+                raise ValueError(
+                    f"_PlainTiffReader: can't interpret a {data.ndim}D TIFF "
+                    f"{data.shape} as (Z, Y, X, C); save it as OME-TIFF."
+                )
+        else:
+            others = [i for i in extra if axes[i] != 'C']
+            if len(others) > 1:
+                raise ValueError(
+                    f"_PlainTiffReader: TIFF axes {''.join(axes)} {data.shape} have "
+                    "more than one non-channel axis besides Y/X; save it as OME-TIFF."
+                )
+            for i in others:
+                axes[i] = 'Z'
+        for missing in 'ZC':
+            if missing not in axes:
+                data = data[np.newaxis]
+                axes.insert(0, missing)
+        return np.transpose(data, [axes.index(a) for a in 'ZYXC'])
+
+    @property
+    def physical_pixel_sizes(self):
+        return self._pixel_sizes
+
+    def get_image_data(self, dim_order="ZYXC", T=0):
+        if dim_order == "ZYXC":
+            return self._data_zyxc
+        raise NotImplementedError(
+            f"_PlainTiffReader: dim_order '{dim_order}' is not supported"
+        )
+
+    def get_image_dask_data(self, dim_order="ZYXC"):
+        import dask.array as da
+        if dim_order == "ZYXC":
+            return da.from_array(self._data_zyxc, chunks=self._data_zyxc.shape)
+        raise NotImplementedError(
+            f"_PlainTiffReader: dim_order '{dim_order}' is not supported"
+        )
+
+
+def _is_plain_tiff(input_file):
+    """True for a .tif/.tiff file without OME metadata."""
+    if not str(input_file).lower().endswith(('.tif', '.tiff')):
+        return False
+    try:
+        import tifffile
+        with tifffile.TiffFile(str(input_file)) as tif:
+            return not tif.is_ome
+    except Exception:
+        return False
+
+
 def _prompt_missing_voxel_sizes(r_X, r_Y, r_Z):
     """Prompt for any voxel size axis the file metadata didn't provide.
 
@@ -424,6 +551,9 @@ def open_image_file(input_file: str):
     if str(input_file).lower().endswith('.oib'):
         return _OifFileReader(str(input_file))
 
+    if _is_plain_tiff(input_file):
+        return _PlainTiffReader(str(input_file))
+
     if str(input_file).lower().endswith('.czi'):
         import importlib.util
         if importlib.util.find_spec('aicspylibczi') is None:
@@ -487,9 +617,18 @@ def load_image_and_metadata(input_file, roi_coords):
     r_X = meta.physical_pixel_sizes.X
     r_Y = meta.physical_pixel_sizes.Y
     r_Z = meta.physical_pixel_sizes.Z
+    is_2d = img.shape[0] == 1
+    if is_2d:
+        # Single plane (2D file, or a one-slice Z ROI): there is no Z step.
+        # Give the plane a 1 um thickness, so every "volume" computed
+        # downstream (voxel count x r_X x r_Y x r_Z) is the area in um2.
+        r_Z = 1.0
     r_X, r_Y, r_Z, was_prompted = _prompt_missing_voxel_sizes(r_X, r_Y, r_Z)
-    if was_prompted:
+    if was_prompted or is_2d:
         meta = _MetaWithVoxelSizeOverride(meta, r_X, r_Y, r_Z)
+    if is_2d:
+        print("2D image (single plane): Z voxel size set to 1 um, so volumes "
+              "[um3] are areas [um2].")
     file_meta = read_file_metadata(input_file, meta)
     print(f"Voxel size: [{r_X}, {r_Y}, {r_Z}] um")
     print(f"Date: {file_meta['date']}")
@@ -497,14 +636,47 @@ def load_image_and_metadata(input_file, roi_coords):
     return meta, img, r_X, r_Y, r_Z, file_meta, ROI_print, used_lazy_loading
 
 
-def select_roi_interactively(input_file, roi_coords, napari_module=None):
+def _saved_stain_display(stain_table_path):
+    """``{file channel name: (layer name, color)}`` from a saved stain table
+    (``<name_setup>_stain_dict.json`` or ``<name_setup>_ld_stain_dict.json``),
+    or ``{}`` if there is none. Only used to label the preview: the table
+    itself is still edited and confirmed in the stain editor."""
+    if not stain_table_path or not os.path.exists(stain_table_path):
+        return {}
+    try:
+        with open(stain_table_path, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+    except Exception as exc:
+        print(f"[preview] Could not read {stain_table_path} ({exc}); "
+              "using the file's channel names.")
+        return {}
+    display = {}
+    for row in rows:
+        channel = row.get("channel", _STAIN_NO_CHANNEL)
+        if channel == _STAIN_NO_CHANNEL:
+            continue
+        condition = str(row.get("condition", "")).upper()
+        marker = str(row.get("marker", "")).strip()
+        name = f"{condition} ({marker})" if marker else condition
+        display[str(channel)] = (name, str(row.get("color", "white")).lower())
+    if display:
+        print(f"Preview channels named and coloured from the saved stain table "
+              f"{stain_table_path}.")
+    return display
+
+
+def select_roi_interactively(input_file, roi_coords, napari_module=None,
+                             stain_table_path=None):
     """Open a napari window on the full image so the ROI can be set by
     dragging a rectangle instead of typing pixel coordinates.
 
     Every channel of the *full* image is loaded lazily (via dask — the file
     is opened independently of the main pipeline load, and no more of it is
     read than napari actually renders) and shown as a separate layer, named
-    from the file metadata. A yellow 'ROI' rectangle seeded from
+    from the file metadata. If a saved stain table exists at
+    ``stain_table_path``, the channels it uses are named after their
+    condition and marker (e.g. 'LIVE (CALCEIN)') and shown in its colors;
+    the table can still be changed in the stain editor afterwards. A yellow 'ROI' rectangle seeded from
     ``roi_coords`` is added on top; drag its edges/corners to the region you
     want, then close the window to continue.
 
@@ -536,7 +708,12 @@ def select_roi_interactively(input_file, roi_coords, napari_module=None):
     file_meta = read_file_metadata(input_file, meta)
     channel_names = file_meta.get("channels") or []
 
-    lazy = meta.get_image_dask_data("ZYXC")
+    # Small files are read directly; only large ones lazily (see
+    # _lazy_image_data -- the lazy TIFF reader can fail on some installs).
+    if _estimate_full_image_bytes(meta) > _LAZY_LOAD_THRESHOLD_BYTES:
+        lazy = _lazy_image_data(meta)
+    else:
+        lazy = meta.get_image_data("ZYXC", T=0)
     z_size, y_size, x_size, c_size = lazy.shape
 
     x0, x1, y0, y1, z0, z1 = roi_coords
@@ -565,12 +742,16 @@ def select_roi_interactively(input_file, roi_coords, napari_module=None):
         )
 
         default_colors = ["gray", "red", "green", "blue", "magenta", "cyan", "yellow"]
+        saved = _saved_stain_display(stain_table_path)
         for c in range(c_size):
             name = channel_names[c] if c < len(channel_names) else f"Channel {c}"
+            colormap = default_colors[c % len(default_colors)]
+            if name in saved:
+                name, colormap = saved[name]
             viewer.add_image(
                 lazy[:, :, :, c],
                 name=name,
-                colormap=default_colors[c % len(default_colors)],
+                colormap=colormap,
                 blending="additive",
             )
 
@@ -658,6 +839,9 @@ def initialize_dataset(input_file, roi_coords,
         PCM_factor += 1
 
     zoom_factors = [x * scale_factor for x in zoom_factors]
+    if img.shape[0] == 1:
+        # 2D image: never resample the single plane along Z.
+        zoom_factors[0] = 1.0
 
     return (meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
             cyto_factor, PCM_factor, zoom_factors, used_lazy_loading)
@@ -2781,12 +2965,13 @@ def build_labels_df(
     percell_mean_df=None,
     percell_std_df=None,
     progress=None,
+    is_2d=False,
 ):
     """Build the compact quantification dictionary, display a preview, and return the DataFrame.
 
     ``percell_mean_df``/``percell_std_df`` (optional, see
     ``compute_percell_marker_intensity_df``) add the "(all cells)" avg/std
-    columns per single-marker row.
+    columns per single-marker row. ``is_2d`` labels the sizes as areas.
     """
     filtered_img = im_final_stack['Filtered image']
     r_xyz = (r_zX, r_zY, r_zZ)
@@ -2802,7 +2987,8 @@ def build_labels_df(
         percell_std_df=percell_std_df,
         progress=progress,
     )
-    labels_df, truncated_df = labels_dict_to_dataframe(labels_dict, truncate=True, progress=progress)
+    labels_df, truncated_df = labels_dict_to_dataframe(labels_dict, truncate=True, progress=progress,
+                                                       is_2d=is_2d)
     try:
         from IPython.display import display as _display
         _display(truncated_df)
@@ -2822,6 +3008,7 @@ def build_full_labels_df(
     percell_mean_df=None,
     percell_std_df=None,
     progress=None,
+    is_2d=False,
 ):
     """Build the full quantification dictionary and convert it to a DataFrame.
 
@@ -2830,7 +3017,7 @@ def build_full_labels_df(
 
     ``percell_mean_df``/``percell_std_df`` (optional, see
     ``compute_percell_marker_intensity_df``) add the "(all cells)" avg/std
-    columns per single-marker row.
+    columns per single-marker row. ``is_2d`` labels the sizes as areas.
     """
     filtered_img = im_final_stack['Filtered image']
     r_xyz = (r_zX, r_zY, r_zZ)
@@ -2845,16 +3032,25 @@ def build_full_labels_df(
         percell_std_df=percell_std_df,
         progress=progress,
     )
-    return labels_dict_to_dataframe(labels_full_dict)
+    return labels_dict_to_dataframe(labels_full_dict, is_2d=is_2d)
 
 
-def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None):
-    """Convert a quantification dictionary to the standard notebook DataFrame."""
+def _area_column_names(columns):
+    """2D images: the sizes are areas, so '[um3]' columns become '[um2]'."""
+    return {c: c.replace("[um3]", "[um2]") for c in columns if "[um3]" in c}
+
+
+def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None, is_2d=False):
+    """Convert a quantification dictionary to the standard notebook DataFrame.
+
+    With ``is_2d`` the size columns are labelled as areas ('[um2]'): for a
+    single-plane image the Z voxel size is 1 um, so the values are areas.
+    """
     labels_df = pd.DataFrame.from_dict(labels_dict, orient="index", columns=LABELS_TABLE_COLUMNS)
     labels_df.index.name = "Combination"
 
     if not truncate:
-        return labels_df
+        return labels_df.rename(columns=_area_column_names(labels_df.columns)) if is_2d else labels_df
 
     truncated_df = labels_df.copy()
     truncate_columns = [
@@ -2878,6 +3074,9 @@ def labels_dict_to_dataframe(labels_dict, truncate=False, progress=None):
     for column in _progress_iter(truncate_columns, progress, desc="Step 23D - Truncate Display Columns"):
         truncated_df[column] = truncated_df[column].apply(lambda value: truncate_cell(value))
 
+    if is_2d:
+        labels_df = labels_df.rename(columns=_area_column_names(labels_df.columns))
+        truncated_df = truncated_df.rename(columns=_area_column_names(truncated_df.columns))
     return labels_df, truncated_df
 
 
@@ -3385,8 +3584,12 @@ def plot_marker_intensity_clouds(
     input_file=None,
     output_dir=None,
     show=True,
+    is_2d=False,
 ):
     """Flow-cytometry-style XY cloud: per-cell marker intensity vs cytoplasm size.
+
+    With ``is_2d`` (single-plane image, Z voxel size 1 um) the size is
+    labelled as an area in um2.
 
     Every segmented cell is one point per marker channel, all channels drawn
     in the same axes (one colour per marker) so their positivity can be
@@ -3471,7 +3674,7 @@ def plot_marker_intensity_clouds(
     if log_scale:
         ax.set_xscale("symlog", linthresh=1.0)
     ax.set_xlabel("Mean intensity per cell (a.u.)")
-    ax.set_ylabel("Cytoplasm size [um3]")
+    ax.set_ylabel("Cytoplasm area [um2]" if is_2d else "Cytoplasm size [um3]")
     ax.grid(alpha=0.2)
     ax.legend(title="Marker", loc="upper right", markerscale=2)
     if top_stats:
@@ -3481,7 +3684,7 @@ def plot_marker_intensity_clouds(
                 0.01, 0.95 - 0.14 * k, text, transform=ax_top.transAxes,
                 ha="left", va="top", fontsize=8, color=color, fontweight="bold",
             )
-    ax_top.set_title("Per-cell marker intensity vs cytoplasm size")
+    ax_top.set_title("Per-cell marker intensity vs cytoplasm " + ("area" if is_2d else "size"))
     ax_top.set_ylabel("Cells")
     ax_right.set_xlabel("Cells")
     plt.setp(ax_top.get_xticklabels(), visible=False)
@@ -5815,18 +6018,30 @@ def apply_per_channel_filter(image_stack, filter_func):
     return im_out
 
 
+def _filter_plane_or_volume(ch, filter_func):
+    """Apply *filter_func* to a (Z, Y, X) channel, in 2D when Z == 1 (a 3D
+    filter would mix the single plane with its padded copies)."""
+    if ch.shape[0] == 1:
+        return filter_func(ch[0])[np.newaxis]
+    return filter_func(ch)
+
+
 def apply_median_denoise(image_stack):
     """Apply median filter to each channel independently."""
     from skimage import filters
-    return apply_per_channel_filter(image_stack, lambda ch: filters.median(ch))
+    return apply_per_channel_filter(
+        image_stack, lambda ch: _filter_plane_or_volume(ch, filters.median)
+    )
 
 
 def apply_gaussian_smoothing(image_stack, sigma=0.5):
     """Apply Gaussian filter to each channel independently."""
     from skimage import filters
     return apply_per_channel_filter(
-        image_stack, 
-        lambda ch: filters.gaussian(ch, sigma, preserve_range=True)
+        image_stack,
+        lambda ch: _filter_plane_or_volume(
+            ch, lambda arr: filters.gaussian(arr, sigma, preserve_range=True)
+        ),
     )
 
 
@@ -5938,6 +6153,24 @@ def _estimate_full_image_bytes(meta):
     return n_voxels * itemsize
 
 
+def _lazy_image_data(meta):
+    """``meta.get_image_dask_data("ZYXC")``, checked by reading one voxel.
+
+    aicsimageio reads TIFF files lazily through zarr 2, which fails with
+    ``ImportError: cannot import name 'cbuffer_sizes' from 'numcodecs.blosc'``
+    when a newer numcodecs is installed. In that case the whole image is read
+    directly instead (returned as a numpy array) and a warning is printed.
+    """
+    try:
+        lazy = meta.get_image_dask_data("ZYXC")
+        lazy[:1, :1, :1, :1].compute()
+        return lazy
+    except ImportError as exc:
+        print(f"[lazy loading] Not available in this environment ({exc}); "
+              "reading the whole image into memory instead.")
+        return meta.get_image_data("ZYXC", T=0)
+
+
 def extract_roi_from_metadata(meta, roi_coords):
     """
     Extract a region of interest from a microscopy file.
@@ -5977,12 +6210,14 @@ def extract_roi_from_metadata(meta, roi_coords):
         z1 = meta.shape[2]
 
     used_lazy_loading = _estimate_full_image_bytes(meta) > _LAZY_LOAD_THRESHOLD_BYTES
-    if used_lazy_loading:
-        lazy = meta.get_image_dask_data("ZYXC")
+    lazy = _lazy_image_data(meta) if used_lazy_loading else None
+    if lazy is not None and not isinstance(lazy, np.ndarray):
         sub = lazy[z0:z1, y0:y1, x0:x1, :]
         image = sub.compute()
     else:
-        image = meta.get_image_data("ZYXC", T=0)[z0:z1, y0:y1, x0:x1, :]
+        used_lazy_loading = False
+        full = lazy if lazy is not None else meta.get_image_data("ZYXC", T=0)
+        image = full[z0:z1, y0:y1, x0:x1, :]
 
     return image, [x0, x1, y0, y1, z0, z1], used_lazy_loading
 
@@ -6201,6 +6436,9 @@ def _threshold_sauvola_chunked(arr, window_size, memory_budget_bytes=1_000_000_0
     from skimage.filters import threshold_sauvola
 
     z_dim, y_dim, x_dim = arr.shape
+    if z_dim == 1:
+        # 2D image: a 2D window over the single plane.
+        return threshold_sauvola(arr[0], window_size=window_size)[np.newaxis]
     half_before = window_size // 2 + 1
     half_after = window_size // 2
 
@@ -9306,7 +9544,9 @@ def _process_single_image_batch(
     (this image's own subfolder of the batch output folder)."""
     roi = list(roi_coords)
     if interactive_roi:
-        roi = select_roi_interactively(input_file, roi, napari_module=napari_module)
+        roi = select_roi_interactively(input_file, roi, napari_module=napari_module,
+                                       stain_table_path=(f"{name_setup}_stain_dict.json"
+                                                         if use_setup else None))
 
     # Cell 4
     (meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
@@ -10074,6 +10314,234 @@ def _ld_single_channel_df(marker):
                         index=pd.Index(['NUCLEI'], name='Condition'))
 
 
+# -- 2D images (single plane) ------------------------------------------------
+# The 3D watershed and its size refinement erode along Z, which wipes out a
+# one-plane image, so 2D images get their own segmentation: the same steps
+# (watershed on the distance map with an intensity-aware split, reference
+# size, merge of undersized fragments, escalating re-split of oversized
+# labels) with every size measured as an area.
+
+_LD_SPLIT_LEVELS_2D = (
+    # (name, peak spacing as a fraction of the radius, intensity weight)
+    ("aggressive", 0.4, 1.0),
+    ("very aggressive", 0.3, 1.5),
+    ("extreme", 0.2, 2.0),
+)
+
+
+def _ld_edt(region, spacing):
+    """Distance map of *region* (any dimension), padded so objects touching
+    the array edge are not treated as extending beyond it."""
+    inner = tuple(slice(1, -1) for _ in range(region.ndim))
+    return ndi.distance_transform_edt(np.pad(region, 1), sampling=spacing)[inner]
+
+
+def _ld_norm_in_mask(arr, mask):
+    values = arr[mask]
+    if values.size == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    lo, hi = np.percentile(values, [2, 98])
+    if hi <= lo:
+        return np.zeros_like(arr, dtype=np.float32)
+    return np.clip((arr - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+def _ld_disk_area_px(diameter_um, pixel_yx):
+    return max(1.0, np.pi * (diameter_um / 2.0) ** 2 / (pixel_yx[0] * pixel_yx[1]))
+
+
+def _ld_watershed_2d(mask, intensity, pixel_yx, diameter_um, peak_fraction=0.5,
+                     intensity_weight=0.5):
+    """Split a 2D mask into objects of about *diameter_um*: one marker per
+    peak of the distance map (peaks at least ``peak_fraction`` x the radius
+    apart, and at least one per island), flooded on a surface combining the
+    distance and the intensity, so touching objects split along the dimmer
+    seam between them."""
+    mask = np.asarray(mask, dtype=bool)
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    if not mask.any():
+        return labels
+    radius_px = diameter_um / 2.0 / float(np.mean(pixel_yx))
+    distance = ndi.gaussian_filter(_ld_edt(mask, pixel_yx), sigma=1.0)
+    islands, n_islands = ndi.label(mask)
+    peaks = peak_local_max(
+        distance,
+        min_distance=max(1, int(round(peak_fraction * radius_px))),
+        labels=islands,
+        exclude_border=False,
+    )
+    markers = np.zeros(mask.shape, dtype=np.int32)
+    if len(peaks):
+        markers[tuple(np.asarray(peaks).T)] = np.arange(1, len(peaks) + 1, dtype=np.int32)
+    has_marker = np.zeros(n_islands + 1, dtype=bool)
+    has_marker[np.unique(islands[markers > 0])] = True
+    next_id = len(peaks) + 1
+    island_slices = ndi.find_objects(islands)
+    for i in np.flatnonzero(~has_marker[1:]) + 1:
+        sl = island_slices[i - 1]
+        local = np.where(islands[sl] == i, distance[sl], -1.0)
+        pos = np.unravel_index(int(np.argmax(local)), local.shape)
+        markers[sl][pos] = next_id
+        next_id += 1
+    smoothed = ndi.gaussian_filter(np.asarray(intensity, dtype=np.float32), sigma=1.0)
+    elevation = -(_ld_norm_in_mask(distance, mask)
+                  + intensity_weight * _ld_norm_in_mask(smoothed, mask))
+    return watershed(elevation, markers, mask=mask).astype(np.int32)
+
+
+def _ld_reference_area_2d(labels, diameter_um, pixel_yx, size_reference="blend",
+                          plausible_range=(0.25, 4.0), min_labels=5):
+    """2D counterpart of `estimate_reference_nucleus_size`: the reference
+    object area (pixels) from a disk of *diameter_um* and/or the median area
+    of the plausible labels."""
+    choices = ("blend", "input", "detected")
+    if size_reference not in choices:
+        raise ValueError(f"Unknown size_reference '{size_reference}'. Choose from {choices}.")
+    input_px = _ld_disk_area_px(diameter_um, pixel_yx)
+    areas = np.bincount(np.asarray(labels).ravel())[1:]
+    areas = areas[areas > 0]
+    lo, hi = plausible_range
+    plausible = areas[(areas >= lo * input_px) & (areas <= hi * input_px)]
+    detected_px = float(np.median(plausible)) if plausible.size >= min_labels else None
+    used = size_reference
+    if detected_px is None or size_reference == "input":
+        reference_px, used = input_px, "input"
+    elif size_reference == "detected":
+        reference_px = detected_px
+    else:
+        reference_px = float(np.sqrt(input_px * detected_px))
+    px_um2 = pixel_yx[0] * pixel_yx[1]
+    print(f"Reference size: input diameter {diameter_um:g} um -> {input_px * px_um2:.1f} um2")
+    if detected_px is None:
+        print(f"  Detected: only {plausible.size} plausible label(s) (< {min_labels}) "
+              "-> using the input size.")
+    else:
+        print(f"  Detected: median of {plausible.size} plausible labels = "
+              f"{detected_px * px_um2:.1f} um2 ({detected_px / input_px:.2f}x input)")
+    print(f"  Reference ('{used}'): {reference_px * px_um2:.1f} um2 "
+          f"(~{diameter_um * np.sqrt(reference_px / input_px):.1f} um diameter)")
+    return reference_px
+
+
+def _ld_split_oversized_2d(labels, intensity, pixel_yx, reference_px, oversize_factor=2.0,
+                           max_iterations=3, progress=None):
+    """Re-split labels bigger than ``oversize_factor`` x the reference area
+    with increasingly aggressive settings (`_LD_SPLIT_LEVELS_2D`). Labels
+    that can't be split are kept."""
+    from skimage.segmentation import relabel_sequential
+
+    labels = np.asarray(labels, dtype=np.int32).copy()
+    ref_diameter = 2.0 * np.sqrt(reference_px * pixel_yx[0] * pixel_yx[1] / np.pi)
+    next_id = int(labels.max()) + 1
+    n_levels = int(np.clip(max_iterations, 1, len(_LD_SPLIT_LEVELS_2D)))
+    for level in range(n_levels):
+        name, peak_fraction, weight = _LD_SPLIT_LEVELS_2D[level]
+        areas = np.bincount(labels.ravel())
+        big = np.flatnonzero(areas > oversize_factor * reference_px)
+        big = big[big > 0]
+        if big.size == 0:
+            break
+        slices = ndi.find_objects(labels)
+        n_split = 0
+        for lab in _progress_iter(big.tolist(), progress,
+                                  desc=f'Split oversized ({name})', leave=False):
+            sl = slices[lab - 1]
+            if sl is None:
+                continue
+            region = labels[sl] == lab
+            parts = _ld_watershed_2d(region, intensity[sl], pixel_yx, ref_diameter,
+                                     peak_fraction=peak_fraction, intensity_weight=weight)
+            ids = np.unique(parts[parts > 0])
+            if ids.size < 2:
+                continue
+            view = labels[sl]
+            for pid in ids[1:]:
+                view[parts == pid] = next_id
+                next_id += 1
+            n_split += 1
+        print(f"  Split level {level + 1} ('{name}'): {big.size} oversized label(s) "
+              f"(> {oversize_factor:g}x reference), {n_split} split")
+    labels, _, _ = relabel_sequential(labels)
+    return labels.astype(np.int32)
+
+
+def _ld_cellpose_2d(image_2d, diameter_um, pixel_yx, model_type):
+    from cellpose import models
+
+    model = models.Cellpose(model_type=model_type, gpu=True)
+    diameter_px = diameter_um / float(np.mean(pixel_yx))
+    labels, _, _, _ = model.eval(image_2d, diameter=diameter_px, channels=[0, 0])
+    print(f"Cellpose 2D (model={model_type}, diameter_px={diameter_px:.1f})")
+    return np.asarray(labels, dtype=np.int32)
+
+
+def _ld_stardist_2d(image_2d, model_name="2D_versatile_fluo"):
+    try:
+        from csbdeep.utils import normalize
+        from stardist.models import StarDist2D
+    except ImportError as exc:
+        raise ImportError(
+            "StarDist requires TensorFlow, csbdeep and stardist, which are not "
+            "installed (TensorFlow has no wheels for Python 3.14). Use Python "
+            "3.10-3.13 for StarDist, or set trig_stardist=False."
+        ) from exc
+    model = StarDist2D.from_pretrained(model_name)
+    labels, _ = model.predict_instances(normalize(image_2d, 1, 99.8, axis=None))
+    return np.asarray(labels, dtype=np.int32)
+
+
+def _ld_segment_objects_2d(
+    mask,
+    intensity,
+    pixel_yx,
+    diameter_um,
+    what,
+    method="watershed",
+    cellpose_model="nuclei",
+    size_reference="blend",
+    iterative_split=True,
+    oversize_factor=2.0,
+    max_split_iterations=3,
+    merge_undersized=True,
+    undersize_factor=0.5,
+    progress=None,
+):
+    """Segment a 2D image into objects of about *diameter_um* (nuclei or cell
+    bodies) and refine them by area, like the 3D nuclei segmentation:
+    watershed (or Cellpose / StarDist in 2D), then undersized fragments
+    merged into a touching neighbour when there is no dark seam between them
+    (`merge_undersized_nuclei`, run on the single plane) and oversized labels
+    re-split (`_ld_split_oversized_2d`). Labels are never deleted."""
+    if method == "cellpose":
+        labels = _ld_cellpose_2d(intensity, diameter_um, pixel_yx, cellpose_model)
+    elif method == "stardist":
+        labels = _ld_stardist_2d(intensity)
+    else:
+        filled = _fill_small_holes_per_slice(
+            np.asarray(mask, dtype=bool)[np.newaxis], _ld_disk_area_px(diameter_um, pixel_yx)
+        )[0]
+        labels = _ld_watershed_2d(filled, intensity, pixel_yx, diameter_um)
+    print(f"Total {what} found: {int(np.count_nonzero(np.unique(labels)))}")
+    if not (iterative_split or merge_undersized) or not labels.any():
+        return labels
+
+    reference_px = _ld_reference_area_2d(labels, diameter_um, pixel_yx, size_reference)
+    if merge_undersized:
+        merged, _ = merge_undersized_nuclei(
+            labels[np.newaxis], intensity[np.newaxis], reference_px,
+            undersize_factor=undersize_factor, progress=progress,
+        )
+        labels = np.asarray(merged[0], dtype=np.int32)
+    if iterative_split:
+        labels = _ld_split_oversized_2d(
+            labels, intensity, pixel_yx, reference_px,
+            oversize_factor=oversize_factor, max_iterations=max_split_iterations,
+            progress=progress,
+        )
+    print(f"Total {what} after size refinement: {int(np.count_nonzero(np.unique(labels)))}")
+    return labels
+
+
 def segment_ld_nuclei(
     im_final_stack,
     stain_df,
@@ -10111,6 +10579,28 @@ def segment_ld_nuclei(
         return {'Nuclei': np.zeros(shape, dtype=np.int32)}
 
     print(f"Nuclei segmented from the nuclear marker(s): {_ld_marker_names(stain_df, nuclear)}")
+    if shape[0] == 1:
+        r_zX, r_zY, _ = r_zxyz
+        merged = _ld_merged_substack(im_final_stack, nuclear)
+        method = 'cellpose' if trig_cellpose else ('stardist' if trig_stardist else 'watershed')
+        labels = _ld_segment_objects_2d(
+            merged['Threshold image'][0, ..., 0] > 0,
+            merged['Filtered image'][0, ..., 0],
+            pixel_yx=(r_zY, r_zX),
+            diameter_um=nuclei_diameter,
+            what="nuclei",
+            method=method,
+            cellpose_model='nuclei',
+            size_reference=size_reference,
+            iterative_split=iterative_split,
+            oversize_factor=oversize_factor,
+            max_split_iterations=max_split_iterations,
+            merge_undersized=merge_undersized,
+            undersize_factor=undersize_factor,
+            progress=progress,
+        )
+        return {'Nuclei': labels[np.newaxis]}
+
     sub_df = _ld_single_channel_df('+'.join(str(stain_df['Marker'].iloc[c]) for c in nuclear))
     seg = segment_nuclei(
         _ld_merged_substack(im_final_stack, nuclear),
@@ -10136,7 +10626,7 @@ def _ld_union_slices(slices):
     slices = [s for s in slices if s is not None]
     return tuple(
         slice(min(s[d].start for s in slices), max(s[d].stop for s in slices))
-        for d in range(3)
+        for d in range(len(slices[0]))
     )
 
 
@@ -10152,8 +10642,8 @@ def _ld_combine_nuclei_and_bodies(nuclei, bodies, spacing, nuclei_diameter,
     - a nucleus outside every body is a cell without stained cytoplasm: the
       cell is the nucleus;
     - a body with no nucleus is a cell whose nucleus is not stained: its
-      nucleus is *estimated* as a sphere of ``nuclei_diameter`` around the
-      innermost point of the body. It gives the cell a position and the
+      nucleus is *estimated* as a sphere (a disk in 2D) of ``nuclei_diameter``
+      around the innermost point of the body. It gives the cell a position and the
       compartment where the nuclear markers are measured.
 
     Returns
@@ -10220,8 +10710,7 @@ def _ld_combine_nuclei_and_bodies(nuclei, bodies, spacing, nuclei_diameter,
         for k, n in enumerate(owned, start=1):
             markers[nuc_sub == n] = k
         region = body | (markers > 0)
-        distance = ndi.distance_transform_edt(np.pad(region, 1), sampling=spacing)[1:-1, 1:-1, 1:-1]
-        parts = watershed(-distance, markers, mask=region)
+        parts = watershed(-_ld_edt(region, spacing), markers, mask=region)
         for k in range(1, len(owned) + 1):
             cell_view[parts == k] = next_id
             nuc_view[markers == k] = next_id
@@ -10266,12 +10755,10 @@ def _ld_combine_nuclei_and_bodies(nuclei, bodies, spacing, nuclei_diameter,
         if sl is None:
             continue
         region = cells[sl] == j
-        distance = ndi.distance_transform_edt(np.pad(region, 1), sampling=spacing)[1:-1, 1:-1, 1:-1]
+        distance = _ld_edt(region, spacing)
         center = np.unravel_index(int(np.argmax(distance)), distance.shape)
-        zz, yy, xx = np.ogrid[:region.shape[0], :region.shape[1], :region.shape[2]]
-        d2 = (((zz - center[0]) * spacing[0]) ** 2
-              + ((yy - center[1]) * spacing[1]) ** 2
-              + ((xx - center[2]) * spacing[2]) ** 2)
+        grids = np.ogrid[tuple(slice(0, n) for n in region.shape)]
+        d2 = sum(((g - c) * s) ** 2 for g, c, s in zip(grids, center, spacing))
         nuc_out[sl][region & (d2 <= radius ** 2)] = j
 
     info = {
@@ -10332,12 +10819,30 @@ def segment_ld_cells(
     if 'Nuclei' not in im_segmentation_stack:
         raise RuntimeError("Run Cell 17 first so im_segmentation_stack contains 'Nuclei'.")
     nuclei = np.asarray(im_segmentation_stack['Nuclei'], dtype=np.int32)
+    is_2d = nuclei.shape[0] == 1
 
     if cytoplasmic:
         print(f"Cell bodies segmented from the cytoplasmic marker(s): "
               f"{_ld_marker_names(stain_df, cytoplasmic)}")
         merged = _ld_merged_substack(im_final_stack, cytoplasmic)
-        if trig_cellpose_cyto:
+        if is_2d:
+            bodies = _ld_segment_objects_2d(
+                merged['Threshold image'][0, ..., 0] > 0,
+                merged['Filtered image'][0, ..., 0],
+                pixel_yx=(r_zY, r_zX),
+                diameter_um=cell_diameter,
+                what="cell bodies",
+                method='cellpose' if trig_cellpose_cyto else 'watershed',
+                cellpose_model='cyto3',
+                size_reference=size_reference,
+                iterative_split=iterative_split,
+                oversize_factor=oversize_factor,
+                max_split_iterations=max_split_iterations,
+                merge_undersized=merge_undersized,
+                undersize_factor=undersize_factor,
+                progress=progress,
+            )[np.newaxis]
+        elif trig_cellpose_cyto:
             intensity = merged['Filtered image'][..., 0]
             bodies = segment_nuclei_cellpose(
                 intensity,
@@ -10385,13 +10890,25 @@ def segment_ld_cells(
         print("No cytoplasmic marker: each cell is its stained nucleus.")
         bodies = np.zeros_like(nuclei)
 
-    cells, nuclei_out, stained, info = _ld_combine_nuclei_and_bodies(
-        nuclei, bodies,
-        spacing=(r_zZ, r_zY, r_zX),
-        nuclei_diameter=nuclei_diameter,
-        min_nucleus_overlap=min_nucleus_overlap,
-        progress=progress,
-    )
+    if is_2d:
+        # Combine in the image plane (a 3D distance map would see the empty
+        # planes above and below the single slice).
+        cells, nuclei_out, stained, info = _ld_combine_nuclei_and_bodies(
+            nuclei[0], bodies[0],
+            spacing=(r_zY, r_zX),
+            nuclei_diameter=nuclei_diameter,
+            min_nucleus_overlap=min_nucleus_overlap,
+            progress=progress,
+        )
+        cells, nuclei_out, stained = (a[np.newaxis] for a in (cells, nuclei_out, stained))
+    else:
+        cells, nuclei_out, stained, info = _ld_combine_nuclei_and_bodies(
+            nuclei, bodies,
+            spacing=(r_zZ, r_zY, r_zX),
+            nuclei_diameter=nuclei_diameter,
+            min_nucleus_overlap=min_nucleus_overlap,
+            progress=progress,
+        )
     n_cells = info['cells']
     n_both = n_cells - info['estimated nuclei'] - info['nucleus only']
     print(f"{info['nuclei']} nuclei + {info['bodies']} cell bodies -> {n_cells} cells:")
@@ -10461,6 +10978,16 @@ def _ld_label_centroids(labels, n_labels):
         return (sums / counts).T[1:]
 
 
+def _ld_size_names(is_2d):
+    """Column names and units of the per-cell sizes: areas for 2D images,
+    volumes for 3D ones."""
+    if is_2d:
+        return {'cell': 'Cell area [um2]', 'nucleus': 'Nucleus area [um2]',
+                'word': 'area', 'unit': 'um2', 'pretty': 'um²'}
+    return {'cell': 'Cell volume [um3]', 'nucleus': 'Nucleus volume [um3]',
+            'word': 'volume', 'unit': 'um3', 'pretty': 'um³'}
+
+
 def _ld_intensity_column(condition, compartment):
     return f"{condition} mean int. ({'nucleus' if compartment == 'nuclear' else 'cell'})"
 
@@ -10513,7 +11040,8 @@ def classify_live_dead(
     im_segmentation_stack : dict
     ld_cells_df : DataFrame
         One row per cell (index 'Cell label' 1..K): status, position and
-        volume of the cell, nucleus (stained/estimated) and, per condition,
+        size of the cell (volume, or area for a 2D image), nucleus
+        (stained/estimated) and, per condition,
         coverage, positivity and mean intensity. The settings are stored in
         ``ld_cells_df.attrs``.
     """
@@ -10521,7 +11049,6 @@ def classify_live_dead(
         raise ValueError(f"ld_rule must be one of {LD_RULES}, got '{ld_rule}'")
     loc = _ld_localization_map(localization)
     r_zX, r_zY, r_zZ = r_zxyz
-    voxel_um3 = float(r_zX) * float(r_zY) * float(r_zZ)
     thr = im_final_stack['Threshold image']
     filt = im_final_stack['Filtered image']
     cells = im_segmentation_stack['Cytoplasm']
@@ -10536,14 +11063,19 @@ def classify_live_dead(
     nuc_vox = _ld_label_sums(nuclei, None, n_cells)
     stained_vox = _ld_label_sums(stained, None, n_cells)[1:]
     centroids = _ld_label_centroids(cells, n_cells)
+    # 2D image: sizes are areas (pixel area), not volumes.
+    is_2d = cells.shape[0] == 1
+    size = _ld_size_names(is_2d)
+    unit_um = float(r_zX) * float(r_zY) * (1.0 if is_2d else float(r_zZ))
 
     df = pd.DataFrame(index=pd.RangeIndex(1, n_cells + 1, name='Cell label'))
     df['X [um]'] = centroids[:, 2] * r_zX
     df['Y [um]'] = centroids[:, 1] * r_zY
-    df['Z [um]'] = centroids[:, 0] * r_zZ
-    df['Cell volume [um3]'] = cell_vox[1:] * voxel_um3
+    if not is_2d:
+        df['Z [um]'] = centroids[:, 0] * r_zZ
+    df[size['cell']] = cell_vox[1:] * unit_um
     df['Nucleus'] = np.where(stained_vox > 0, 'stained', 'estimated')
-    df['Nucleus volume [um3]'] = np.where(stained_vox > 0, stained_vox * voxel_um3, np.nan)
+    df[size['nucleus']] = np.where(stained_vox > 0, stained_vox * unit_um, np.nan)
 
     seg = dict(im_segmentation_stack)
     coverage, positive = {}, {}
@@ -10611,6 +11143,7 @@ def classify_live_dead(
     seg['Status'] = status_lut[cells]
 
     df.attrs = {
+        'is_2d': bool(is_2d),
         'ld_rule': rule,
         'rule_text': _ld_rule_text(rule, has_live, has_dead),
         'min_positive_fraction': float(min_positive_fraction),
@@ -10685,20 +11218,22 @@ def _ld_conditions(ld_cells_df):
 def _ld_status_table(ld_cells_df):
     """Population table: one row per status (LIVE, DEAD) and ALL cells."""
     loc = ld_cells_df.attrs.get('localization', {})
+    size = _ld_size_names(ld_cells_df.attrs.get('is_2d', False))
+    word, unit = size['word'], size['unit']
     total = len(ld_cells_df)
     rows = {}
     for name in ('LIVE', 'DEAD', 'ALL'):
         sub = ld_cells_df if name == 'ALL' else ld_cells_df[ld_cells_df['Status'] == name]
         n = len(sub)
-        nuc = sub['Nucleus volume [um3]'].dropna()
+        nuc = sub[size['nucleus']].dropna()
         row = {
             'Cells': n,
             '% of cells': 100.0 * n / total if total else np.nan,
-            'Cell volume mean [um3]': sub['Cell volume [um3]'].mean() if n else np.nan,
-            'Cell volume SD [um3]': sub['Cell volume [um3]'].std(ddof=0) if n else np.nan,
+            f'Cell {word} mean [{unit}]': sub[size['cell']].mean() if n else np.nan,
+            f'Cell {word} SD [{unit}]': sub[size['cell']].std(ddof=0) if n else np.nan,
             'Stained nuclei': int(len(nuc)),
-            'Nucleus volume mean [um3]': nuc.mean() if len(nuc) else np.nan,
-            'Nucleus volume SD [um3]': nuc.std(ddof=0) if len(nuc) else np.nan,
+            f'Nucleus {word} mean [{unit}]': nuc.mean() if len(nuc) else np.nan,
+            f'Nucleus {word} SD [{unit}]': nuc.std(ddof=0) if len(nuc) else np.nan,
         }
         for cond in _ld_conditions(ld_cells_df):
             int_col = _ld_intensity_column(cond, loc.get(cond))
@@ -10727,8 +11262,11 @@ def print_ld_summary(ld_cells_df, stain_df):
     per population, cell/nucleus size and marker intensity."""
     attrs = ld_cells_df.attrs
     loc = attrs.get('localization', {})
+    size = _ld_size_names(attrs.get('is_2d', False))
     total = len(ld_cells_df)
 
+    if attrs.get('is_2d'):
+        print("2D IMAGE: cell and nucleus sizes are areas [um²].")
     print("CHANNELS:")
     for i, cond in enumerate(stain_df.index):
         row = stain_df.loc[cond]
@@ -10769,8 +11307,8 @@ def print_ld_summary(ld_cells_df, stain_df):
         if sub.empty:
             continue
         print(f"\n {status}  —  {len(sub)} cells  ({100.0 * len(sub) / total:.1f} %)")
-        _ld_stats_line(sub['Cell volume [um3]'], "   Cell volume", "um³")
-        _ld_stats_line(sub['Nucleus volume [um3]'], "   Nucleus volume (stained)", "um³")
+        _ld_stats_line(sub[size['cell']], f"   Cell {size['word']}", size['pretty'])
+        _ld_stats_line(sub[size['nucleus']], f"   Nucleus {size['word']} (stained)", size['pretty'])
         for cond in _ld_conditions(ld_cells_df):
             col = _ld_intensity_column(cond, loc.get(cond))
             _ld_stats_line(sub[col], f"   {col}", "a.u.")
@@ -10851,12 +11389,14 @@ def plot_live_dead_classification(ld_cells_df, stain_complete_df, input_file=Non
 def plot_ld_spatial_distributions(ld_cells_df, stain_complete_df, volume_shape, r_zxyz, bins=30):
     """LD Cell 27: where the LIVE and DEAD cells are along X, Y and Z (number of
     cells, left axis) and the viability along each direction (% LIVE, dashed,
-    right axis) -- e.g. viability vs depth in a 3D construct."""
+    right axis) -- e.g. viability vs depth in a 3D construct. A 2D image has
+    only X and Y."""
     colors = _ld_status_colors(stain_complete_df)
     r_zX, r_zY, r_zZ = r_zxyz
     extents = {'X': volume_shape[2] * r_zX, 'Y': volume_shape[1] * r_zY, 'Z': volume_shape[0] * r_zZ}
-    fig, axs = plt.subplots(3, 1, figsize=(15, 15))
-    for ax, axis_name in zip(axs, 'XYZ'):
+    axis_names = 'XYZ' if 'Z [um]' in ld_cells_df.columns else 'XY'
+    fig, axs = plt.subplots(len(axis_names), 1, figsize=(15, 5 * len(axis_names)))
+    for ax, axis_name in zip(axs, axis_names):
         edges = np.linspace(0, extents[axis_name], bins + 1)
         centers = (edges[:-1] + edges[1:]) / 2
         counts = {}
@@ -10883,12 +11423,14 @@ def plot_ld_spatial_distributions(ld_cells_df, stain_complete_df, volume_shape, 
 
 
 def plot_ld_size_distributions(ld_cells_df, stain_complete_df, bins=30):
-    """LD Cell 28: cell volume and (stained) nucleus volume of the LIVE and
-    DEAD cells."""
+    """LD Cell 28: cell and (stained) nucleus size of the LIVE and DEAD cells:
+    volumes, or areas for a 2D image."""
     colors = _ld_status_colors(stain_complete_df)
+    size = _ld_size_names(ld_cells_df.attrs.get('is_2d', False))
+    word = size['word'].upper()
     fig, axs = plt.subplots(2, 1, figsize=(15, 10))
-    for ax, col, title in ((axs[0], 'Cell volume [um3]', 'CELL SIZE DISTRIBUTION'),
-                           (axs[1], 'Nucleus volume [um3]', 'NUCLEUS SIZE DISTRIBUTION (stained nuclei)')):
+    for ax, col, title in ((axs[0], size['cell'], f'CELL {word} DISTRIBUTION'),
+                           (axs[1], size['nucleus'], f'NUCLEUS {word} DISTRIBUTION (stained nuclei)')):
         values = ld_cells_df[col].dropna()
         if values.empty:
             ax.text(0.5, 0.5, "no data", ha='center', va='center', transform=ax.transAxes)
@@ -10901,7 +11443,7 @@ def plot_ld_size_distributions(ld_cells_df, stain_complete_df, bins=30):
                             label=f"{status} ({len(sub)})")
             ax.legend(loc="upper right")
         ax.set_title(title)
-        ax.set_xlabel("[μm3]")
+        ax.set_xlabel(f"[{size['pretty'].replace('um', 'μm')}]")
         ax.set_ylabel("Cells")
     return fig, axs
 
@@ -10933,6 +11475,7 @@ def export_live_dead_to_excel(input_file, original_stain_complete_df, ld_cells_d
     counts = ld_cells_df['Status'].value_counts()
     n_live, n_dead = int(counts.get('LIVE', 0)), int(counts.get('DEAD', 0))
     summary_rows = [
+        ('Image', '2D (sizes are areas, um2)' if attrs.get('is_2d') else '3D (sizes are volumes, um3)'),
         ('Total cells', total),
         ('LIVE cells', n_live),
         ('DEAD cells', n_dead),
@@ -11063,10 +11606,14 @@ def _process_single_image_ld_batch(
 ):
     """Run the LIVE/DEAD notebook (Cells 4-35) on one file, without viewers,
     inline plots or PNG subfolders, writing every output file into
-    *output_dir*. Returns this image's LIVE/DEAD counts."""
+    *output_dir*. Returns this image's LIVE/DEAD counts. A 2D image (single
+    plane) is segmented in 2D, its sizes are areas and the 3D mesh exports
+    are skipped."""
     roi = list(roi_coords)
     if interactive_roi:
-        roi = select_roi_interactively(input_file, roi, napari_module=napari_module)
+        roi = select_roi_interactively(input_file, roi, napari_module=napari_module,
+                                       stain_table_path=(f"{name_setup}_ld_stain_dict.json"
+                                                         if use_setup else None))
 
     # Cell 4
     (meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
@@ -11077,6 +11624,7 @@ def _process_single_image_ld_batch(
         scale_factor=scale_factor,
         zoom_factors=list(zoom_factors),
     )
+    is_2d = img.shape[0] == 1
 
     # Cells 6-7
     im_final_stack, _, _, _, _, stain_df, _ = prepare_and_preview(
@@ -11217,6 +11765,7 @@ def _process_single_image_ld_batch(
         percell_mean_df=percell_mean_df,
         percell_std_df=percell_std_df,
         progress=progress,
+        is_2d=is_2d,
     )
 
     # Cells 29-30 -- saved as PNG only, not displayed
@@ -11234,6 +11783,7 @@ def _process_single_image_ld_batch(
         input_file=input_file,
         output_dir=output_dir,
         show=False,
+        is_2d=is_2d,
     )
     plt.close("all")
 
@@ -11255,8 +11805,10 @@ def _process_single_image_ld_batch(
         show_plot=False,
     )
 
-    # Cells 31, 32, 35
-    if export_vtk:
+    # Cells 31, 32, 35 -- 3D meshes, not made for a 2D image
+    if is_2d and (export_vtk or export_stl or export_fea):
+        print("2D image: VTK, STL and FEA mesh exports skipped (3D only).")
+    if export_vtk and not is_2d:
         build_vtk_volumes(
             im_segmentation_stack,
             labels_full_df=labels_full_df,
@@ -11268,7 +11820,7 @@ def _process_single_image_ld_batch(
             output_dir=output_dir,
             live_counter=False,
         )
-    if export_stl:
+    if export_stl and not is_2d:
         export_marker_stl(
             im_segmentation_stack,
             stain_df=stain_df,
@@ -11279,7 +11831,7 @@ def _process_single_image_ld_batch(
             progress=progress,
             output_dir=output_dir,
         )
-    if export_fea:
+    if export_fea and not is_2d:
         export_fea_mesh(
             {'Nuclei': im_segmentation_stack['Cytoplasm']},
             input_file=input_file,
@@ -11290,6 +11842,7 @@ def _process_single_image_ld_batch(
     counts = ld_cells_df['Status'].value_counts()
     n_cells = len(ld_cells_df)
     return {
+        'Image': '2D' if is_2d else '3D',
         'Cells': n_cells,
         'LIVE': int(counts.get('LIVE', 0)),
         'DEAD': int(counts.get('DEAD', 0)),
@@ -11370,7 +11923,7 @@ def run_ld_batch_folder(
         print(f"[{n}/{len(image_files)}] {image_path.name}")
         print("=" * 80)
         image_output_dir = output_dir / _image_stem(image_path)
-        row = {'File': image_path.name, 'Status': 'OK', 'Cells': np.nan, 'LIVE': np.nan,
+        row = {'File': image_path.name, 'Status': 'OK', 'Image': '', 'Cells': np.nan, 'LIVE': np.nan,
                'DEAD': np.nan, 'Viability [%]': np.nan,
                'Output folder': str(image_output_dir), 'Error': ''}
         try:
