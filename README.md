@@ -41,126 +41,230 @@ This repository provides Jupyter notebooks and shared Python helpers for the seg
 
 ## Getting Started
 
+Type (or paste) **one command at a time**, press **Enter**, and wait for it to finish before the next one.
+
 ### Prerequisites
 
-- **Python 3.10, 3.11, 3.12, 3.13, or 3.14.** `requirements.txt` pins `numpy`/`scipy`/`tensorflow`/`lxml` per Python version via markers, so one file covers all five (3.10/3.11 is the most tested range; 3.12–3.14 have been checked against current PyPI wheel availability but are less exercised in practice; **3.14 is the newest supported — avoid 3.15+**). **Python 3.14 limitation:** TensorFlow publishes no 3.14 wheels, so TensorFlow, `csbdeep` and `stardist` are not installed there and the StarDist option (`trig_stardist`) is unavailable; Cellpose and the classical methods work normally. Use Python 3.10–3.13 if you need StarDist. Likewise, `aicspylibczi` (the Zeiss `.czi` reader) has no 3.14 wheels, so it is skipped there and **`.czi` files can't be opened on 3.14** — use Python 3.10–3.13 for `.czi`, or export the images to OME-TIFF. Check your version with `python --version` (Windows/macOS) or `python3 --version` (macOS/Linux). Don't have it? Download from [python.org/downloads](https://www.python.org/downloads/).
-- **Git**, to clone the repository. Don't have it? Download from [git-scm.com/downloads](https://git-scm.com/downloads).
-- **[`uv`](https://github.com/astral-sh/uv)**, used in every "Install dependencies" step below instead of plain `pip`. Two independent reasons:
-  - **Speed:** `requirements.txt` pulls in several large, dependency-heavy packages (napari, TensorFlow, PyTorch-based Cellpose, VTK/PyVista, SimpleITK). Plain `pip` can take a long time to resolve and download all of them; `uv` resolves and installs the same packages dramatically faster.
-  - **Correctness on Python 3.13:** `aicsimageio==4.14.0` unconditionally pins `lxml<5`, which has no Python 3.13 wheels. `requirements.txt` raises that floor for 3.13, but only `uv`'s `--override` flag can force it past aicsimageio's declared cap (plain `pip` has no equivalent — it would try to build old `lxml` from source and fail without a full C++ toolchain).
-
-  Install it once with `pip install uv`. On Python 3.10/3.11/3.12 the `--override` flag used below is a no-op (nothing to override), so the exact same command works unchanged on every supported Python version.
+- **Python 3.10–3.14** (3.10/3.11 are the most tested; avoid 3.15+). Download from [python.org/downloads](https://www.python.org/downloads/).
+  - On **Python 3.14**, StarDist (`trig_stardist`) and `.czi` files are unavailable (no TensorFlow / `aicspylibczi` wheels). Use 3.10–3.13 if you need them.
+- **Git**, to download the repository. Download from [git-scm.com/downloads](https://git-scm.com/downloads).
+- **[`uv`](https://github.com/astral-sh/uv)** is installed in the steps below. It is used instead of plain `pip` because it is much faster, and because its `--override` flag is needed to install on Python 3.13 (`aicsimageio` pins an `lxml` with no 3.13 wheels). On other versions the flag does nothing, so the same command works everywhere.
 
 ### Windows
 
-> **Important:** Run all commands below in **PowerShell**, not Command Prompt (`cmd.exe`). Look for "Windows PowerShell" or "PowerShell" in the Start menu — the icon is a dark blue console with a `>_` prompt (Command Prompt uses a plain black icon). Terminal in VS Code and Windows Terminal also default to PowerShell. The commands use PowerShell-only syntax (e.g. `.venv\Scripts\Activate.ps1`) and will fail or behave differently in `cmd.exe`.
+> **Use PowerShell, not Command Prompt.** Open the Start menu and search for "PowerShell" (dark blue icon with `>_`). The VS Code terminal and Windows Terminal also use PowerShell by default.
 
-1. **Clone the repository**
+1. **Check that Python is installed** — it should print `Python 3.1x.x`:
+   ```powershell
+   python --version
+   ```
+   If `python` is not recognized, use the Python Launcher instead: replace `python` with `py -3.11` (or your version) in step 5.
+
+2. **Go to the folder where you want the project** (e.g. Documents):
+   ```powershell
+   cd $HOME\Documents
+   ```
+
+3. **Download the repository:**
    ```powershell
    git clone https://github.com/edoborgiani/napari_env-3D_fluo_segmentation.git
+   ```
+
+4. **Enter the project folder:**
+   ```powershell
    cd napari_env-3D_fluo_segmentation
    ```
 
-2. **Create a virtual environment** (recommended)
+5. **Create a virtual environment** (an isolated Python for this project):
    ```powershell
    python -m venv .venv
-   .venv\Scripts\Activate.ps1
    ```
 
-   If PowerShell reports that `python` is not recognized, use the [Python Launcher](https://docs.python.org/3/using/windows.html#launcher) instead — it ships with the official python.org installer even when `python` isn't on `PATH`: `py -3.11 -m venv .venv` (or `py -3.13 -m venv .venv` / `py -3.14 -m venv .venv`).
+6. **Activate it** — `(.venv)` appears at the start of the prompt:
+   ```powershell
+   .venv\Scripts\Activate.ps1
+   ```
+   If you get an error about *running scripts being disabled*, run the command below once, answer `Y`, then repeat step 6:
+   ```powershell
+   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+   ```
 
-   > If activation fails with a message about running scripts being disabled on this system, PowerShell's execution policy is blocking it. Run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once (in the same PowerShell window), confirm with `Y`, then re-run the activation command above.
-
-3. **Install dependencies**
+7. **Install `uv`:**
    ```powershell
    pip install uv
+   ```
+
+8. **Install the dependencies** (takes a few minutes):
+   ```powershell
    uv pip install -r requirements.txt --override overrides.txt
    ```
 
-4. **Launch Jupyter**
+9. **Launch Jupyter** — it opens in your browser:
    ```powershell
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.3.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.1.ipynb` for Live/Dead segmentation.
+
+10. **Open a notebook:** `Fluo_3D_nuc_seg_v1.6.3.ipynb` (nuclei) or `Fluo_3D_LD_seg_v1.2.1.ipynb` (Live/Dead).
+
+**Next time**, open PowerShell in the project folder and repeat only step 6 (activate) and step 9 (launch Jupyter).
 
 ---
 
 ### macOS
 
-1. **Clone the repository**
+Open the **Terminal** app (Applications → Utilities → Terminal).
+
+1. **Check that Python is installed** — it should print `Python 3.1x.x`:
+   ```bash
+   python3 --version
+   ```
+
+2. **Go to the folder where you want the project** (e.g. Documents):
+   ```bash
+   cd ~/Documents
+   ```
+
+3. **Download the repository:**
    ```bash
    git clone https://github.com/edoborgiani/napari_env-3D_fluo_segmentation.git
+   ```
+
+4. **Enter the project folder:**
+   ```bash
    cd napari_env-3D_fluo_segmentation
    ```
 
-2. **Create a virtual environment** (recommended)
+5. **Create a virtual environment** (an isolated Python for this project):
    ```bash
    python3 -m venv .venv
+   ```
+
+6. **Activate it** — `(.venv)` appears at the start of the prompt:
+   ```bash
    source .venv/bin/activate
    ```
 
-3. **Install dependencies**
+7. **Install `uv`:**
    ```bash
    pip install uv
+   ```
+
+8. **Install the dependencies** (takes a few minutes):
+   ```bash
    uv pip install -r requirements.txt --override overrides.txt
    ```
 
-4. **Launch Jupyter**
+9. **Launch Jupyter** — it opens in your browser:
    ```bash
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.3.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.1.ipynb` for Live/Dead segmentation.
 
-> **Note (Apple Silicon — M1/M2/M3):** If step 3 fails with build errors for packages like `tetgen` or `meshlib`, your Mac's ARM architecture is likely the cause. In that case, skip steps 2–3 above and use [Miniforge](https://github.com/conda-forge/miniforge) to create a conda environment instead:
-> ```bash
-> conda create -n napari-fluo python=3.10
-> conda activate napari-fluo
-> pip install uv
-> uv pip install -r requirements.txt --override overrides.txt
-> ```
-> Then proceed directly to step 4.
+10. **Open a notebook:** `Fluo_3D_nuc_seg_v1.6.3.ipynb` (nuclei) or `Fluo_3D_LD_seg_v1.2.1.ipynb` (Live/Dead).
+
+**Next time**, open Terminal in the project folder and repeat only step 6 (activate) and step 9 (launch Jupyter).
+
+#### Apple Silicon (M1/M2/M3): if step 8 fails
+
+If step 8 fails with build errors for `tetgen` or `meshlib`, install [Miniforge](https://github.com/conda-forge/miniforge) and use a conda environment instead of steps 5–6:
+
+- **Create the environment:**
+
+  ```bash
+  conda create -n napari-fluo python=3.10
+  ```
+
+- **Activate it** (this replaces step 6, also next time):
+
+  ```bash
+  conda activate napari-fluo
+  ```
+
+- Then continue from step 7.
 
 ---
 
 ### Linux
 
-1. **Clone the repository**
+Open a terminal.
+
+1. **Check that Python is installed** — it should print `Python 3.1x.x`:
+   ```bash
+   python3 --version
+   ```
+
+2. **Go to the folder where you want the project** (e.g. your home folder):
+   ```bash
+   cd ~
+   ```
+
+3. **Download the repository:**
    ```bash
    git clone https://github.com/edoborgiani/napari_env-3D_fluo_segmentation.git
+   ```
+
+4. **Enter the project folder:**
+   ```bash
    cd napari_env-3D_fluo_segmentation
    ```
 
-2. **Create a virtual environment** (recommended)
+5. **Create a virtual environment** (an isolated Python for this project):
    ```bash
    python3 -m venv .venv
+   ```
+   On Debian/Ubuntu, if this fails with `ensurepip is not available`, run the command below (use e.g. `python3.11-venv` for a non-default version), then repeat step 5:
+   ```bash
+   sudo apt-get install python3-venv
+   ```
+
+6. **Activate it** — `(.venv)` appears at the start of the prompt:
+   ```bash
    source .venv/bin/activate
    ```
 
-   On Debian/Ubuntu, the system `python3` package often omits the `venv` module, which makes this step fail with `ensurepip is not available`. Install it first with `sudo apt-get install python3-venv` (or `python3.10-venv` / `python3.11-venv` for a non-default version), then re-run the command above.
-
-3. **Install dependencies**
+7. **Install `uv`:**
    ```bash
    pip install uv
+   ```
+
+8. **Install the dependencies** (takes a few minutes):
+   ```bash
    uv pip install -r requirements.txt --override overrides.txt
    ```
 
-4. **Launch Jupyter**
+9. **Launch Jupyter** — it opens in your browser:
    ```bash
    jupyter notebook
    ```
-   Open `Fluo_3D_nuc_seg_v1.6.3.ipynb` for nuclei segmentation, or `Fluo_3D_LD_seg_v1.2.1.ipynb` for Live/Dead segmentation.
 
-> **Note (Headless servers only):** If you are running on a remote Linux server without a physical display (e.g. an HPC cluster accessed via SSH), Napari's Qt backend will fail to open. Run the following commands **before step 4** to start a virtual framebuffer:
-> ```bash
-> sudo apt-get install libxcb-xinerama0 xvfb
-> export DISPLAY=:99
-> Xvfb :99 -screen 0 1024x768x24 &
-> ```
-> This is not needed on a standard desktop Linux installation.
+10. **Open a notebook:** `Fluo_3D_nuc_seg_v1.6.3.ipynb` (nuclei) or `Fluo_3D_LD_seg_v1.2.1.ipynb` (Live/Dead).
+
+**Next time**, open a terminal in the project folder and repeat only step 6 (activate) and step 9 (launch Jupyter).
+
+#### Headless servers only
+
+On a server without a display (e.g. an HPC cluster over SSH), napari needs a virtual display. Not needed on a desktop Linux installation. Before step 9:
+
+- **Install the virtual display:**
+
+  ```bash
+  sudo apt-get install libxcb-xinerama0 xvfb
+  ```
+
+- **Point napari to it:**
+
+  ```bash
+  export DISPLAY=:99
+  ```
+
+- **Start it in the background:**
+
+  ```bash
+  Xvfb :99 -screen 0 1024x768x24 &
+  ```
 
 ## Usage
 
-- Run the notebook cells in order. Each code cell has a short description right above it (**Cell N** (title)), and the notebook is divided into six sections: imports → inputs and setup → preparation → processing and segmentation → quantification → export.
+- Run the notebook cells in order. Each code cell has a one-line description right above it (**Cell N** — title), each setting is explained by a short comment on its line, and the notebook is divided into six sections: imports → inputs and setup → preparation → processing and segmentation → quantification → export.
 - The first cell calls `load_nuclei_notebook_setup()` to import all required libraries in one step; the second calls `reload_helpers()` so edits to the helper file take effect without restarting the kernel.
 - Use Napari for interactive visualization at any step.
 - All shared processing logic lives in `helpers/notebook_helpers.py` — customize functions there rather than duplicating code across notebooks.
