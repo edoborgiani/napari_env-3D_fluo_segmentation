@@ -2535,9 +2535,13 @@ def export_channel_histograms(
     -------
     output_path : str or Path
     """
+    from helpers.notebook_setup_helpers import stardist_available
+
     output_path = _stem_output_path(input_file, '_histograms.xlsx', output_dir)
     if nuclei_split_config is None:
         nuclei_split_config = get_nuclei_split_config(profile="balanced")
+    # Record the method actually used (segment_nuclei warns when it falls back).
+    trig_stardist = bool(trig_stardist) and stardist_available()
 
     processing_params = {
         'Input file':                     str(input_file),
@@ -7954,6 +7958,11 @@ def segment_nuclei(
     from skimage import morphology
     from skimage.segmentation import relabel_sequential
 
+    from helpers.notebook_setup_helpers import resolve_stardist_flag
+
+    # Falls back to Cellpose/watershed (with a warning) if StarDist isn't installed.
+    trig_stardist = resolve_stardist_flag(trig_stardist)
+
     r_zX, r_zY, r_zZ = r_zxyz
     im_segmentation_stack = {}
     if nuclei_split_config is None:
@@ -9720,8 +9729,8 @@ class StainDictEditor:
         errors, _ = self._validate()
         if errors or not self._confirmed:
             raise StainTableNotConfirmed(
-                "The stain table in Cell 4 is not confirmed yet: fill it in, "
-                "click 'Confirm', then run the notebook again from Cell 5."
+                "The stain table in Cell 5 is not confirmed yet: fill it in, "
+                "click 'Confirm', then run the notebook again from Cell 6."
             )
         return self.stain_dict, self.cyto_markers
 
@@ -9777,7 +9786,7 @@ def _process_single_image_batch(
     split_gamma_step=0.0,
     min_piece_fraction=0.0,
 ):
-    """Run the notebook pipeline (Cells 4-34) on one file, without viewers,
+    """Run the notebook pipeline (Cells 5-35) on one file, without viewers,
     plots or PNG subfolders, writing every output file into *output_dir*
     (this image's own subfolder of the batch output folder).
     ``split_gamma``, ``split_gamma_step`` and ``min_piece_fraction`` are the
@@ -9788,7 +9797,7 @@ def _process_single_image_batch(
                                        stain_table_path=(f"{name_setup}_stain_dict.json"
                                                          if use_setup else None))
 
-    # Cell 4
+    # Cell 5
     (meta, img, r_X, r_Y, r_Z, file_meta, ROI_print,
      cyto_factor, PCM_factor, zooms, used_lazy_loading) = initialize_dataset(
         input_file, roi,
@@ -9800,7 +9809,7 @@ def _process_single_image_batch(
     # 2D image (single plane): segmented in 2D, sizes are areas, no 3D exports.
     is_2d = img.shape[0] == 1
 
-    # Cells 6-7
+    # Cells 7-8
     im_final_stack, _, _, _, _, stain_df, _ = prepare_and_preview(
         img,
         nuclei_diameter, cell_diameter,
@@ -9821,7 +9830,7 @@ def _process_single_image_batch(
         progress=progress,
     )
 
-    # Cells 9-15
+    # Cells 10-16
     im_final_stack = run_normalize(im_final_stack, stain_complete_df=stain_complete_df)
     im_final_stack, r_zX, r_zY, r_zZ = run_resample(
         im_final_stack, stain_complete_df=stain_complete_df, zoom_factors=zooms, meta=meta,
@@ -9843,7 +9852,7 @@ def _process_single_image_batch(
         progress=progress,
     )
 
-    # Cell 16
+    # Cell 17
     export_channel_histograms(
         im_final_stack, stain_complete_df, input_file,
         ROI_print=ROI_print, lazy_loading_used=used_lazy_loading,
@@ -9868,7 +9877,7 @@ def _process_single_image_batch(
         },
     )
 
-    # Cells 17-21
+    # Cells 18-22
     im_segmentation_stack = segment_nuclei(
         im_final_stack,
         stain_df=stain_df,
@@ -9928,7 +9937,7 @@ def _process_single_image_batch(
     # the previous image's tables -- register this image's before quantifying.
     set_notebook_context(stain_df=stain_df, stain_complete_df=stain_complete_df)
 
-    # Cells 23 and 25
+    # Cells 24 and 26
     percell_mean_df, percell_std_df = compute_percell_marker_intensity_df(
         im_segmentation_stack, im_final_stack,
         stain_complete_df=stain_complete_df,
@@ -9945,7 +9954,7 @@ def _process_single_image_batch(
         is_2d=is_2d,
     )
 
-    # Cell 29 -- saved as PNG only, not displayed
+    # Cell 30 -- saved as PNG only, not displayed
     plot_marker_intensity_clouds(
         percell_mean_df,
         stain_complete_df=stain_complete_df,
@@ -9960,13 +9969,13 @@ def _process_single_image_batch(
     )
     plt.close("all")
 
-    # Cell 33 (written first: it is the main result and the cheapest export)
+    # Cell 34 (written first: it is the main result and the cheapest export)
     export_quantification_to_excel(
         input_file, original_stain_complete_df, labels_full_df,
         progress=progress, output_dir=output_dir,
     )
 
-    # Cell 26 -- PDF only, PNGs go to a temporary folder
+    # Cell 27 -- PDF only, PNGs go to a temporary folder
     build_histogram_report(
         im_segmentation_stack, im_final_stack,
         stain_df=stain_df,
@@ -9978,7 +9987,7 @@ def _process_single_image_batch(
         show_plot=False,
     )
 
-    # Cells 30, 31, 34 -- 3D meshes, not made for a 2D image
+    # Cells 31, 32, 35 -- 3D meshes, not made for a 2D image
     if is_2d and (export_vtk or export_stl or export_fea):
         print("2D image: VTK, STL and FEA mesh exports skipped (3D only).")
     if export_vtk and not is_2d:
@@ -10059,20 +10068,20 @@ def run_batch_folder(
     ``<input_folder>_output/<image stem>/``.
 
     Each file goes through the same steps as the single-file notebook
-    (Cells 4-34) with the same settings, but without napari viewers, inline
+    (Cells 5-35) with the same settings, but without napari viewers, inline
     plots, the optional single-nucleus export, or the crop_png/merged_png/
     density_png subfolders (the PNGs are only needed to build the PDF, so
     they are written to a temporary folder and deleted). Output files keep
     the ``<image stem>_...`` naming of the single-file mode.
 
     Contrast/gamma settings come from ``<name_setup>_setup.csv`` like in
-    Cell 7: if it doesn't exist yet (or ``use_setup`` is False), the napari
+    Cell 8: if it doesn't exist yet (or ``use_setup`` is False), the napari
     setup viewer opens -- or ``automatic_contrast`` picks limits -- and the
     CSV written for the first image is then reused for the following ones
     (as long as ``use_setup`` is True).
 
     ``membrane_markers`` (from the stain table) are filled as rings into the
-    cytoplasm and used as cell borders when splitting it (Cell 18).
+    cytoplasm and used as cell borders when splitting it (Cell 19).
 
     A file that raises an error is reported and skipped; the batch carries on
     with the next one.
@@ -10084,6 +10093,10 @@ def run_batch_folder(
         and error message.
     """
     import traceback
+    from helpers.notebook_setup_helpers import resolve_stardist_flag
+
+    # Resolved once here so the warning isn't repeated for every image.
+    trig_stardist = resolve_stardist_flag(trig_stardist)
 
     image_files = list_image_files(input_folder)
     if not image_files:

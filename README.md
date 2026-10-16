@@ -270,7 +270,7 @@ On a server without a display (e.g. an HPC cluster over SSH), napari needs a vir
 - All shared processing logic lives in `helpers/notebook_helpers.py` — customize functions there rather than duplicating code across notebooks.
 
 ### 2D images
-Both notebooks handle 2D images (a file without a Z stack, or a ROI with a single Z slice) automatically; Cell 4 prints whether the image is 2D or 3D and sets `is_2d`.
+Both notebooks handle 2D images (a file without a Z stack, or a ROI with a single Z slice) automatically; the image-loading cell (Cell 5 in the nuclei notebook, Cell 4 in the LIVE/DEAD one) prints whether the image is 2D or 3D and sets `is_2d`.
 - **Loading:** no Z voxel size is asked — the plane is given a 1 µm thickness, so every "volume" the pipeline computes is the area in µm². Resampling never adds planes along Z.
 - **Reading plain TIFFs:** a TIFF without OME metadata is read from its own dimensions (singleton axes dropped): 2 = one 2D channel, 3 = a 2D image with channels, 4 = a 3D stack with channels (the smaller of the two extra axes is taken as the channel axis). Channel axes stated by the file (ImageJ hyperstack, RGB samples) are used as they are. OME-TIFFs go through aicsimageio as before.
 - **Processing:** median, Gaussian and Sauvola filters run in 2D on the plane.
@@ -282,8 +282,8 @@ Both notebooks handle 2D images (a file without a Z stack, or a ROI with a singl
 ### 1. Import Libraries and Helpers (Cells 1-2)
 Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 calls `reload_helpers()` to reload `helpers/notebook_helpers.py` without restarting the kernel.
 
-### 2. Inputs and Setup (Cells 3-5)
-- **Cell 3 — Settings.** The only cell to edit for a new dataset:
+### 2. Inputs and Setup (Cells 3-6)
+- **Cell 3 — Settings.** Together with Cell 4, the only cells to edit for a new dataset:
   - `input_file`: an image file (`.nd2`, `.tif`/`.tiff`/`.ome.tif`, `.czi`, `.lif` or `.oib`; for multi-scene `.czi`/`.lif` only the first scene is read) — or a **folder** for batch mode.
   - `ROI`, `interactive_roi`, `name_setup`, `use_setup`, `automatic_contrast`.
   - `nuclei_diameter`, `cell_diameter` (in the image plane for a 2D image), `scale_factor`, `zoom_factors`.
@@ -291,20 +291,23 @@ Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 cal
   - `multilabel`, `aggregate_grow_factor`.
   - Nuclei size refinement: `size_reference`, `iterative_split`, `oversize_factor`, `max_split_iterations`, `merge_undersized`, `undersize_factor`.
   - Splitting (v1.6.3): `split_gamma` (gamma on the intensity used to split touching nuclei and cells; 1.0 = off), `split_gamma_step` (added at each re-split level of the nuclei; 0 = off), `min_piece_fraction` (split pieces smaller than this × a nucleus are merged back; 0 = off). All three off = v1.6.2 behaviour.
-- **Cell 4 — Load image and stain table.**
+- **Cell 4 — Image processing and export settings**, used in single-file and batch mode:
+  - `sigma` (Gaussian smoothing, Cell 14), `num_plateaus` / `plateau_factor` (histogram equalization, Cell 15), `threshold_method` (Cell 16).
+  - `export_vtk`, `export_stl`, `export_fea` (3D exports, Cells 31, 32, 35) and `export_nuc_3D_vtk` (single-cell VTK, Cell 33, single-file mode only).
+- **Cell 5 — Load image and stain table.**
   - Loads the image with `initialize_dataset()`, automatically choosing lazy (chunked) or eager reading from the file's size, and sets `is_2d` for a single-plane image. With `interactive_roi = True`, `select_roi_interactively()` first opens a napari window with a draggable ROI rectangle (X/Y only); with a saved stain table, its channels are named and colored after the table.
   - Prints the channel list (`print_channel_list()`). In batch mode nothing is loaded: the metadata of every image is read and any image whose channels differ from the first one is flagged.
   - Shows the **interactive stain table** (`edit_stain_dict()`, requires `ipywidgets`, installed with `jupyter`). One row per condition: NUCLEI and CYTOPLASM are fixed, other stains can be added or removed. Choose each condition's channel (`no` = not used) and color (blue, red, green, white, yellow, magenta), type the marker name, tick **Intracellular?** for markers that define the cytoplasm (`cyto_markers`), and **Membrane?** for membrane stains (`membrane_markers`, also included in `cyto_markers`): their rings are filled to get the cytoplasm, and the bright membrane is used as the border between touching cells. The two ticks exclude each other. The table is checked live (e.g. a channel used twice, a missing marker name). **Confirm** saves it to `<name_setup>_stain_dict.json`; with `use_setup = True` it is reloaded, already confirmed, on the next run.
-- **Cell 5 — Read the stain table and run the batch.** Reads the confirmed table into `stain_dict` / `cyto_markers`. If it isn't confirmed yet, execution stops with a message (click **Confirm**, then run again from Cell 5). In batch mode, `run_batch_folder()` then processes every image in the folder with the whole pipeline (no viewers or plots; 3D exports skipped for 2D images) and stops; the image-processing parameters for the batch are set in this cell.
+- **Cell 6 — Read the stain table and run the batch.** Reads the confirmed table into `stain_dict` / `cyto_markers`. If it isn't confirmed yet, execution stops with a message (click **Confirm**, then run again from Cell 6). In batch mode, `run_batch_folder()` then processes every image in the folder with the whole pipeline and the settings of Cells 3-4 (no viewers or plots; 3D exports skipped for 2D images) and stops.
 
-### 3. Preparation and Preview (Cells 6-8)
+### 3. Preparation and Preview (Cells 7-9)
 - `prepare_and_preview()` builds the image stack and the `stain_df` table (channels not used in the stain table are dropped) and opens a napari viewer for channel inspection.
 - `prepare_stain_settings()` loads or creates per-channel contrast/gamma settings — reused from `<name_setup>_setup.csv` if it exists, otherwise set interactively in napari, or picked automatically from the histogram if `automatic_contrast = True`.
-- Cell 8 shows the complete stain settings table for review.
+- Cell 9 shows the complete stain settings table for review.
 
-### 4. Image Processing and Segmentation (Cells 9-22)
-- **Preprocessing:** normalization (`run_normalize()`), isotropic resampling (`run_resample()`), median denoising (`run_denoise()`), contrast/gamma (`run_contrast_gamma()`), Gaussian smoothing (`run_smooth()`, tunable `sigma`) and histogram equalization (`run_equalize()`, tunable `num_plateaus` / `plateau_factor`).
-- **Thresholding (Cell 15):**
+### 4. Image Processing and Segmentation (Cells 10-23)
+- **Preprocessing:** normalization (`run_normalize()`), isotropic resampling (`run_resample()`), median denoising (`run_denoise()`), contrast/gamma (`run_contrast_gamma()`), Gaussian smoothing (`run_smooth()`, `sigma`) and histogram equalization (`run_equalize()`, `num_plateaus` / `plateau_factor`); the tunable values are set in Cell 4.
+- **Thresholding (Cell 16):**
   - Marker channels: `run_threshold()` combines a selectable global method (`threshold_method`: Otsu / median / Huang), local Sauvola thresholding and a statistical-background component (blend weights fixed internally). The histogram marks the global and final thresholds per channel. These masks decide marker positivity.
   - Cytoplasm: `segment_cytoplasm()` uses the **union of the stains** thresholded by `run_threshold()` - the CYTOPLASM channel and/or the intracellular markers, plus the membrane markers with their rings closed and filled (enclosed areas up to ~1.5 cell cross-sections, `build_cytoplasm_mask()`) - and assigns exactly these voxels to the nuclei, without any growth (a cell with no stained cytoplasm keeps just its nucleus). Cells are only grown from the nuclei when there is no CYTOPLASM channel and no ticked marker at all.
 - **Histogram export:** `export_channel_histograms()` saves every stage's histograms and a Parameters sheet (including the splitting settings) to Excel.
@@ -318,7 +321,7 @@ Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 cal
 - **Label assignment and aggregates:** `assign_channel_labels()` links cells to marker channels; `detect_aggregates()` finds cell aggregates.
 - **Visualization:** `view_processing_results()` opens napari viewers with every stage and the segmentation, including "Thresh islands" layers to check the threshold masks.
 
-### 5. Quantification and Analysis (Cells 23-29)
+### 5. Quantification and Analysis (Cells 24-30)
 Marker intensity is reported both for **positive cells** (cells that passed that marker's threshold) and for **all cells**. Sizes are volumes, or areas for a 2D image.
 - `compute_percell_marker_intensity_df()` and `build_labels_df()`: per-cell marker intensity, overlap, size and position.
 - `print_population_summary()`: counts and percentages per condition.
@@ -326,8 +329,9 @@ Marker intensity is reported both for **positive cells** (cells that passed that
 - `build_histogram_report()`: per-nucleus KDE plots and a PDF report.
 - `plot_spatial_distributions()` (X/Y/Z, X/Y for a 2D image), `plot_size_distributions()` and `plot_marker_intensity_clouds()` (flow-cytometry-style intensity vs cytoplasm size plot, saved as PNG).
 
-### 6. Export (Cells 30-34)
-- **3D meshes (3D images only):** VTK volumes (`build_vtk_volumes()`) and per-marker STL meshes (`export_marker_stl()`) for ParaView or similar. Set `nuc_3D_export = True` in Cell 32 to also export a single cell as a VTK sub-volume.
+### 6. Export (Cells 31-35)
+Each 3D export can be switched off in Cell 4 (`export_vtk`, `export_stl`, `export_fea`).
+- **3D meshes (3D images only):** VTK volumes (`build_vtk_volumes()`) and per-marker STL meshes (`export_marker_stl()`) for ParaView or similar. Set `export_nuc_3D_vtk = True` in Cell 4 to also export a single cell as a VTK sub-volume (Cell 33).
 - **Excel:** full quantification tables, stain settings and processing parameters (`export_quantification_to_excel()`), with areas instead of volumes for a 2D image.
 - **FEA (3D images only):** Abaqus `.inp` mesh via tetrahedralization (`export_fea_mesh()`, using `tetgen`).
 

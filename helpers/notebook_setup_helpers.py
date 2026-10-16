@@ -57,9 +57,9 @@ def stardist_available() -> bool:
 def resolve_stardist_flag(trig_stardist: bool) -> bool:
     """Return ``trig_stardist``, forced to False (with a warning) if StarDist can't run.
 
-    StarDist needs TensorFlow, which has no wheels for Python 3.14. Call this
-    right after setting ``trig_stardist`` so the rest of the notebook (including
-    the parameters saved to Excel) sees the value that is actually used.
+    StarDist needs TensorFlow, which has no wheels for Python 3.14. Called by
+    ``segment_nuclei`` and ``run_batch_folder``, so the nuclei notebook doesn't
+    need to call it itself.
     """
     if not trig_stardist or stardist_available():
         return trig_stardist
