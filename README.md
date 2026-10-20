@@ -293,7 +293,7 @@ Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 cal
   - Splitting (v1.6.3): `split_gamma` (gamma on the intensity used to split touching nuclei and cells; 1.0 = off), `split_gamma_step` (added at each re-split level of the nuclei; 0 = off), `min_piece_fraction` (split pieces smaller than this × a nucleus are merged back; 0 = off). All three off = v1.6.2 behaviour.
 - **Cell 4 — Image processing and export settings**, used in single-file and batch mode:
   - `sigma` (Gaussian smoothing, Cell 14), `num_plateaus` / `plateau_factor` (histogram equalization, Cell 15), `threshold_method` (Cell 16).
-  - `export_vtk`, `export_stl`, `export_fea` (3D exports, Cells 31, 32, 35) and `export_nuc_3D_vtk` (single-cell VTK, Cell 33, single-file mode only).
+  - `export_vtk`, `export_stl`, `export_fea` (3D exports, Cells 31, 32, 35).
 - **Cell 5 — Load image and stain table.**
   - Loads the image with `initialize_dataset()`, automatically choosing lazy (chunked) or eager reading from the file's size, and sets `is_2d` for a single-plane image. With `interactive_roi = True`, `select_roi_interactively()` first opens a napari window with a draggable ROI rectangle (X/Y only); with a saved stain table, its channels are named and colored after the table.
   - Prints the channel list (`print_channel_list()`). In batch mode nothing is loaded: the metadata of every image is read and any image whose channels differ from the first one is flagged.
@@ -331,7 +331,7 @@ Marker intensity is reported both for **positive cells** (cells that passed that
 
 ### 6. Export (Cells 31-35)
 Each 3D export can be switched off in Cell 4 (`export_vtk`, `export_stl`, `export_fea`).
-- **3D meshes (3D images only):** VTK volumes (`build_vtk_volumes()`) and per-marker STL meshes (`export_marker_stl()`) for ParaView or similar. Set `export_nuc_3D_vtk = True` in Cell 4 to also export a single cell as a VTK sub-volume (Cell 33).
+- **3D meshes (3D images only):** VTK volumes (`build_vtk_volumes()`) and per-marker STL meshes (`export_marker_stl()`) for ParaView or similar. Set `export_nuc_3D_vtk = True` in Cell 33 itself to also export a single cell as a VTK sub-volume (Cell 33).
 - **Excel:** full quantification tables, stain settings and processing parameters (`export_quantification_to_excel()`), with areas instead of volumes for a 2D image.
 - **FEA (3D images only):** Abaqus `.inp` mesh via tetrahedralization (`export_fea_mesh()`, using `tetgen`).
 

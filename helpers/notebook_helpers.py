@@ -2,6 +2,7 @@ from collections import defaultdict
 import gc
 import json
 import os
+import sys
 
 import cv2
 import matplotlib.colors as mcolors
@@ -779,7 +780,7 @@ def select_roi_interactively(input_file, roi_coords, napari_module=None,
             "you want to process, then close the napari window to continue.\n"
             "The Z range from Cell 3 is kept as-is (not editable here)."
         )
-        napari_module.run()
+        _run_blocking_viewer(viewer, napari_module)
     finally:
         settings.application.ipy_interactive = was_ipy_interactive
 
@@ -995,6 +996,39 @@ def _close_all_napari_viewers(napari_module=None):
         except (RuntimeError, AttributeError):
             pass
     napari_module.Viewer._instances.clear()
+
+
+def _run_blocking_viewer(viewer, napari_module):
+    """Block until ``viewer`` is closed by the user.
+
+    Other platforms use ``napari.run()``. On macOS, that nested Qt loop inside
+    ipykernel can leave the window frozen (spinning wheel), so a local
+    QEventLoop runs instead and quits once the window is no longer visible.
+    """
+    if sys.platform != "darwin":
+        napari_module.run()
+        return
+
+    from qtpy.QtCore import QEventLoop, QTimer
+
+    qt_win = viewer.window._qt_window
+    loop = QEventLoop()
+    timer = QTimer()
+
+    def _quit_if_closed():
+        try:
+            closed = not qt_win.isVisible()
+        except RuntimeError:  # Qt window already deleted
+            closed = True
+        if closed:
+            timer.stop()
+            loop.quit()
+
+    timer.timeout.connect(_quit_if_closed)
+    timer.start(200)
+    qt_win.raise_()
+    qt_win.activateWindow()
+    loop.exec()
 
 
 def _context(name, default=None):
@@ -2426,7 +2460,7 @@ def prepare_stain_settings(
                 "A napari window has opened — check it, adjust the contrast and gamma "
                 "for each channel, then close the window to continue."
             )
-            napari_module.run()
+            _run_blocking_viewer(viewer, napari_module)
             settings.application.ipy_interactive = True
             image_layers = [layer for layer in viewer.layers if isinstance(layer, napari_module.layers.Image)]
             contrast_limits = {layer.name: layer.contrast_limits for layer in image_layers}
