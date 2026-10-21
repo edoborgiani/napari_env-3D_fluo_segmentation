@@ -2451,7 +2451,7 @@ def prepare_stain_settings(
                 viewer.add_image(
                     im_view,
                     name=f"{idx[0]} ({idx[1]})",
-                    colormap=stain_initial_df.loc[idx]["Color"],
+                    colormap=_napari_colormap(stain_initial_df.loc[idx]["Color"]),
                     blending="additive",
                     scale=(r_xyz[2], r_xyz[1], r_xyz[0]) if r_xyz is not None else None,
                 )
@@ -6360,6 +6360,17 @@ def prepare_image_stack(img, nuclei_diameter, cell_diameter):
     return {'Original image': orig}, nuclei_radius, cell_radius, nuclei_volume, cell_volume
 
 
+def _napari_colormap(color):
+    """Map a stain colour to a napari colormap name.
+
+    Stain colours are stored uppercase; napari does not recognise "GREEN" as its
+    built-in colormap and falls back to the darker CSS green (#008000).
+    """
+    if isinstance(color, str) and color.upper() == "GREEN":
+        return "green"
+    return color
+
+
 def build_stain_dataframe(stain_dict: dict, file_meta: dict) -> "pd.DataFrame":
     """Build and sort the staining metadata DataFrame.
 
@@ -6461,7 +6472,7 @@ def view_original_channels(im_final_stack: dict, stain_df: "pd.DataFrame",
         viewer.add_image(
             im_8b,
             name=f"{stain_df.index[c]} ({c_name})",
-            colormap=stain_df['Color'].iloc[c],
+            colormap=_napari_colormap(stain_df['Color'].iloc[c]),
             blending='additive',
             scale=scale,
         )
@@ -8753,7 +8764,7 @@ def view_processing_results(
         for c in range(im_thr.shape[3]):
             idx = stain_complete_df.index[c]
             marker = stain_complete_df.loc[idx, 'Marker']
-            color = stain_complete_df['Color'].iloc[c]
+            color = _napari_colormap(stain_complete_df['Color'].iloc[c])
             viewer_0.add_image(
                 im_final_stack[stage_key][:, :, :, c],
                 name=f'{stage_prefix} {idx} ({marker})', colormap=color,
@@ -8790,7 +8801,7 @@ def view_processing_results(
         for c in range(eq_img.shape[3]):
             idx = stain_df.index[c]
             marker = stain_df.loc[idx, 'Marker']
-            color = stain_df['Color'].iloc[c]
+            color = _napari_colormap(stain_df['Color'].iloc[c])
             viewer_1.add_image(
                 eq_img[:, :, :, c],
                 name=f'EQ {idx} ({marker})', colormap=color,
