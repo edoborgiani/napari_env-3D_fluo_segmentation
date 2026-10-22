@@ -30,6 +30,39 @@ AICSPYLIBCZI_MAX_PYTHON = (3, 13)
 # Kept in sync with the python_version markers in requirements.txt.
 SUPPORTED_PYTHON_VERSIONS = {(3, 10), (3, 11), (3, 12), (3, 13), (3, 14)}
 
+# Harmless Qt messages hidden from the notebook output (see hide_harmless_qt_warnings).
+HIDDEN_QT_MESSAGES = (
+    # Windows nudges napari's window by a few pixels on multi-monitor/scaled displays.
+    "QWindowsWindow::setGeometry: Unable to set geometry",
+)
+
+# Kept at module level so the handler is not garbage-collected while Qt uses it.
+_qt_message_handler = None
+
+
+def hide_harmless_qt_warnings() -> None:
+    """Drop the Qt messages in ``HIDDEN_QT_MESSAGES``; every other message is passed on."""
+    global _qt_message_handler
+    if _qt_message_handler is not None:
+        return
+    try:
+        from qtpy.QtCore import qInstallMessageHandler
+    except Exception:
+        return
+
+    previous = None
+
+    def _handler(mode, context, message):
+        if message.startswith(HIDDEN_QT_MESSAGES):
+            return
+        if previous is not None:
+            previous(mode, context, message)
+        else:
+            sys.stderr.write(message + "\n")
+
+    _qt_message_handler = _handler
+    previous = qInstallMessageHandler(_handler)
+
 
 def check_python_version() -> None:
     """Print whether the active interpreter matches a version requirements.txt is pinned for."""
@@ -228,6 +261,7 @@ def load_common_imports(
     if enable_napari_interactive:
         settings.application.ipy_interactive = True
 
+    hide_harmless_qt_warnings()
     return imported
 
 

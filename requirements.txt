@@ -36,6 +36,11 @@ Pillow
 
 # Notebook environment
 jupyter
+# Pinned: with ipykernel 7 the Qt event loop (%gui qt) doesn't run properly,
+# so napari windows never open (the cell hangs in napari.Viewer(), seen on
+# Windows) or open frozen (spinning wheel on macOS). See
+# https://github.com/napari/napari/issues/7707. 6.x works on both.
+ipykernel<7
 
 # Image I/O
 opencv-python==4.10.0.84

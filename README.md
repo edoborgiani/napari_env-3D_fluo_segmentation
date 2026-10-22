@@ -391,7 +391,7 @@ Same as the nuclei notebook.
 ## Requirements
 See `requirements.txt` for the full list. Key dependencies:
 - `napari[all]`, `numpy`, `scipy`, `scikit-image`, `matplotlib`, `pandas`
-- `jupyter` (includes `ipywidgets`, used by the interactive stain tables)
+- `jupyter` (includes `ipywidgets`, used by the interactive stain tables), with `ipykernel<7`: with ipykernel 7 napari windows don't open (Windows) or freeze (macOS). On an existing environment, run `uv pip install "ipykernel<7"` and restart the kernel.
 - `aicsimageio[nd2]`, `nd2reader`, `aicspylibczi` + `fsspec`, `readlif`, `oiffile` — image readers (ND2, TIFF/OME-TIFF, CZI, LIF, OIB); plain TIFFs are read with `tifffile`, installed with aicsimageio
 - `tensorflow`, `csbdeep`, `stardist`, `cellpose` — segmentation models
 - `pyvista`, `SimpleITK`
