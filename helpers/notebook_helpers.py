@@ -2527,7 +2527,7 @@ def export_channel_histograms(
     threshold_method='otsu',
     global_threshold_weight=0.15,
     sauvola_weight=0.60,
-    aggregate_grow_factor=2.0,
+    aggregate_grow_factor=1.0,
     progress=None,
     output_dir=None,
     membrane_markers=None,
@@ -8217,7 +8217,7 @@ def segment_nuclei(
     return im_segmentation_stack
 
 
-def detect_aggregates(im_segmentation_stack, stain_df, aggregate_grow_factor=2.0):
+def detect_aggregates(im_segmentation_stack, stain_df, aggregate_grow_factor=1.0):
     """Detect cell aggregates by growing cytoplasm labels and masking overlap.
 
     Only runs when a NUCLEI or CYTOPLASM channel is present (i.e. not LD mode).
@@ -8711,8 +8711,9 @@ def view_processing_results(
     denoised, corrected, filtered, equalized), plus a per-channel "Thresh
     islands" labels layer (connected components of the threshold mask) so
     nuclei/marker regions missed or fragmented by thresholding are visible.
+    Only the equalized and threshold-island layers start visible.
     Viewer 1 (only when NUCLEI or CYTOPLASM is present) shows label overlays for
-    nuclei, cytoplasm, PCM, and marker channels.
+    nuclei, cytoplasm, PCM, and marker channels; the marker labels start hidden.
 
     Parameters
     ----------
@@ -8769,6 +8770,9 @@ def view_processing_results(
                 im_final_stack[stage_key][:, :, :, c],
                 name=f'{stage_prefix} {idx} ({marker})', colormap=color,
                 blending='additive', scale=scale,
+                # Only EQ starts visible (with the threshold islands below);
+                # the earlier stages are hidden but can be toggled on.
+                visible=(stage_key == 'Equalized image'),
             )
         if stage_key in _stages_freed_after_view:
             del im_final_stack[stage_key]
@@ -8828,9 +8832,12 @@ def view_processing_results(
                     name='PCM', blending='additive', scale=scale_zoom,
                 )
             elif idx not in ('PCM',):
+                # Marker labels start hidden; EQ, nuclei, cytoplasm, PCM and
+                # aggregates stay visible.
                 viewer_1.add_labels(
                     im_segmentation_stack[idx].astype(np.int32),
                     name=f'{idx} ({marker})', blending='additive', scale=scale_zoom,
+                    visible=False,
                 )
         if 'Cytoplasm' in im_segmentation_stack and 'CYTOPLASM' not in stain_df.index:
             viewer_1.add_labels(
@@ -10084,7 +10091,7 @@ def run_batch_folder(
     trig_stardist=False,
     trig_cellpose_cyto=False,
     multilabel=True,
-    aggregate_grow_factor=2.0,
+    aggregate_grow_factor=1.0,
     nuclei_split_config=None,
     cyto_split_config=None,
     iterative_split=True,
