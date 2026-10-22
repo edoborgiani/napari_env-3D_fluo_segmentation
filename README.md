@@ -288,11 +288,11 @@ Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 cal
   - `ROI`, `interactive_roi`, `name_setup`, `use_setup`, `automatic_contrast`.
   - `nuclei_diameter`, `cell_diameter` (in the image plane for a 2D image), `scale_factor`, `zoom_factors`.
   - Segmentation method: `trig_cellpose`, `trig_stardist` (both `False` = watershed) and `trig_cellpose_cyto`.
-  - `multilabel`, `aggregate_grow_factor`.
+  - `multilabel`, `aggregate_distance_factor` (cells closer than this × `cell_diameter` form one aggregate), `pcm_thickness_factor` (PCM shell thickness = this × `cell_diameter`). Both are converted to µm, so they don't change with `scale_factor`.
   - Nuclei size refinement: `size_reference`, `iterative_split`, `oversize_factor`, `max_split_iterations`, `merge_undersized`, `undersize_factor`.
   - Splitting (v1.6.3): `split_gamma` (gamma on the intensity used to split touching nuclei and cells; 1.0 = off), `split_gamma_step` (added at each re-split level of the nuclei; 0 = off), `min_piece_fraction` (split pieces smaller than this × a nucleus are merged back; 0 = off). All three off = v1.6.2 behaviour.
 - **Cell 4 — Image processing and export settings**, used in single-file and batch mode:
-  - `sigma` (Gaussian smoothing, Cell 13), `num_plateaus` / `plateau_factor` (histogram equalization, Cell 14), `threshold_method` (Cell 15).
+  - `sigma` (Gaussian smoothing, Cell 13; in voxels of the resampled image, like the median filter of Cell 11, so it acts over a smaller distance in µm at a higher `scale_factor`), `num_plateaus` / `plateau_factor` (histogram equalization, Cell 14), `threshold_method` (Cell 15).
   - `export_vtk`, `export_stl`, `export_fea` (3D exports, Cells 30, 31, 34).
 - **Cell 5 — Load image and stain table.**
   - Loads the image with `initialize_dataset()`, automatically choosing lazy (chunked) or eager reading from the file's size, and sets `is_2d` for a single-plane image. With `interactive_roi = True`, `select_roi_interactively()` first opens a napari window with a draggable ROI rectangle (X/Y only); with a saved stain table, its channels are named and colored after the table.
@@ -316,8 +316,8 @@ Cell 1 loads all required imports via `load_nuclei_notebook_setup()`. Cell 2 cal
   - the pieces of each split smaller than `min_piece_fraction` × a nucleus are merged into the closest big piece of the same split (`absorb_small_split_pieces()`);
   - then, for every method, a size-based refinement sets a reference nucleus size (`size_reference`), merges fragments smaller than `undersize_factor` × reference into a touching neighbour (only if the result is still one plausible nucleus with no dark seam at the contact), and re-splits labels bigger than `oversize_factor` × reference with increasingly aggressive settings ('aggressive' → 'very aggressive' → 'extreme') and, with `split_gamma_step`, a higher gamma at each level. Labels that can't be fixed are kept, never deleted.
   - On a 2D image the same steps run in the image plane (see [2D images](#2d-images)).
-- **Cytoplasm / PCM:** `segment_cytoplasm()` builds the cytoplasm from the CYTOPLASM channel (optionally shaped with Cellpose, `trig_cellpose_cyto = True`), otherwise from the intracellular markers, otherwise by growing the nuclei; touching cells are split where the marker signal fades and where a membrane marker is bright — on intensities gamma-adjusted with `split_gamma`, so the borders between cells are more distinct. `segment_pcm()` adds the pericellular matrix shell.
-- **Label assignment and aggregates:** `assign_channel_labels()` links cells to marker channels; `detect_aggregates()` finds cell aggregates.
+- **Cytoplasm / PCM:** `segment_cytoplasm()` builds the cytoplasm from the CYTOPLASM channel (optionally shaped with Cellpose, `trig_cellpose_cyto = True`), otherwise from the intracellular markers, otherwise by growing the nuclei; touching cells are split where the marker signal fades and where a membrane marker is bright — on intensities gamma-adjusted with `split_gamma`, so the borders between cells are more distinct. `segment_pcm()` adds the pericellular matrix shell, `pcm_thickness_factor` × `cell_diameter` µm thick.
+- **Label assignment and aggregates:** `assign_channel_labels()` links cells to marker channels; `detect_aggregates()` groups cells closer than `aggregate_distance_factor` × `cell_diameter` µm into aggregates.
 - **Visualization:** `view_processing_results()` opens napari viewers with every stage and the segmentation, including "Thresh islands" layers to check the threshold masks.
 
 ### 5. Quantification and Analysis (Cells 23-29)

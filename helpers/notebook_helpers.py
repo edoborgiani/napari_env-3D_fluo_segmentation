@@ -57,6 +57,7 @@ __all__ = [
     "get_nuclei_split_config",
     "get_stain_name",
     "grow_labels",
+    "expand_labels_um",
     "grow_markers_within_islands_limited",
     "hist_plot",
     "hist_plot_with_thresholds",
@@ -837,6 +838,8 @@ def initialize_dataset(input_file, roi_coords,
     )
 
     cyto_factor = int(np.round(cell_diameter / nuclei_diameter))
+    # PCM_factor is no longer used (segment_pcm takes pcm_thickness_factor);
+    # still returned so the notebooks' unpacking keeps working.
     PCM_factor = int(cyto_factor * 1.1)
     if PCM_factor == cyto_factor:
         PCM_factor += 1
@@ -1351,7 +1354,10 @@ def stardist3d_from_2d(
     norm=True,
     progress=None,
 ):
-    """Apply StarDist2D slice by slice, then split merged objects in 3D."""
+    """Apply StarDist2D slice by slice, then split merged objects in 3D.
+
+    ``nucleus_radius`` is in um and ``voxel_size`` is (Z, Y, X) in um.
+    """
     try:
         from csbdeep.utils import normalize
         from stardist.models import StarDist2D
@@ -1388,11 +1394,13 @@ def stardist3d_from_2d(
 
     distance = ndi.distance_transform_edt(labels_3d > 0, sampling=voxel_size)
 
+    # nucleus_radius is in um: converted to voxels per axis, so the peak
+    # neighbourhood follows the voxel size (and scale_factor).
     footprint = np.ones(
         (
-            max(1, int(round(z_spacing / y_spacing))),
-            max(1, int(round(nucleus_radius))),
-            max(1, int(round(nucleus_radius))),
+            max(1, int(round(nucleus_radius / z_spacing))),
+            max(1, int(round(nucleus_radius / y_spacing))),
+            max(1, int(round(nucleus_radius / x_spacing))),
         ),
         dtype=bool,
     )
@@ -1959,6 +1967,23 @@ def grow_labels(label_matrix, volume_factor=5.0):
     return output
 
 
+def expand_labels_um(label_matrix, distance_um, spacing):
+    """Grow every label into free space by *distance_um* micrometers.
+
+    Distances use the physical voxel *spacing* (Z, Y, X), so the growth is
+    the same in um whatever the voxel size (or ``scale_factor``). Each free
+    voxel goes to its nearest label.
+    """
+    if distance_um <= 0 or not np.any(label_matrix):
+        return label_matrix.copy()
+    distance, indices = ndi.distance_transform_edt(
+        label_matrix == 0, sampling=spacing, return_indices=True,
+    )
+    output = label_matrix[tuple(indices)]
+    output[distance > distance_um] = 0
+    return output
+
+
 def merge_small_touching_labels(label_matrix, size_threshold, z_weight=2.0):
     """Merge small touching labels into their largest viable neighbor."""
     del z_weight
@@ -2512,7 +2537,7 @@ def export_channel_histograms(
     nuclei_diameter=None,
     cell_diameter=None,
     cyto_factor=None,
-    PCM_factor=None,
+    pcm_thickness_factor=None,
     zoom_factors=None,
     scale_factor=1.0,
     trig_cellpose=False,
@@ -2527,7 +2552,7 @@ def export_channel_histograms(
     threshold_method='otsu',
     global_threshold_weight=0.15,
     sauvola_weight=0.60,
-    aggregate_grow_factor=1.0,
+    aggregate_distance_factor=0.05,
     progress=None,
     output_dir=None,
     membrane_markers=None,
@@ -2585,7 +2610,7 @@ def export_channel_histograms(
         'Nuclei diameter (um)':           str(nuclei_diameter),
         'Cell diameter (um)':             str(cell_diameter),
         'Cyto factor':                    str(cyto_factor),
-        'PCM factor':                     str(PCM_factor),
+        'PCM thickness factor (x cell diameter)': str(pcm_thickness_factor),
         'Zoom factors [Z,Y,X]':           str(zoom_factors),
         'Scale factor':                   str(scale_factor),
         'Use Cellpose':                   str(trig_cellpose),
@@ -2600,7 +2625,7 @@ def export_channel_histograms(
         'Threshold method':               str(threshold_method),
         'Global threshold weight':        str(global_threshold_weight),
         'Sauvola (local) threshold weight': str(sauvola_weight),
-        'Aggregate grow factor':          str(aggregate_grow_factor),
+        'Aggregate distance factor (x cell diameter)': str(aggregate_distance_factor),
     }
     if membrane_markers is not None:
         processing_params['Membrane markers'] = str(membrane_markers)
@@ -6728,10 +6753,16 @@ def apply_threshold_per_channel(
             f"sauvola_weight={sauvola_weight}"
         )
 
-    r_zX, r_zY, _ = r_zxyz
+    r_zX, r_zY, r_zZ = r_zxyz
     im_out = image_stack.copy()
     nuclei_size = int(nuclei_diameter / (np.mean([r_zX, r_zY])))
     cell_size = int(cell_diameter / (np.mean([r_zX, r_zY])))
+    # One nucleus in voxels, the reference of the small-island filter: a
+    # sphere for a 3D image (islands are counted in 3D), a disk for 2D.
+    if image_stack.shape[0] > 1:
+        nucleus_vox = _sphere_volume_um3(nuclei_diameter) / (r_zX * r_zY * r_zZ)
+    else:
+        nucleus_vox = np.pi * (nuclei_diameter / 2.0) ** 2 / (r_zX * r_zY)
 
     statistical_weight = 1.0 - global_threshold_weight - sauvola_weight
     global_thresholds = []
@@ -6765,10 +6796,7 @@ def apply_threshold_per_channel(
         rescue = (gain > (gain_ass + 3.0)) & (arr > statistical_thr)
         arrayseg = primary | rescue
 
-        if not is_nuclei:
-            min_size = np.ceil(0.8 * np.pi * ((nuclei_size / 2) ** 2))
-        else:
-            min_size = np.ceil(0.4 * np.pi * ((nuclei_size / 2) ** 2))
+        min_size = np.ceil((0.4 if is_nuclei else 0.8) * nucleus_vox)
 
         im_out[:, :, :, c] = remove_small_islands(
             arrayseg, min_size, progress=progress,
@@ -6844,14 +6872,16 @@ def _cytoplasm_stain_channels(stain_complete_df, n_channels, cyto_markers, membr
     return intra, memb
 
 
-def build_cytoplasm_mask(threshold_img, intra_channels, membrane_channels, max_cell_area):
+def build_cytoplasm_mask(threshold_img, intra_channels, membrane_channels, max_cell_area,
+                         close_radius=2):
     """Union of the thresholded intracellular stains and the filled membrane
     stains.
 
     *threshold_img* is the 'Threshold image' (Z, Y, X, C) of Cell 15. Nothing
     else is added: no nuclei, no hole filling of the union, no growth.
-    Membrane rings are filled up to *max_cell_area* voxels per XY slice
-    (see `_fill_membrane_rings`).
+    Membrane rings are filled up to *max_cell_area* voxels per XY slice,
+    after closing their gaps with a ball of *close_radius* voxels (see
+    `_fill_membrane_rings`).
     """
     mask = np.zeros(threshold_img.shape[:3], dtype=bool)
     for c in intra_channels:
@@ -6860,7 +6890,7 @@ def build_cytoplasm_mask(threshold_img, intra_channels, membrane_channels, max_c
         memb = np.zeros(threshold_img.shape[:3], dtype=bool)
         for c in membrane_channels:
             memb |= threshold_img[:, :, :, c] > 0
-        mask |= _fill_membrane_rings(memb, max_cell_area)
+        mask |= _fill_membrane_rings(memb, max_cell_area, close_radius=close_radius)
     return mask
 
 
@@ -8217,11 +8247,15 @@ def segment_nuclei(
     return im_segmentation_stack
 
 
-def detect_aggregates(im_segmentation_stack, stain_df, aggregate_grow_factor=1.0):
-    """Detect cell aggregates by growing cytoplasm labels and masking overlap.
+def detect_aggregates(im_segmentation_stack, stain_df, cell_diameter, r_zxyz,
+                      aggregate_distance_factor=0.05):
+    """Detect cell aggregates: cells closer than ``aggregate_distance_factor``
+    x ``cell_diameter`` um to each other belong to the same aggregate.
 
-    Only runs when a NUCLEI or CYTOPLASM channel is present (i.e. not LD mode).
-    Updates ``im_segmentation_stack`` in-place with an ``'Aggregates'`` key.
+    Each cell is grown by half that distance (in um, with the physical voxel
+    size, so it does not change with ``scale_factor``); cells whose grown
+    regions touch form one aggregate. Only runs when a NUCLEI or CYTOPLASM
+    channel is present (i.e. not LD mode).
 
     Returns
     -------
@@ -8231,9 +8265,13 @@ def detect_aggregates(im_segmentation_stack, stain_df, aggregate_grow_factor=1.0
     from scipy.ndimage import label as _label
 
     if ('NUCLEI' in stain_df.index) | ('CYTOPLASM' in stain_df.index):
-        im_out, _ = _label(
-            grow_labels(im_segmentation_stack['Cytoplasm'], aggregate_grow_factor) > 0
-        )
+        r_zX, r_zY, r_zZ = r_zxyz
+        gap_um = float(aggregate_distance_factor) * float(cell_diameter)
+        grown = expand_labels_um(im_segmentation_stack['Cytoplasm'], gap_um / 2.0,
+                                 (r_zZ, r_zY, r_zX))
+        im_out, _ = _label(grown > 0)
+        print(f"Aggregates: cells closer than {gap_um:.2f} um "
+              f"({aggregate_distance_factor:g} x cell diameter {cell_diameter:g} um)")
         im_segmentation_stack = dict(im_segmentation_stack)
         im_segmentation_stack['Aggregates'] = im_out * (im_segmentation_stack['Cytoplasm'] > 0)
     return im_segmentation_stack
@@ -8496,6 +8534,8 @@ def segment_cytoplasm(
         cyto_mask = build_cytoplasm_mask(
             im_in, intra_channels, membrane_channels,
             max_cell_area=1.5 * np.pi * (cell_px / 2) ** 2,
+            # Membrane gaps closed over 3% of a cell diameter, in voxels.
+            close_radius=max(1, int(round(0.03 * cell_px))),
         )
         combined_mask = cyto_mask | (nuclei_labels > 0)
         if split_by_intensity_gradient:
@@ -8599,13 +8639,16 @@ def segment_cytoplasm(
 def segment_pcm(
     im_segmentation_stack,
     stain_df,
-    cyto_markers,
-    cyto_factor,
-    PCM_factor,
+    cell_diameter,
+    r_zxyz,
+    pcm_thickness_factor=0.05,
 ):
     """
-    Build the pericellular matrix (PCM) label volume by expanding cytoplasm
-    or nuclei labels and subtracting the cytoplasm.
+    Build the pericellular matrix (PCM) label volume: a shell around each
+    cell's cytoplasm, ``pcm_thickness_factor`` x ``cell_diameter`` um thick.
+
+    The thickness is set in um and grown with the physical voxel size, so it
+    does not change with ``scale_factor``.
 
     Parameters
     ----------
@@ -8613,12 +8656,12 @@ def segment_pcm(
         Must contain 'Nuclei' and 'Cytoplasm'.
     stain_df : DataFrame
         Staining metadata.
-    cyto_markers : list of str
-        Marker labels used for cytoplasm expansion.
-    cyto_factor : float
-        Growth factor used for cytoplasm.
-    PCM_factor : float
-        Total growth factor for PCM (relative to nuclei).
+    cell_diameter : float
+        Approximate whole-cell diameter in um (the thickness reference).
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ)
+        Isotropic voxel sizes in um.
+    pcm_thickness_factor : float
+        PCM thickness as a fraction of ``cell_diameter`` (0.05 = 5%).
 
     Returns
     -------
@@ -8628,18 +8671,16 @@ def segment_pcm(
     if not (('NUCLEI' in stain_df.index) or ('CYTOPLASM' in stain_df.index)):
         return im_segmentation_stack
 
-    has_cyto_channel = 'CYTOPLASM' in stain_df.index
-
-    if has_cyto_channel or len(cyto_markers) > 0:
-        P_factor = int(PCM_factor - cyto_factor)
-        im_out = grow_labels(im_segmentation_stack['Cytoplasm'], P_factor)
-    else:
-        im_out = grow_labels(im_segmentation_stack['Nuclei'], PCM_factor)
-
-    im_out = im_out - im_segmentation_stack['Cytoplasm']
+    r_zX, r_zY, r_zZ = r_zxyz
+    thickness_um = float(pcm_thickness_factor) * float(cell_diameter)
+    cytoplasm = im_segmentation_stack['Cytoplasm']
+    grown = expand_labels_um(cytoplasm, thickness_um, (r_zZ, r_zY, r_zX))
+    im_out = np.where(cytoplasm > 0, 0, grown).astype(cytoplasm.dtype)
+    print(f"PCM: {thickness_um:.2f} um shell around each cell "
+          f"({pcm_thickness_factor:g} x cell diameter {cell_diameter:g} um)")
 
     im_segmentation_stack = dict(im_segmentation_stack)
-    im_segmentation_stack['PCM'] = im_out.copy()
+    im_segmentation_stack['PCM'] = im_out
     return im_segmentation_stack
 
 
@@ -9814,7 +9855,7 @@ def _process_single_image_batch(
     trig_stardist,
     trig_cellpose_cyto,
     multilabel,
-    aggregate_grow_factor,
+    aggregate_distance_factor,
     nuclei_split_config,
     cyto_split_config,
     iterative_split,
@@ -9837,6 +9878,7 @@ def _process_single_image_batch(
     split_gamma=1.0,
     split_gamma_step=0.0,
     min_piece_fraction=0.0,
+    pcm_thickness_factor=0.05,
 ):
     """Run the notebook pipeline (Cells 5-35) on one file, without viewers,
     plots or PNG subfolders, writing every output file into *output_dir*
@@ -9910,7 +9952,7 @@ def _process_single_image_batch(
         ROI_print=ROI_print, lazy_loading_used=used_lazy_loading,
         name_setup=name_setup,
         nuclei_diameter=nuclei_diameter, cell_diameter=cell_diameter,
-        cyto_factor=cyto_factor, PCM_factor=PCM_factor,
+        cyto_factor=cyto_factor, pcm_thickness_factor=pcm_thickness_factor,
         zoom_factors=zooms, scale_factor=scale_factor,
         trig_cellpose=trig_cellpose, trig_stardist=trig_stardist,
         trig_cellpose_cyto=trig_cellpose_cyto,
@@ -9918,7 +9960,7 @@ def _process_single_image_batch(
         nuclei_split_config=nuclei_split_config,
         sigma=sigma, num_plateaus=num_plateaus, plateau_factor=plateau_factor,
         threshold_method=threshold_method,
-        aggregate_grow_factor=aggregate_grow_factor,
+        aggregate_distance_factor=aggregate_distance_factor,
         progress=progress,
         output_dir=output_dir,
         membrane_markers=list(membrane_markers or []),
@@ -9969,9 +10011,9 @@ def _process_single_image_batch(
     im_segmentation_stack = segment_pcm(
         im_segmentation_stack=im_segmentation_stack,
         stain_df=stain_df,
-        cyto_markers=cyto_markers,
-        cyto_factor=cyto_factor,
-        PCM_factor=PCM_factor,
+        cell_diameter=cell_diameter,
+        r_zxyz=(r_zX, r_zY, r_zZ),
+        pcm_thickness_factor=pcm_thickness_factor,
     )
     im_segmentation_stack = assign_channel_labels(
         im_final_stack,
@@ -9982,7 +10024,9 @@ def _process_single_image_batch(
     im_segmentation_stack = detect_aggregates(
         im_segmentation_stack,
         stain_df=stain_df,
-        aggregate_grow_factor=aggregate_grow_factor,
+        cell_diameter=cell_diameter,
+        r_zxyz=(r_zX, r_zY, r_zZ),
+        aggregate_distance_factor=aggregate_distance_factor,
     )
 
     # _context() looks at this module's globals first, which may still hold
@@ -10091,7 +10135,7 @@ def run_batch_folder(
     trig_stardist=False,
     trig_cellpose_cyto=False,
     multilabel=True,
-    aggregate_grow_factor=1.0,
+    aggregate_distance_factor=0.05,
     nuclei_split_config=None,
     cyto_split_config=None,
     iterative_split=True,
@@ -10114,6 +10158,7 @@ def run_batch_folder(
     split_gamma=1.0,
     split_gamma_step=0.0,
     min_piece_fraction=0.0,
+    pcm_thickness_factor=0.05,
 ):
     """Process every supported image file in *input_folder* with the full
     pipeline and write each image's outputs into its own subfolder,
@@ -10196,7 +10241,7 @@ def run_batch_folder(
                 trig_stardist=trig_stardist,
                 trig_cellpose_cyto=trig_cellpose_cyto,
                 multilabel=multilabel,
-                aggregate_grow_factor=aggregate_grow_factor,
+                aggregate_distance_factor=aggregate_distance_factor,
                 nuclei_split_config=nuclei_split_config,
                 cyto_split_config=cyto_split_config,
                 iterative_split=iterative_split,
@@ -10219,6 +10264,7 @@ def run_batch_folder(
                 split_gamma=split_gamma,
                 split_gamma_step=split_gamma_step,
                 min_piece_fraction=min_piece_fraction,
+                pcm_thickness_factor=pcm_thickness_factor,
             )
             results.append({
                 "File": image_path.name,
@@ -12284,7 +12330,7 @@ def _process_single_image_ld_batch(
         multilabel=multilabel,
         sigma=sigma, num_plateaus=num_plateaus, plateau_factor=plateau_factor,
         threshold_method=threshold_method,
-        aggregate_grow_factor=None,  # no aggregates / PCM in the LD analysis
+        aggregate_distance_factor=None,  # no aggregates / PCM in the LD analysis
         progress=progress,
         output_dir=output_dir,
         extra_params=ld_params,
