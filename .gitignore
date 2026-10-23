@@ -1,6 +1,6 @@
 # Python environments
-.venv/
-venv/
+.ven*/
+ven*/
 env/
 
 # Python cache / build artifacts

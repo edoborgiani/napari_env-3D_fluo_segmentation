@@ -9287,6 +9287,7 @@ def export_marker_stl(
 def export_fea_mesh(
     im_segmentation_stack,
     input_file,
+    r_zxyz=None,
     progress=None,
     output_dir=None,
 ):
@@ -9297,12 +9298,18 @@ def export_fea_mesh(
     2. Assign tetrahedral elements to individual nucleus labels.
     3. Write a final ``_FEA.inp`` Abaqus file with per-nucleus element sets.
 
+    Node coordinates are written in micrometers, in X, Y, Z order. Nuclei that
+    receive no element get no element set (Abaqus rejects empty sets).
+
     Parameters
     ----------
     im_segmentation_stack : dict
         Must contain 'Nuclei'.
     input_file : str or Path
         Source image path (used to derive output filenames).
+    r_zxyz : tuple of float (r_zX, r_zY, r_zZ), optional
+        Voxel sizes of the segmentation grid in micrometers (after
+        resampling). Without it, coordinates stay in voxel units.
     progress : callable or None
         tqdm-compatible wrapper.
     output_dir : str or Path, optional
@@ -9312,6 +9319,7 @@ def export_fea_mesh(
     import meshlib.mrmeshpy as mr
     import meshlib.mrmeshnumpy as mrn
     import meshio
+    import tempfile
     import tetgen
     import statistics as st
 
@@ -9337,12 +9345,8 @@ def export_fea_mesh(
             nodes, elems = tet.node, tet.elem
     else:
         nodes, elems = tet.node, tet.elem
-    import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message='.*binary.*', category=DeprecationWarning)
-        tet.write('FE_segmentation_full.vtk', binary=False)
-    meshel = meshio.read('FE_segmentation_full.vtk')
-    meshel.write('FE_segmentation.inp')
+    nodes = np.asarray(nodes, dtype=float)
+    elems = np.asarray(elems, dtype=np.int64)
 
     # --- Step 2: assign elements to nucleus labels ---
     cell_elements = {c: [] for c in range(1, nuc_max + 1)}
@@ -9370,29 +9374,56 @@ def export_fea_mesh(
         if c_el != 0 and c_el in cell_elements:
             cell_elements[c_el].append(ce + 1)
 
-    # --- Step 3: write element sets and finalise .inp ---
-    with open("FE_segmentation.inp", "a") as f:
-        for c in _progress_iter(range(1, nuc_max + 1), progress, desc='Step 33C - Write Element Sets'):
-            f.write(f"*Elset, elset=cell{c}\n")
-            j = 1
-            for t in range(1, len(cell_elements[c])):
-                f.write(str(cell_elements[c][t]) + ",")
-                j += 1
-                if j > 16:
-                    f.write("\n")
-                    j = 1
-            f.write("\n")
+    # --- Step 3: write nodes, elements and element sets ---
+    # The mesh was built on the (Z, Y, X) array in voxel units: reorder the
+    # node coordinates to X, Y, Z and scale them to micrometers.
+    if r_zxyz is None:
+        print("export_fea_mesh: no voxel size given (r_zxyz) -- coordinates are in voxel units.")
+        r_zX = r_zY = r_zZ = 1.0
+    else:
+        r_zX, r_zY, r_zZ = r_zxyz
+    points = nodes[:, [2, 1, 0]] * np.array([r_zX, r_zY, r_zZ], dtype=float)
 
-    with open("FE_segmentation.inp", "r") as f:
-        lines = f.readlines()
+    # Swapping the X and Z axes mirrors the mesh, which flips the orientation
+    # of every tetrahedron; reorder the nodes of any element with a negative
+    # volume so Abaqus (C3D4) gets positive volumes throughout.
+    p = points[elems]
+    volume = np.einsum('ij,ij->i', np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0])
+    flipped = volume < 0
+    elems[flipped] = elems[flipped][:, [0, 2, 1, 3]]
+
+    # meshio writes the *NODE / *ELEMENT blocks (1-based ids, matching the
+    # element numbers collected in cell_elements) to a temporary file.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_inp = os.path.join(tmp_dir, "FE_segmentation.inp")
+        meshio.Mesh(points, [("tetra", elems)]).write(tmp_inp, file_format="abaqus")
+        with open(tmp_inp, "r") as f:
+            lines = f.readlines()
 
     out_path = _stem_output_path(input_file, "_FEA.inp", output_dir)
+    empty_sets = 0
     with open(out_path, "w") as f:
-        for line in _progress_iter(lines, progress, desc='Step 33D - Write Final INP'):
-            if line == "*NODE\n":
+        for line in _progress_iter(lines, progress, desc='Step 33C - Write Nodes And Elements'):
+            if line.strip().upper() == "*NODE":
                 f.write("*PART, name=Part-1\n")
             f.write(line)
+        for c in _progress_iter(range(1, nuc_max + 1), progress, desc='Step 33D - Write Element Sets'):
+            ids = cell_elements[c]
+            if not ids:
+                empty_sets += 1
+                continue
+            f.write(f"*Elset, elset=cell{c}\n")
+            for i in range(0, len(ids), 16):  # Abaqus: at most 16 entries per data line
+                f.write(", ".join(str(e) for e in ids[i:i + 16]) + "\n")
         f.write("*END PART\n")
+
+    units = "um" if r_zxyz is not None else "voxels"
+    print(
+        f"FEA mesh: {len(points)} nodes, {len(elems)} tetrahedra, coordinates in {units} (X, Y, Z). "
+        f"Saved to {out_path}"
+    )
+    if empty_sets:
+        print(f"{empty_sets} nucleus label(s) received no element and have no element set.")
 
 
 # ---------------------------------------------------------------------------
@@ -10113,6 +10144,7 @@ def _process_single_image_batch(
         export_fea_mesh(
             im_segmentation_stack,
             input_file=input_file,
+            r_zxyz=(r_zX, r_zY, r_zZ),
             progress=progress,
             output_dir=output_dir,
         )
@@ -12470,6 +12502,7 @@ def _process_single_image_ld_batch(
         export_fea_mesh(
             {'Nuclei': im_segmentation_stack['Cytoplasm']},
             input_file=input_file,
+            r_zxyz=(r_zX, r_zY, r_zZ),
             progress=progress,
             output_dir=output_dir,
         )

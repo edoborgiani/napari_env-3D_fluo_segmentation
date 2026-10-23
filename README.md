@@ -332,7 +332,7 @@ Marker intensity is reported both for **positive cells** (cells that passed that
 Each 3D export can be switched off in Cell 4 (`export_vtk`, `export_stl`, `export_fea`).
 - **3D meshes (3D images only):** VTK volumes (`build_vtk_volumes()`) and per-marker STL meshes (`export_marker_stl()`) for ParaView or similar. Set `export_nuc_3D_vtk = True` in Cell 32 itself to also export a single cell as a VTK sub-volume (Cell 32).
 - **Excel:** full quantification tables, stain settings and processing parameters (`export_quantification_to_excel()`), with areas instead of volumes for a 2D image.
-- **FEA (3D images only):** Abaqus `.inp` mesh via tetrahedralization (`export_fea_mesh()`, using `tetgen`).
+- **FEA (3D images only):** Abaqus `.inp` mesh via tetrahedralization (`export_fea_mesh()`, using `tetgen`), saved as `<file>_FEA.inp`: node coordinates in µm (X, Y, Z), one element set per nucleus (`cell1`, `cell2`, …).
 
 ---
 
