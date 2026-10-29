@@ -5,7 +5,9 @@ NucleoSeg3D notebook processed, read with the pipeline's own loader, together
 with a Labels layer at the correct voxel scale. Paint one label per nucleus;
 when the napari window is closed the labels are saved as
 ``<out>/<image name>.tif`` (the name evaluate_segmentation.py expects), with a
-``<image name>.json`` record of the source file, ROI, channel and draft used.
+``<image name>.json`` record of the source file, ROI, channel, voxel size and
+draft used, the annotator and date/time of every session, and the software
+versions.
 
 The Labels layer starts from, in order of priority:
 
@@ -20,11 +22,11 @@ methods ("initialised with Cellpose and manually corrected").
 Usage::
 
     python validation/annotate_ground_truth.py path/to/image.nd2 \\
-        --roi 100 400 100 400 0 0 --channel DAPI --out ground_truth
+        --roi 100 400 100 400 0 0 --channel DAPI --annotator "Jane Doe" --out ground_truth
 
     # Cellpose draft to correct instead of painting from scratch:
     python validation/annotate_ground_truth.py path/to/image.nd2 --channel DAPI \\
-        --draft cellpose --nuclei-diameter 10
+        --annotator "Jane Doe" --draft cellpose --nuclei-diameter 10
 
 In napari: press M for a new (unused) label, use the paint / fill / erase
 tools of the layer controls, and tick "preserve labels" to avoid painting
@@ -32,7 +34,6 @@ over neighbouring nuclei. Shift+S saves without closing the window.
 """
 
 import argparse
-import datetime
 import json
 import sys
 from pathlib import Path
@@ -44,6 +45,8 @@ from skimage.segmentation import relabel_sequential
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from helpers.notebook_helpers import _image_stem, load_image_and_metadata  # noqa: E402
+from validation.run_metadata import (  # noqa: E402
+    now, software_info, source_file_info, write_record)
 
 LAYER_NAME = "ground truth"
 
@@ -104,13 +107,15 @@ def load_draft(draft, nuclei, voxel_size, nuclei_diameter):
     return labels.astype(np.uint32)
 
 
-def save_labels(labels, gt_path, record):
+def save_labels(labels, gt_path, record, session):
+    """Write the labels and their record; ``session`` (part of the record's
+    ``sessions`` list) gets this save's time and nucleus count."""
     labels, _, _ = relabel_sequential(np.asarray(labels).astype(np.uint32))
     gt_path.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(gt_path, labels.astype(np.uint32), compression="zlib")
-    record = {**record, "n_nuclei": int(labels.max()),
-              "saved": datetime.datetime.now().isoformat(timespec="seconds")}
-    gt_path.with_suffix(".json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    session.update(saved=now(), n_nuclei=int(labels.max()))
+    record.update(saved=session["saved"], n_nuclei=session["n_nuclei"])
+    write_record(gt_path.with_suffix(".json"), record)
     print(f"Saved {record['n_nuclei']} nuclei to {gt_path}")
 
 
@@ -130,23 +135,38 @@ def initial_labels(nuclei, scale, gt_path, draft, nuclei_diameter, restart):
         labels = load_draft(draft, nuclei, scale, nuclei_diameter)
     else:
         labels = np.zeros(nuclei.shape, dtype=np.uint32)
-    return labels, {"draft": draft or "none"}
+    record = {"kind": "ground_truth", "created": now(), "draft": draft or "none"}
+    if draft == "cellpose":
+        record["draft_nuclei_diameter_um"] = nuclei_diameter
+    elif draft:
+        record["draft"] = str(Path(draft).resolve())
+    return labels, record
 
 
-def annotate(img, channel_names, nuc_index, scale, gt_path, record, draft=None,
-             nuclei_diameter=None, restart=False, in_notebook=False):
+def annotate(img, channel_names, nuc_index, scale, gt_path, record, annotator,
+             draft=None, nuclei_diameter=None, restart=False, in_notebook=False):
     """Open napari on ``img`` (..., C) and save the painted labels to ``gt_path``.
 
-    ``in_notebook`` makes the viewer block inside Jupyter until it is closed,
-    as the notebook's own napari windows do.
+    ``annotator`` (a name) is recorded with the start and save time of this
+    session in the ``sessions`` list of ``<gt_path>.json``; resuming an
+    annotation adds a session. ``in_notebook`` makes the viewer block inside
+    Jupyter until it is closed, as the notebook's own napari windows do.
     """
+    annotator = str(annotator or "").strip()
+    if not annotator:
+        raise SystemExit("Give the annotator's name.")
     nuclei = img[..., nuc_index]
     labels, saved_record = initial_labels(nuclei, scale, gt_path, draft,
                                           nuclei_diameter, restart)
     record = {**saved_record, **record,
               "shape": list(nuclei.shape),
               "voxel_size_um": [float(s) for s in scale],
-              "nuclear_channel": channel_names[nuc_index]}
+              "nuclear_channel": channel_names[nuc_index],
+              "software": software_info()}
+    session = {"annotator": annotator, "started": now(),
+               "n_nuclei_at_start": int(labels.max())}
+    record["sessions"] = record.get("sessions", []) + [session]
+    record["annotators"] = sorted({s["annotator"] for s in record["sessions"]})
 
     import napari
 
@@ -175,7 +195,7 @@ def annotate(img, channel_names, nuc_index, scale, gt_path, record, draft=None,
 
         @viewer.bind_key("Shift-S", overwrite=True)
         def _save(_viewer):
-            save_labels(layer.data, gt_path, record)
+            save_labels(layer.data, gt_path, record, session)
 
         print("\nPaint one label per nucleus. M = new label, Shift+S = save, "
               "closing the window saves too.")
@@ -186,23 +206,26 @@ def annotate(img, channel_names, nuc_index, scale, gt_path, record, draft=None,
     finally:
         if in_notebook:
             settings.application.ipy_interactive = was_ipy_interactive
-    save_labels(layer.data, gt_path, record)
+    save_labels(layer.data, gt_path, record, session)
     return gt_path
 
 
-def annotate_from_notebook(img, input_file, roi, file_meta, stain_df, voxel_size,
-                           out="ground_truth", draft=None, nuclei_diameter=None,
-                           restart=False):
+def annotate_from_notebook(img, input_file, roi, file_meta, stain_dict, voxel_size,
+                           annotator, out="ground_truth", draft=None,
+                           nuclei_diameter=None, restart=False):
     """Annotate the NucleoSeg3D notebook's ROI on the original voxel grid.
 
-    The nuclear channel is the stain table's NUCLEI channel. ``img`` is the
-    notebook's (Z, Y, X, C) ROI as loaded, before any zoom, and ``voxel_size``
-    its (Z, Y, X) voxel size, (r_Z, r_Y, r_X): the ground truth is the same as
-    the command line would give, and evaluate_segmentation.py maps the
-    pipeline's resampled labels onto it.
+    The nuclear channel is the stain table's NUCLEI channel (``stain_dict``
+    from Cell 6). ``img`` is the notebook's (Z, Y, X, C) ROI as loaded, before
+    any zoom, and ``voxel_size`` its (Z, Y, X) voxel size, (r_Z, r_Y, r_X):
+    the ground truth is the same as the command line would give, and
+    evaluate_segmentation.py maps the pipeline's resampled labels onto it.
     """
     channel_names = list(file_meta.get("channels") or [])
-    nuclear = str(stain_df.loc["NUCLEI", "Laser"]).strip().upper()
+    nuclear_entry = {str(k).upper(): v for k, v in stain_dict.items()}.get("NUCLEI")
+    if nuclear_entry is None:
+        raise ValueError("The stain table has no NUCLEI row.")
+    nuclear = str(nuclear_entry[1]).strip().upper()  # [marker, channel, color]
     hits = [i for i, name in enumerate(channel_names) if str(name).strip().upper() == nuclear]
     if not hits:
         raise ValueError(f"NUCLEI channel '{nuclear}' not in the file's channels "
@@ -216,11 +239,11 @@ def annotate_from_notebook(img, input_file, roi, file_meta, stain_df, voxel_size
         img, scale = img[0], scale[1:]
 
     record = {
-        "source_file": str(Path(input_file).resolve()),
+        "source_file": source_file_info(input_file),
         "roi_x0_x1_y0_y1_z0_z1": list(roi),
     }
     gt_path = Path(out) / f"{_image_stem(input_file)}.tif"
-    return annotate(img, channel_names, nuc_index, scale, gt_path, record,
+    return annotate(img, channel_names, nuc_index, scale, gt_path, record, annotator,
                     draft=draft, nuclei_diameter=nuclei_diameter, restart=restart,
                     in_notebook=True)
 
@@ -234,6 +257,8 @@ def main():
                         help="same ROI as in the notebook; 0 = full range (default)")
     parser.add_argument("--channel", help="nuclear channel: index or part of its name "
                                           "(default: first channel)")
+    parser.add_argument("--annotator", required=True,
+                        help="name of the person annotating (saved in the .json)")
     parser.add_argument("--out", default="ground_truth", help="output folder")
     parser.add_argument("--draft", help="'cellpose' or a label TIFF to start from")
     parser.add_argument("--nuclei-diameter", type=float,
@@ -255,12 +280,12 @@ def main():
         scale = (r_Z, r_Y, r_X)
 
     record = {
-        "source_file": str(Path(args.image).resolve()),
+        "source_file": source_file_info(args.image),
         "roi_x0_x1_y0_y1_z0_z1": list(args.roi),
     }
     gt_path = Path(args.out) / f"{_image_stem(args.image)}.tif"
-    annotate(img, channel_names, nuc_index, scale, gt_path, record, draft=args.draft,
-             nuclei_diameter=args.nuclei_diameter, restart=args.restart)
+    annotate(img, channel_names, nuc_index, scale, gt_path, record, args.annotator,
+             draft=args.draft, nuclei_diameter=args.nuclei_diameter, restart=args.restart)
 
 
 if __name__ == "__main__":
