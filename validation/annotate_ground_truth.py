@@ -114,6 +114,117 @@ def save_labels(labels, gt_path, record):
     print(f"Saved {record['n_nuclei']} nuclei to {gt_path}")
 
 
+def initial_labels(nuclei, scale, gt_path, draft, nuclei_diameter, restart):
+    """Labels to start from (existing annotation, draft or empty) and their record."""
+    if gt_path.exists() and not restart:
+        labels = np.squeeze(tifffile.imread(gt_path)).astype(np.uint32)
+        if labels.shape != nuclei.shape:
+            raise SystemExit(f"{gt_path} has shape {labels.shape} but the image is "
+                             f"{nuclei.shape}: annotate the same ROI as before, "
+                             "or restart.")
+        print(f"Resuming {gt_path} ({int(labels.max())} labels).")
+        record = json.loads(gt_path.with_suffix(".json").read_text(encoding="utf-8")) \
+            if gt_path.with_suffix(".json").exists() else {}
+        return labels, record
+    if draft:
+        labels = load_draft(draft, nuclei, scale, nuclei_diameter)
+    else:
+        labels = np.zeros(nuclei.shape, dtype=np.uint32)
+    return labels, {"draft": draft or "none"}
+
+
+def annotate(img, channel_names, nuc_index, scale, gt_path, record, draft=None,
+             nuclei_diameter=None, restart=False, in_notebook=False):
+    """Open napari on ``img`` (..., C) and save the painted labels to ``gt_path``.
+
+    ``in_notebook`` makes the viewer block inside Jupyter until it is closed,
+    as the notebook's own napari windows do.
+    """
+    nuclei = img[..., nuc_index]
+    labels, saved_record = initial_labels(nuclei, scale, gt_path, draft,
+                                          nuclei_diameter, restart)
+    record = {**saved_record, **record,
+              "shape": list(nuclei.shape),
+              "voxel_size_um": [float(s) for s in scale],
+              "nuclear_channel": channel_names[nuc_index]}
+
+    import napari
+
+    if in_notebook:
+        # The viewer only blocks when ipy_interactive is off when it is created.
+        from napari.settings import get_settings
+        from helpers.notebook_helpers import _close_all_napari_viewers, _run_blocking_viewer
+        settings = get_settings()
+        was_ipy_interactive = settings.application.ipy_interactive
+        settings.application.ipy_interactive = False
+        _close_all_napari_viewers(napari)
+    try:
+        viewer = napari.Viewer(title=f"Ground truth - {gt_path.stem}")
+        for c in range(img.shape[-1]):
+            data = img[..., c]
+            low, high = np.percentile(data, (1, 99.8))
+            viewer.add_image(data, name=channel_names[c], scale=scale, blending="additive",
+                             contrast_limits=(float(low), float(max(high, low + 1))),
+                             colormap="gray" if c == nuc_index else "magenta",
+                             visible=c == nuc_index)
+        layer = viewer.add_labels(labels, name=LAYER_NAME, scale=scale, opacity=0.5)
+        layer.mode = "paint"
+        layer.selected_label = int(labels.max()) + 1
+        if nuclei.ndim == 3:
+            layer.n_edit_dimensions = 2  # paint slice by slice
+
+        @viewer.bind_key("Shift-S", overwrite=True)
+        def _save(_viewer):
+            save_labels(layer.data, gt_path, record)
+
+        print("\nPaint one label per nucleus. M = new label, Shift+S = save, "
+              "closing the window saves too.")
+        if in_notebook:
+            _run_blocking_viewer(viewer, napari)
+        else:
+            napari.run()
+    finally:
+        if in_notebook:
+            settings.application.ipy_interactive = was_ipy_interactive
+    save_labels(layer.data, gt_path, record)
+    return gt_path
+
+
+def annotate_from_notebook(img, input_file, roi, file_meta, stain_df, voxel_size,
+                           out="ground_truth", draft=None, nuclei_diameter=None,
+                           restart=False):
+    """Annotate the NucleoSeg3D notebook's ROI on the original voxel grid.
+
+    The nuclear channel is the stain table's NUCLEI channel. ``img`` is the
+    notebook's (Z, Y, X, C) ROI as loaded, before any zoom, and ``voxel_size``
+    its (Z, Y, X) voxel size, (r_Z, r_Y, r_X): the ground truth is the same as
+    the command line would give, and evaluate_segmentation.py maps the
+    pipeline's resampled labels onto it.
+    """
+    channel_names = list(file_meta.get("channels") or [])
+    nuclear = str(stain_df.loc["NUCLEI", "Laser"]).strip().upper()
+    hits = [i for i, name in enumerate(channel_names) if str(name).strip().upper() == nuclear]
+    if not hits:
+        raise ValueError(f"NUCLEI channel '{nuclear}' not in the file's channels "
+                         f"{channel_names}.")
+    nuc_index = hits[0]
+
+    img = np.asarray(img)  # possibly a dask array before this
+    channel_names += [f"Channel {i + 1}" for i in range(len(channel_names), img.shape[-1])]
+    scale = tuple(float(v) for v in voxel_size)
+    if img.shape[0] == 1:
+        img, scale = img[0], scale[1:]
+
+    record = {
+        "source_file": str(Path(input_file).resolve()),
+        "roi_x0_x1_y0_y1_z0_z1": list(roi),
+    }
+    gt_path = Path(out) / f"{_image_stem(input_file)}.tif"
+    return annotate(img, channel_names, nuc_index, scale, gt_path, record,
+                    draft=draft, nuclei_diameter=nuclei_diameter, restart=restart,
+                    in_notebook=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Annotate ground-truth nuclei in napari for evaluate_segmentation.py.")
@@ -137,62 +248,19 @@ def main():
     channel_names += [f"Channel {i + 1}" for i in range(len(channel_names), img.shape[-1])]
     nuc_index = pick_channel(args.channel, channel_names, img.shape[-1])
 
-    is_2d = img.shape[0] == 1
-    if is_2d:
+    if img.shape[0] == 1:
         img = img[0]
         scale = (r_Y, r_X)
     else:
         scale = (r_Z, r_Y, r_X)
-    nuclei = img[..., nuc_index]
 
-    gt_path = Path(args.out) / f"{_image_stem(args.image)}.tif"
-    if gt_path.exists() and not args.restart:
-        labels = np.squeeze(tifffile.imread(gt_path)).astype(np.uint32)
-        if labels.shape != nuclei.shape:
-            raise SystemExit(f"{gt_path} has shape {labels.shape} but the ROI is "
-                             f"{nuclei.shape}: use the same --roi as before, or --restart.")
-        print(f"Resuming {gt_path} ({int(labels.max())} labels).")
-        record = json.loads(gt_path.with_suffix(".json").read_text(encoding="utf-8")) \
-            if gt_path.with_suffix(".json").exists() else {}
-    else:
-        if args.draft:
-            labels = load_draft(args.draft, nuclei, scale, args.nuclei_diameter)
-        else:
-            labels = np.zeros(nuclei.shape, dtype=np.uint32)
-        record = {"draft": args.draft or "none"}
-
-    record.update({
+    record = {
         "source_file": str(Path(args.image).resolve()),
         "roi_x0_x1_y0_y1_z0_z1": list(args.roi),
-        "shape": list(nuclei.shape),
-        "voxel_size_um": list(scale),
-        "nuclear_channel": channel_names[nuc_index],
-    })
-
-    import napari
-
-    viewer = napari.Viewer(title=f"Ground truth - {gt_path.stem}")
-    for c in range(img.shape[-1]):
-        data = img[..., c]
-        low, high = np.percentile(data, (1, 99.8))
-        viewer.add_image(data, name=channel_names[c], scale=scale, blending="additive",
-                         contrast_limits=(float(low), float(max(high, low + 1))),
-                         colormap="gray" if c == nuc_index else "magenta",
-                         visible=c == nuc_index)
-    layer = viewer.add_labels(labels, name=LAYER_NAME, scale=scale, opacity=0.5)
-    layer.mode = "paint"
-    layer.selected_label = int(labels.max()) + 1
-    if not is_2d:
-        layer.n_edit_dimensions = 2  # paint slice by slice
-
-    @viewer.bind_key("Shift-S", overwrite=True)
-    def _save(_viewer):
-        save_labels(layer.data, gt_path, record)
-
-    print("\nPaint one label per nucleus. M = new label, Shift+S = save, "
-          "closing the window saves too.")
-    napari.run()
-    save_labels(layer.data, gt_path, record)
+    }
+    gt_path = Path(args.out) / f"{_image_stem(args.image)}.tif"
+    annotate(img, channel_names, nuc_index, scale, gt_path, record, draft=args.draft,
+             nuclei_diameter=args.nuclei_diameter, restart=args.restart)
 
 
 if __name__ == "__main__":
