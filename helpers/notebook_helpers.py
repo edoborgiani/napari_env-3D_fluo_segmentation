@@ -6182,6 +6182,114 @@ def apply_histogram_equalization_per_channel(image_stack, num_plateaus=2, platea
     return im_out
 
 
+def _slice_background(plane, radius_px, percentile):
+    """Smooth background of one 2D plane: a low percentile over a window of
+    ``2 * radius_px``, computed on a block-averaged copy (fast) and
+    interpolated back to the plane's size."""
+    h, w = plane.shape
+    d = max(1, int(radius_px // 8))
+    ph, pw = -h % d, -w % d
+    padded = np.pad(plane, ((0, ph), (0, pw)), mode='edge') if (ph or pw) else plane
+    small = padded.reshape(padded.shape[0] // d, d, padded.shape[1] // d, d).mean(axis=(1, 3))
+    win = max(3, int(round(2 * radius_px / d)) | 1)
+    bg = ndi.percentile_filter(small, percentile, size=win, mode='reflect')
+    bg = ndi.uniform_filter(bg, size=win, mode='reflect')
+    if d > 1:
+        bg = ndi.zoom(bg, d, order=1, mode='nearest')
+    return bg[:h, :w]
+
+
+def correct_z_background(image_stack, radius_um, voxel_size_zyx, percentile=25.0,
+                         channels=None):
+    """Remove the background haze slice by slice (v1.6.5).
+
+    Out-of-focus light makes some Z slices (typically the first ones, near
+    the coverslip) brighter than the rest, and the threshold then takes the
+    haze around the nuclei for nucleus: the nuclei of those slices come out
+    too large and merged. For every Z slice the local background - the
+    ``percentile``-th percentile of the intensity within ``radius_um`` - is
+    estimated and subtracted, and the stack's median background level is
+    added back, so the intensity scale (and the contrast settings) stay
+    comparable.
+
+    Parameters
+    ----------
+    image_stack : ndarray (Z, Y, X, C)
+    radius_um : float
+        Size of the background window, in um (several nuclei across, e.g.
+        15-40). 0 = off (input returned unchanged). A value larger than the
+        image (e.g. 1000) uses one background level per slice.
+    voxel_size_zyx : tuple
+        Voxel size (Z, Y, X) of ``image_stack`` in um.
+    percentile : float
+        Percentile of the intensity taken as background (default 25; must
+        stay below the fraction of the window that is background).
+    channels : iterable of int, optional
+        Channels to correct (default all).
+    """
+    if not radius_um or radius_um <= 0:
+        return image_stack
+    im_out = image_stack.copy()
+    dtype = image_stack.dtype
+    hi = 255 if dtype == np.uint8 else None
+    radius_px = float(radius_um) / float(voxel_size_zyx[1])
+    whole_slice = radius_px >= max(image_stack.shape[1:3])
+    for c in (range(image_stack.shape[3]) if channels is None else channels):
+        ch = image_stack[:, :, :, c].astype(np.float32)
+        bg = np.empty_like(ch)
+        for z in range(ch.shape[0]):
+            if whole_slice:
+                bg[z] = np.percentile(ch[z], percentile)
+            else:
+                bg[z] = _slice_background(ch[z], radius_px, percentile)
+        ref = float(np.median(bg))
+        out = ch - (bg - ref)
+        out = np.clip(out, 0, hi) if hi is not None else np.maximum(out, 0)
+        im_out[:, :, :, c] = out.astype(dtype)
+    return im_out
+
+
+def trim_flared_slices(labels, factor):
+    """Trim the Z slices where a nucleus flares out (v1.6.5).
+
+    Blurred nuclei, in the first/last slices especially, can spread far
+    wider in a few slices than in the rest of the nucleus. For every label,
+    starting from its slice of typical (median) cross-section and moving up
+    and down, a slice whose area is above ``factor`` x that median is cut
+    back to the previous slice's footprint grown by one pixel. ``factor``
+    0 = off.
+    """
+    if not factor or factor <= 0 or labels.ndim != 3 or labels.shape[0] < 3:
+        return labels
+    out = labels.copy()
+    n_trimmed = 0
+    for i, sl in enumerate(ndi.find_objects(labels), start=1):
+        if sl is None:
+            continue
+        m = labels[sl] == i
+        area = m.sum(axis=(1, 2))
+        zs = np.nonzero(area)[0]
+        if len(zs) < 3:
+            continue
+        ref = float(np.median(area[zs]))
+        core = int(zs[np.argmin(np.abs(area[zs] - ref))])
+        new = m.copy()
+        for step in (1, -1):
+            prev = new[core]
+            z = core + step
+            while 0 <= z < m.shape[0]:
+                if area[z] > factor * ref:
+                    new[z] = m[z] & ndi.binary_dilation(prev)
+                    n_trimmed += 1
+                if new[z].any():
+                    prev = new[z]
+                z += step
+        out[sl][m & ~new] = 0
+    if n_trimmed:
+        print(f"Flared slices trimmed (area > {factor:g}x the nucleus median): {n_trimmed}")
+    return out
+
+
 def resample_to_isotropic(image_stack, zoom_factors, meta=None):
     """
     Resample image stack to isotropic voxel spacing.
@@ -7936,6 +8044,9 @@ def segment_nuclei(
     split_gamma=1.0,
     split_gamma_step=0.0,
     min_piece_fraction=0.0,
+    z_elongation=1.0,
+    nuclei_expand_um=0.0,
+    nuclei_flare_trim_factor=0.0,
 ):
     """
     Segment nuclei from the image using watershed, StarDist, or Cellpose.
@@ -8023,6 +8134,27 @@ def segment_nuclei(
         island smaller than this x a nucleus of ``nuclei_diameter`` are merged
         into the closest big piece of the same island
         (`absorb_small_split_pieces`). Default 0 = off.
+    z_elongation : float
+        v1.6.4, 3D images. How many times taller (Z) than wide (XY) a nucleus
+        looks in the image - e.g. ~2.5-3 at 20x, where the axial blur
+        stretches every nucleus along Z. The nuclei segmentation then works
+        with a Z voxel size ``z_elongation`` times smaller, so a stretched
+        nucleus counts as one round nucleus of ``nuclei_diameter``: the
+        expected nucleus volume, the erosion radii and the split distances
+        match the real objects, and a single tall nucleus is no longer taken
+        for an assembly and split along Z. The labels stay on the same grid;
+        only the segmentation's notion of distance in Z changes. Default 1.0
+        = off (v1.6.3 behaviour).
+    nuclei_expand_um : float
+        v1.6.4. Grow every final nucleus label by this distance (um, physical
+        voxel size) into free space, without overlapping its neighbours - for
+        nuclei that come out narrower than they are (threshold too tight at
+        the edge). Default 0 = off.
+    nuclei_flare_trim_factor : float
+        v1.6.5, 3D images. Cut back the Z slices where a nucleus is wider
+        than this x its median cross-section (blur flaring, typically in the
+        first slices); see `trim_flared_slices`. Applied before
+        ``nuclei_expand_um``. Default 0 = off.
 
     Returns
     -------
@@ -8030,6 +8162,15 @@ def segment_nuclei(
         Dict with key 'Nuclei' mapping to the integer label array (Z, Y, X).
     """
     from skimage.measure import label as skimage_label
+
+    # Physical spacing (for the label expansion) vs the spacing seen by the
+    # segmentation (Z shrunk by z_elongation, v1.6.4).
+    physical_zyx = (r_zxyz[2], r_zxyz[1], r_zxyz[0])
+    z_elongation = float(z_elongation or 1.0)
+    if abs(z_elongation - 1.0) > 1e-6 and im_final_stack['Threshold image'].shape[0] > 1:
+        r_zxyz = (r_zxyz[0], r_zxyz[1], r_zxyz[2] / z_elongation)
+        print(f"Z elongation {z_elongation:g}: nuclei segmented with a Z voxel size of "
+              f"{r_zxyz[2]:.3f} um instead of {physical_zyx[0]:.3f} um")
     from skimage import morphology
     from skimage.segmentation import relabel_sequential
 
@@ -8242,6 +8383,11 @@ def segment_nuclei(
 
         im_out = _refine(im_out, split_intensity, split_intensity_raw, gamma_levels)
         del split_intensity, split_intensity_raw
+        if nuclei_flare_trim_factor and nuclei_flare_trim_factor > 0:
+            im_out = trim_flared_slices(im_out, float(nuclei_flare_trim_factor))
+        if nuclei_expand_um and nuclei_expand_um > 0:
+            im_out = expand_labels_um(im_out, float(nuclei_expand_um), physical_zyx)
+            print(f"Nuclei grown by {nuclei_expand_um:g} um into free space.")
         im_segmentation_stack['Nuclei'] = im_out
 
     return im_segmentation_stack

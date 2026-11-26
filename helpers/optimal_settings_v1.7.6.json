@@ -1,0 +1,90 @@
+{
+ "version": "1.7.6",
+ "description": "v1.7.5 settings + the nuclei edge fraction adapted to each image's NUCLEI histogram (signal-to-noise ratio, histogram_rules), fitted and checked leave-one-image-out on manual ground truths. Cell-body settings as v1.7.5.",
+ "validation": {
+  "n_images": 6,
+  "mean_f1": 0.559,
+  "f1_50": 0.766,
+  "objective": "mean F1 over IoU 0.5-0.75 / F1 at IoU 0.5, every ground truth segmented as a new image"
+ },
+ "settings": {
+  "scale_factor": 0.5,
+  "sigma": 0.1,
+  "num_plateaus": 2,
+  "plateau_factor": 0.5,
+  "threshold_method": "median",
+  "split_gamma": 2.0,
+  "split_gamma_step": 1.0,
+  "min_piece_fraction": 0.2,
+  "size_reference": "blend",
+  "iterative_split": true,
+  "oversize_factor": 1.75,
+  "max_split_iterations": 3,
+  "merge_undersized": true,
+  "undersize_factor": 0.6,
+  "z_elongation": 3.0,
+  "nuclei_expand_um": 0.0,
+  "z_bg_radius_um": 10.0,
+  "z_bg_percentile": 40.0,
+  "nuclei_flare_trim_factor": 0.0,
+  "z_atten_strength": 1.0,
+  "nuclei_saddle_dip": 0.9,
+  "nuclei_edge_fraction": 0.3,
+  "nuclei_edge_margin_um": 1.0,
+  "nuclei_tall_volume_factor": 1.3,
+  "nuclei_tall_elongation_factor": 1.2,
+  "nuclei_rescue_contrast": 0.55,
+  "nuclei_rescue_grow_fraction": 0.5,
+  "z_atten_correction": false,
+  "z_atten_model": "exp",
+  "z_atten_conditions": [
+   "NUCLEI"
+  ],
+  "zoom_factors": [
+   1.0,
+   1.0,
+   1.0
+  ],
+  "resample_edge_mode": "nearest",
+  "global_threshold_weight": 0.05,
+  "sauvola_weight": 0.9,
+  "nuclei_split_config_overrides": {
+   "nuclei_bridge_shrink_factor": 0.22,
+   "nuclei_seed_min_fraction": 0.03,
+   "nuclei_min_roundness": 0.55,
+   "nuclei_gradient_smooth_sigma": 1.5,
+   "nuclei_intensity_weight": 1.0,
+   "nuclei_gradient_weight": 1.0,
+   "nuclei_z_anisotropy_factor": 1.0
+  },
+  "nuclei_contrast": "calibrated",
+  "nuclei_gamma": 1.15,
+  "suggest_contrast": true,
+  "auto_adapt_settings": true,
+  "cyto_threshold": {
+   "threshold_method": "huang",
+   "global_threshold_weight": 0.18,
+   "sauvola_weight": 0.48,
+   "window_um": 26.9
+  },
+  "cyto_membrane_close_fraction": 0.061,
+  "cyto_membrane_fill_area_factor": 0.57,
+  "cyto_split_by_intensity_gradient": false,
+  "cyto_mask_close_um": 0.72,
+  "cyto_fill_holes": false,
+  "cyto_grow_um": 1.07,
+  "adapt_to_histograms": true,
+  "histogram_rules": {
+   "nuclei_edge_fraction": {
+    "channel": "NUCLEI",
+    "feature": "snr",
+    "log": true,
+    "a": 0.062,
+    "b": 0.152,
+    "lo": 0.15,
+    "hi": 0.4,
+    "round": 3
+   }
+  }
+ }
+}

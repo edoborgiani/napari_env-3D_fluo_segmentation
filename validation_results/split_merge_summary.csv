@@ -1,0 +1,2 @@
+method,n_gt,n_pred,split_gt_objects,extra_split_pieces,merged_predictions,gt_objects_in_merges,missed_gt_objects,background_predictions,median_abs_size_error
+test_02,214,190,6,6,12,26,40,21,0.24527117180755043

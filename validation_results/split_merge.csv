@@ -1,0 +1,2 @@
+method,image,n_gt,n_pred,split_gt_objects,extra_split_pieces,merged_predictions,gt_objects_in_merges,missed_gt_objects,background_predictions
+test_02,EB-019_M1_CUBE_S1_20x.tif,214,190,6,6,12,26,40,21
