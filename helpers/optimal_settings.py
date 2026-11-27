@@ -1,27 +1,36 @@
-"""Optimal (validated) settings of the nuclei segmentation, for the user notebook.
+"""Optimal (validated) settings of the nuclei segmentation, for the user notebooks.
 
-The user notebooks (`Fluo_3D_nuc_seg_v1.7.1.ipynb`, `..._v1.7.2.ipynb`) ask
-the user only what depends on the experiment (file, ROI, stain table, cell
-size, method, exports). Every setting of the nuclei segmentation itself was
-chosen by ``validation/tune_segmentation.py`` against manual ground truths and
-is read here from ``optimal_settings_v<version>.json`` (next to this file;
-each notebook loads its own version, so an older notebook keeps its results):
+The user notebooks ask only what depends on the experiment (file, ROI, stain
+table, cell size, method, exports). Every setting of the segmentation itself
+was tuned against manual ground truths and is read here from
+``settings/optimal_settings_v<version>.json`` (``SETTINGS_DIR``, the
+``settings`` folder at the top of the repository).
+
+``version='best'`` (the default of `load_optimal_settings`) loads the
+version with the highest nuclei mean F1 on the ground truths (then F1@0.5;
+`best_version`): v1.6.41 at present. It is used by `NucleoSeg3D_v1.6.41.ipynb`
+and the LIVE/DEAD notebook (`helpers.optimal_settings_ld`).
+`NucleoSeg3D_v1.6.4.ipynb` asks for ``'1.6.4'``, so it keeps its results.
+
+- **v1.6.4**: tuned on four ground truths;
+- **v1.6.41**: re-tuned on six ground truths, each scored as a new image.
+  Compared with v1.6.4:
+
+  - the calibrated NUCLEI contrast uses gamma ``nuclei_gamma`` 1.15
+    instead of 1.0;
+  - the resampling keeps the last Z slice (``resample_edge_mode``
+    'nearest', Cell 10);
+  - the cell bodies (Cell 18) have their own settings (``cyto_*``,
+    `cytoplasm_settings`), tuned on Cellpose cell bodies of the manual nuclei;
+  - settings that follow each image's channel histograms
+    (``histogram_rules``, `adapt_to_histograms`, Cell 8; fitted and checked
+    leave-one-image-out): the nuclei edge fraction from the NUCLEI
+    signal-to-noise ratio.
+
+In both versions:
 
 - the NUCLEI contrast of every image is set from its own histogram
-  (calibrated rule, `calibrated_contrast`; v1.7.2: gamma ``nuclei_gamma``
-  1.15 instead of 1.0);
-- v1.7.3: the resampling keeps the last Z slice (``resample_edge_mode``
-  'nearest', Cell 10) and the re-tuned shared values;
-- v1.7.4: the nuclei as v1.7.3; the cell bodies (Cell 18C) with their own
-  settings (``cyto_*``, `cytoplasm_settings`), tuned by
-  ``validation/tune_cyto.py`` on Cellpose cell bodies of the manual nuclei;
-- v1.7.5: the settings of v1.7.4; the notebook adds the optional processing
-  steps (Cells 9-14 can be skipped) and, for 2D images, the resolution
-  adapted to the given nucleus size (`adapt_scale_2d`);
-- v1.7.6: settings that follow each image's channel histograms
-  (``histogram_rules``, `adapt_to_histograms`, Cell 8; fitted and checked
-  leave-one-image-out by ``validation/fit_adaptive_rules.py`` on six ground
-  truths): the nuclei edge fraction from the NUCLEI signal-to-noise ratio;
+  (calibrated rule, `calibrated_contrast`);
 - the nucleus size, `scale_factor` and the um sizes are measured / adapted
   in each image (`adapt_settings_to_image`);
 - everything else (smoothing, threshold, watershed split configuration,
@@ -29,26 +38,54 @@ each notebook loads its own version, so an older notebook keeps its results):
   split, rescue of missed nuclei, edges) is the validated value.
 
 Any of them can still be changed by name with ``custom_settings`` (Cell 4).
-The full validation notebook (`Fluo_3D_nuc_seg_v1.7.1_validation.ipynb`)
-exposes them all.
 """
 
 import json
 from pathlib import Path
 
-VERSIONS = ("1.7.1", "1.7.2", "1.7.3", "1.7.4", "1.7.5", "1.7.6")
+VERSIONS = ("1.6.4", "1.6.41")
 LATEST = VERSIONS[-1]
+# the settings files: <repository>/settings/
+SETTINGS_DIR = Path(__file__).resolve().parent.parent / "settings"
 
 
-def settings_file(version="1.7.1"):
-    """The settings file of one version (``optimal_settings_v<version>.json``)."""
+def _validation_score(version):
+    """(mean F1, F1@0.5, number of ground truths) of one settings file."""
+    record = json.loads((SETTINGS_DIR / f"optimal_settings_v{version}.json")
+                        .read_text(encoding="utf-8"))
+    v = (record.get("validation") or {}).get("all") or {}
+    return (float(v.get("mean_f1") or 0.0), float(v.get("f1_50") or 0.0),
+            len(record.get("ground_truths") or []))
+
+
+def best_version():
+    """The version whose validated settings score best on the manual ground
+    truths: highest nuclei mean F1 (IoU 0.5-0.75, accurate outlines), then
+    F1@0.5 (nuclei found), then the number of ground truths. Settings files
+    missing from ``settings/`` are skipped."""
+    present = [v for v in VERSIONS if (SETTINGS_DIR / f"optimal_settings_v{v}.json").exists()]
+    if not present:
+        raise FileNotFoundError(f"No settings file in {SETTINGS_DIR}")
+    return max(present, key=_validation_score)
+
+
+def resolve_version(version="best"):
+    """``version``, with ``'best'`` replaced by `best_version`."""
+    if version == "best":
+        return best_version()
     if version not in VERSIONS:
-        raise ValueError(f"version must be one of {VERSIONS}, not {version!r}")
-    return Path(__file__).with_name(f"optimal_settings_v{version}.json")
+        raise ValueError(f"version must be 'best' or one of {VERSIONS}, not {version!r}")
+    return version
 
 
-# default of load_optimal_settings: v1.7.1, the version its notebook was written for
-SETTINGS_FILE = settings_file("1.7.1")
+def settings_file(version="best"):
+    """The settings file of one version (``settings/optimal_settings_v<version>.json``;
+    ``'best'`` = `best_version`)."""
+    return SETTINGS_DIR / f"optimal_settings_v{resolve_version(version)}.json"
+
+
+# the settings file of the v1.6.4 notebook (kept for older code)
+SETTINGS_FILE = settings_file("1.6.4")
 
 # segment_nuclei keywords taken from the settings (besides the user's own)
 _SEGMENT_KEYS = (
@@ -68,18 +105,28 @@ _BATCH_OPTION_KEYS = (
     "nuclei_gamma", "resample_edge_mode")
 
 
-def load_optimal_settings(custom_settings=None, path=None, verbose=True, version="1.7.1"):
+def load_optimal_settings(custom_settings=None, path=None, verbose=True, version="best"):
     """The validated settings of ``version`` as a dict (``opt``), with
     ``custom_settings`` (``{name: value}``) applied on top.
+    ``version``: ``'best'`` (default) = the best-scoring settings file
+    (`best_version`), or a version of `VERSIONS` (e.g. ``'1.6.4'`` to keep
+    the results of an older notebook).
     ``nuclei_split_config_overrides`` in ``custom_settings`` is merged into the
-    validated one. Adds ``nuclei_split_config`` (for `segment_nuclei`).
-    ``path`` (a settings file) overrides ``version``."""
+    validated one. Adds ``nuclei_split_config`` (for `segment_nuclei`) and
+    ``_version`` (the version loaded). ``path`` (a settings file) overrides
+    ``version``."""
     from helpers.notebook_helpers import get_nuclei_split_config
+    if verbose and not path and version == "best":
+        best = best_version()
+        others = ", ".join(f"v{v} {_validation_score(v)[0]:.3f}" for v in VERSIONS
+                           if v != best and (SETTINGS_DIR / f"optimal_settings_v{v}.json").exists())
+        print(f"version='best': v{best}, the highest nuclei mean F1 on the ground truths"
+              + (f" (others: {others})." if others else "."))
     path = Path(path) if path else settings_file(version)
     record = json.loads(path.read_text(encoding="utf-8"))
     opt = dict(record["settings"])
-    opt.setdefault("nuclei_gamma", 1.0)  # v1.7.1 files: gamma 1.0
-    # before v1.7.3: the resampling leaves the last Z slice (and row / column) empty
+    opt.setdefault("nuclei_gamma", 1.0)  # v1.6.4 file: gamma 1.0
+    # v1.6.4 file: the resampling leaves the last Z slice (and row / column) empty
     opt.setdefault("resample_edge_mode", "constant")
     custom = dict(custom_settings or {})
     unknown = set(custom) - set(opt)
@@ -90,22 +137,20 @@ def load_optimal_settings(custom_settings=None, path=None, verbose=True, version
         custom["nuclei_split_config_overrides"] = {
             **opt["nuclei_split_config_overrides"], **custom["nuclei_split_config_overrides"]}
     opt.update(custom)
-    # v1.7.6: the settings the user set are not changed by the histogram rules
+    # v1.6.41: the settings the user set are not changed by the histogram rules
     opt["_custom_keys"] = sorted(custom)
     if opt["nuclei_contrast"] not in ("calibrated", None):
         raise ValueError("nuclei_contrast must be 'calibrated' or None (None = as the other "
                          "channels: setup file, napari or automatic_contrast)")
     opt["nuclei_split_config"] = get_nuclei_split_config(
         profile="balanced", **opt["nuclei_split_config_overrides"])
+    opt["_version"] = record.get("version")
     if verbose:
-        # public files: validation {n_images, mean_f1, f1_50}; the full record
-        # (per-image results) is kept privately in validation_tuning/settings_evidence/
         v = record.get("validation", {})
-        summary = v.get("all", v)
-        n_images = v.get("n_images", len(record.get("ground_truths", [])))
         print(f"Optimal settings v{record.get('version')} ({path.name}), validated on "
-              f"{n_images} manual ground truths "
-              f"(mean F1 {summary.get('mean_f1')}, F1@0.5 {summary.get('f1_50')}).")
+              f"{len(record.get('ground_truths', []))} manual ground truths "
+              f"(mean F1 {v.get('all', {}).get('mean_f1')}, F1@0.5 "
+              f"{v.get('all', {}).get('f1_50')}).")
         if custom:
             print("Changed by custom_settings: " + ", ".join(
                 f"{k} = {custom[k]!r}" for k in sorted(custom)))
@@ -130,7 +175,7 @@ def set_nuclei_contrast(im_original, stain_complete_df, original_stain_complete_
 
 
 def adapt_to_histograms(im_original, stain_complete_df, opt):
-    """Cell 8 (v1.7.6): the settings that follow the channel histograms
+    """Cell 8 (v1.6.41): the settings that follow the channel histograms
     (``opt['histogram_rules']``, ``value = clip(a + b x feature, lo, hi)``,
     see `helpers.histogram_adapt`), when ``opt['adapt_to_histograms']``.
     Settings given in ``custom_settings`` are kept. Updates ``opt`` in place;
@@ -233,8 +278,8 @@ def segmentation_settings(opt):
 
 
 def cytoplasm_settings(opt):
-    """Cell 18C: keyword arguments of `segment_cytoplasm`. Up to v1.7.3 only
-    ``split_gamma`` (shared with the nuclei split); v1.7.4 adds the cell-body
+    """Cell 18C: keyword arguments of `segment_cytoplasm`. In v1.6.4 only
+    ``split_gamma`` (shared with the nuclei split); v1.6.41 adds the cell-body
     settings (``cyto_*`` keys of the settings file)."""
     out = {"split_gamma": opt["split_gamma"]}
     if "cyto_grow_um" not in opt:
@@ -258,13 +303,13 @@ def batch_settings(opt):
     options = {k: opt[k] for k in _BATCH_OPTION_KEYS}
     options["z_atten_model"] = opt["z_atten_model"] if opt["z_atten_correction"] else "off"
     options["auto_adapt"] = opt["auto_adapt_settings"]
-    if "histogram_rules" in opt:  # v1.7.6: per image, the user's own settings kept
+    if "histogram_rules" in opt:  # v1.6.41: per image, the user's own settings kept
         keep = set(opt.get("_custom_keys", ()))
         rules = {k: r for k, r in (opt["histogram_rules"] or {}).items()
                  if k.partition(".")[0] not in keep}
         options["histogram_rules"] = rules if opt.get("adapt_to_histograms") and rules else None
     extra = {}
-    if "cyto_grow_um" in opt:  # v1.7.4: the cell-body settings
+    if "cyto_grow_um" in opt:  # v1.6.41: the cell-body settings
         from helpers.notebook_helpers import get_cyto_split_config
         cyto = {k: v for k, v in cytoplasm_settings(opt).items() if k != "split_gamma"}
         extra["cyto_split_config"] = {**get_cyto_split_config(profile="balanced"), **cyto}
@@ -283,11 +328,12 @@ def settings_for_report(opt, adapt_changes=()):
     skip = {"nuclei_split_config", "nuclei_split_config_overrides", "histogram_rules"}
     report = {f"Optimal setting {k}": (str(v) if isinstance(v, (list, dict)) else v)
               for k, v in opt.items() if k not in skip and not k.startswith("_")}
+    report["Settings version"] = opt.get("_version")
     report["Watershed split config"] = str(opt["nuclei_split_config_overrides"])
     report["Settings adapted to the image"] = (
         "; ".join(f"{n} {o} -> {v}" for n, o, v, _ in adapt_changes) or
         ("no change" if opt["auto_adapt_settings"] else "off"))
-    if "histogram_rules" in opt:  # v1.7.6
+    if "histogram_rules" in opt:  # v1.6.41
         report["Histogram rules"] = str(opt["histogram_rules"])
         report["Settings adapted to the histograms"] = (
             "; ".join(f"{n} {o} -> {v} ({s})" for n, o, v, s in opt.get("_histogram_changes", []))

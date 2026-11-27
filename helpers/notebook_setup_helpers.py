@@ -27,7 +27,7 @@ TENSORFLOW_MAX_PYTHON = (3, 13)
 # aicspylibczi (Zeiss .czi reader) ships no wheels for Python 3.14 yet.
 AICSPYLIBCZI_MAX_PYTHON = (3, 13)
 
-# Kept in sync with the python_version markers in requirements.txt.
+# Kept in sync with the python_version markers in install/requirements.txt.
 SUPPORTED_PYTHON_VERSIONS = {(3, 10), (3, 11), (3, 12), (3, 13), (3, 14)}
 
 # Harmless Qt messages hidden from the notebook output (see hide_harmless_qt_warnings).
@@ -65,15 +65,15 @@ def hide_harmless_qt_warnings() -> None:
 
 
 def check_python_version() -> None:
-    """Print whether the active interpreter matches a version requirements.txt is pinned for."""
+    """Print whether the active interpreter matches a version install/requirements.txt is pinned for."""
     version = sys.version_info[:2]
     version_str = f"{version[0]}.{version[1]}"
     if version in SUPPORTED_PYTHON_VERSIONS:
-        print(f"Python {version_str} detected -- supported by requirements.txt.")
+        print(f"Python {version_str} detected -- supported by install/requirements.txt.")
     else:
         supported_str = ", ".join(f"{major}.{minor}" for major, minor in sorted(SUPPORTED_PYTHON_VERSIONS))
         print(
-            f"Warning: Python {version_str} detected. requirements.txt is pinned for "
+            f"Warning: Python {version_str} detected. install/requirements.txt is pinned for "
             f"{supported_str} -- other versions may fail to install or behave "
             "unexpectedly. See README.md Prerequisites."
         )
@@ -105,7 +105,7 @@ def resolve_stardist_flag(trig_stardist: bool) -> bool:
         hint = "Use Python 3.10-3.13 to run StarDist, or use trig_cellpose = True instead."
     else:
         reason = "TensorFlow, csbdeep and/or stardist are not installed in this environment."
-        hint = "Install them with requirements.txt, or use trig_cellpose = True instead."
+        hint = "Install them with install/requirements.txt, or use trig_cellpose = True instead."
 
     print(
         "\n" + "!" * 78 + "\n"

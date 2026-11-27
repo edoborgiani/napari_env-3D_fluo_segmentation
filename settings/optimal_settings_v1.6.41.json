@@ -1,0 +1,364 @@
+{
+  "version": "1.6.41",
+  "description": "Settings of NucleoSeg3D v1.6.41: the nuclei and cell-body settings of the last tuning round (labelled v1.7.5 in the validation records below) + nuclei edge fraction adapted to each image's NUCLEI histogram (signal-to-noise ratio), fitted and checked leave-one-image-out on six manual ground truths (two new: GT5, GT6). Cell-body settings re-checked on six images; no histogram rule helped. The v1.7.x labels in the validation records are internal tuning rounds, not released versions.",
+  "source": "validation_tuning/v176 (sweep/, rules/, check_rule/, sweep_cyto/, rules_cyto/)",
+  "ground_truths": [
+    "GT1",
+    "GT2",
+    "GT3",
+    "GT4",
+    "GT5",
+    "GT6"
+  ],
+  "validation": {
+    "objective": "mean F1 over IoU 0.5-0.75 (whole crop)",
+    "all": {
+      "mean_f1": 0.559,
+      "f1_50": 0.766
+    },
+    "per_image": {
+      "GT1": {
+        "mean_f1": 0.3,
+        "f1_50": 0.655,
+        "nuclei_edge_fraction": 0.207,
+        "tp": 133,
+        "fp": 59,
+        "fn": 81
+      },
+      "GT2": {
+        "mean_f1": 0.605,
+        "f1_50": 0.805,
+        "nuclei_edge_fraction": 0.324,
+        "tp": 70,
+        "fp": 7,
+        "fn": 27
+      },
+      "GT3": {
+        "mean_f1": 0.565,
+        "f1_50": 0.771,
+        "nuclei_edge_fraction": 0.359,
+        "tp": 113,
+        "fp": 16,
+        "fn": 51
+      },
+      "GT4": {
+        "mean_f1": 0.649,
+        "f1_50": 0.829,
+        "nuclei_edge_fraction": 0.349,
+        "tp": 109,
+        "fp": 12,
+        "fn": 33
+      },
+      "GT5": {
+        "mean_f1": 0.608,
+        "f1_50": 0.706,
+        "nuclei_edge_fraction": 0.32,
+        "tp": 66,
+        "fp": 13,
+        "fn": 42
+      },
+      "GT6": {
+        "mean_f1": 0.629,
+        "f1_50": 0.829,
+        "nuclei_edge_fraction": 0.351,
+        "tp": 124,
+        "fp": 20,
+        "fn": 31
+      }
+    },
+    "note": "Every ground truth scored as a new image: calibrated NUCLEI window, measured nucleus size, edge fraction from its NUCLEI histogram (rule fitted on all six).",
+    "v1.7.5_same_images": {
+      "mean_f1": 0.433,
+      "f1_50": 0.685,
+      "per_image": {
+        "GT1": {
+          "mean_f1": 0.304,
+          "f1_50": 0.655
+        },
+        "GT2": {
+          "mean_f1": 0.58,
+          "f1_50": 0.759
+        },
+        "GT3": {
+          "mean_f1": 0.391,
+          "f1_50": 0.608
+        },
+        "GT4": {
+          "mean_f1": 0.418,
+          "f1_50": 0.692
+        },
+        "GT5": {
+          "mean_f1": 0.44,
+          "f1_50": 0.652
+        },
+        "GT6": {
+          "mean_f1": 0.465,
+          "f1_50": 0.742
+        }
+      }
+    },
+    "leave_one_image_out": {
+      "what": "edge-fraction rule fitted on five images, scored on the sixth (interpolated between swept edge fractions); shared = best single edge fraction of the five",
+      "mean_f1_rule": 0.552,
+      "mean_f1_shared": 0.54,
+      "mean_f1_v1.7.5": 0.433,
+      "per_image": {
+        "GT1": {
+          "rule": 0.303,
+          "shared": 0.243,
+          "v1.7.5": 0.304
+        },
+        "GT2": {
+          "rule": 0.588,
+          "shared": 0.585,
+          "v1.7.5": 0.581
+        },
+        "GT3": {
+          "rule": 0.559,
+          "shared": 0.555,
+          "v1.7.5": 0.391
+        },
+        "GT4": {
+          "rule": 0.639,
+          "shared": 0.625,
+          "v1.7.5": 0.418
+        },
+        "GT5": {
+          "rule": 0.601,
+          "shared": 0.604,
+          "v1.7.5": 0.44
+        },
+        "GT6": {
+          "rule": 0.624,
+          "shared": 0.63,
+          "v1.7.5": 0.465
+        }
+      }
+    }
+  },
+  "histogram_rules_evidence": {
+    "nuclei_edge_fraction": "best edge fraction per image vs log10(NUCLEI snr): r 0.85; the three ground truths painted to the painting rule (GT1 snr 9 -> 0.21, GT2 53 -> 0.28, GT6 79 -> 0.33) follow it, so it is the image (noise), not only the painting.",
+    "not_adapted": "nuclei_gamma, nuclei_rescue_contrast (no rule beat one shared value leave-one-image-out); cyto threshold weights and cyto_grow_um (rules gained <= 0.002 mean cell IoU and lost up to 0.009 on some image; per-image optimum only +0.006 over shared)."
+  },
+  "changes": {
+    "nuclei_edge_fraction": [
+      0.2,
+      "rule (0.3 when not adapted)"
+    ],
+    "histogram_rules": [
+      null,
+      "nuclei_edge_fraction from NUCLEI snr"
+    ]
+  },
+  "cytoplasm_tuning": {
+    "run": "validation_tuning/cyto_cellpose_02 (trial 60 of 61)",
+    "objective": "mean over the images of mean_cell_iou (validation/score_cells.py)",
+    "ground_truth": "ground_truth_cyto_cellpose (Cellpose cyto3, 2D + Z stitch, diameter estimated by Cellpose, on the v1.7.3 equalized channels; nuclei = ground_truth/)",
+    "not_used": "ground_truth_cyto/ (drafted from the pipeline itself)",
+    "v1.7.3_mean_cell_iou": 0.4405,
+    "v1.7.4_mean_cell_iou": 0.5151,
+    "per_image": {
+      "GT4": {
+        "mean_cell_iou": 0.577,
+        "cells_mean_f1": 0.475,
+        "cells_f1_50": 0.648,
+        "cyto_mean_f1": 0.405,
+        "cells_without_predicted_cell": 0
+      },
+      "GT1": {
+        "mean_cell_iou": 0.477,
+        "cells_mean_f1": 0.227,
+        "cells_f1_50": 0.472,
+        "cyto_mean_f1": 0.056,
+        "cells_without_predicted_cell": 0
+      },
+      "GT2": {
+        "mean_cell_iou": 0.548,
+        "cells_mean_f1": 0.452,
+        "cells_f1_50": 0.608,
+        "cyto_mean_f1": 0.309,
+        "cells_without_predicted_cell": 0
+      },
+      "GT3": {
+        "mean_cell_iou": 0.458,
+        "cells_mean_f1": 0.191,
+        "cells_f1_50": 0.427,
+        "cyto_mean_f1": 0.112,
+        "cells_without_predicted_cell": 0
+      }
+    },
+    "pipeline_check": {
+      "note": "segment_cytoplasm with the pipeline v1.7.3 nuclei (cyto_cache), scored vs ground_truth_cyto_cellpose; mean over the 4 images",
+      "v1.7.3": {
+        "mean_cell_iou": 0.408,
+        "cells_mean_f1": 0.271,
+        "cells_f1_50": 0.458,
+        "cyto_mean_f1": 0.17,
+        "per_image": {
+          "GT4": {
+            "mean_cell_iou": 0.521,
+            "cells_mean_f1": 0.426
+          },
+          "GT1": {
+            "mean_cell_iou": 0.295,
+            "cells_mean_f1": 0.114
+          },
+          "GT2": {
+            "mean_cell_iou": 0.46,
+            "cells_mean_f1": 0.395
+          },
+          "GT3": {
+            "mean_cell_iou": 0.355,
+            "cells_mean_f1": 0.151
+          }
+        }
+      },
+      "v1.7.4": {
+        "mean_cell_iou": 0.458,
+        "cells_mean_f1": 0.348,
+        "cells_f1_50": 0.548,
+        "cyto_mean_f1": 0.21,
+        "per_image": {
+          "GT4": {
+            "mean_cell_iou": 0.553,
+            "cells_mean_f1": 0.527
+          },
+          "GT1": {
+            "mean_cell_iou": 0.391,
+            "cells_mean_f1": 0.166
+          },
+          "GT2": {
+            "mean_cell_iou": 0.464,
+            "cells_mean_f1": 0.433
+          },
+          "GT3": {
+            "mean_cell_iou": 0.423,
+            "cells_mean_f1": 0.267
+          }
+        }
+      }
+    },
+    "six_image_check": {
+      "settings": "v1.7.5 cell-body settings, cells grown from the manual nuclei, vs ground_truth_cyto_cellpose (GT5 and GT6 not used in the tuning)",
+      "mean_cell_iou": 0.556,
+      "per_image": {
+        "GT1": {
+          "mean_cell_iou": 0.477,
+          "cells_mean_f1": 0.225,
+          "cells_f1_50": 0.472,
+          "cyto_mean_f1": 0.056
+        },
+        "GT2": {
+          "mean_cell_iou": 0.548,
+          "cells_mean_f1": 0.452,
+          "cells_f1_50": 0.608,
+          "cyto_mean_f1": 0.309
+        },
+        "GT3": {
+          "mean_cell_iou": 0.456,
+          "cells_mean_f1": 0.19,
+          "cells_f1_50": 0.421,
+          "cyto_mean_f1": 0.112
+        },
+        "GT4": {
+          "mean_cell_iou": 0.577,
+          "cells_mean_f1": 0.475,
+          "cells_f1_50": 0.648,
+          "cyto_mean_f1": 0.405
+        },
+        "GT5": {
+          "mean_cell_iou": 0.629,
+          "cells_mean_f1": 0.603,
+          "cells_f1_50": 0.772,
+          "cyto_mean_f1": 0.531
+        },
+        "GT6": {
+          "mean_cell_iou": 0.652,
+          "cells_mean_f1": 0.652,
+          "cells_f1_50": 0.88,
+          "cyto_mean_f1": 0.537
+        }
+      }
+    }
+  },
+  "settings": {
+    "scale_factor": 0.5,
+    "sigma": 0.1,
+    "num_plateaus": 2,
+    "plateau_factor": 0.5,
+    "threshold_method": "median",
+    "split_gamma": 2.0,
+    "split_gamma_step": 1.0,
+    "min_piece_fraction": 0.2,
+    "size_reference": "blend",
+    "iterative_split": true,
+    "oversize_factor": 1.75,
+    "max_split_iterations": 3,
+    "merge_undersized": true,
+    "undersize_factor": 0.6,
+    "z_elongation": 3.0,
+    "nuclei_expand_um": 0.0,
+    "z_bg_radius_um": 10.0,
+    "z_bg_percentile": 40.0,
+    "nuclei_flare_trim_factor": 0.0,
+    "z_atten_strength": 1.0,
+    "nuclei_saddle_dip": 0.9,
+    "nuclei_edge_fraction": 0.3,
+    "nuclei_edge_margin_um": 1.0,
+    "nuclei_tall_volume_factor": 1.3,
+    "nuclei_tall_elongation_factor": 1.2,
+    "nuclei_rescue_contrast": 0.55,
+    "nuclei_rescue_grow_fraction": 0.5,
+    "z_atten_correction": false,
+    "z_atten_model": "exp",
+    "z_atten_conditions": [
+      "NUCLEI"
+    ],
+    "zoom_factors": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "resample_edge_mode": "nearest",
+    "global_threshold_weight": 0.05,
+    "sauvola_weight": 0.9,
+    "nuclei_split_config_overrides": {
+      "nuclei_bridge_shrink_factor": 0.22,
+      "nuclei_seed_min_fraction": 0.03,
+      "nuclei_min_roundness": 0.55,
+      "nuclei_gradient_smooth_sigma": 1.5,
+      "nuclei_intensity_weight": 1.0,
+      "nuclei_gradient_weight": 1.0,
+      "nuclei_z_anisotropy_factor": 1.0
+    },
+    "nuclei_contrast": "calibrated",
+    "nuclei_gamma": 1.15,
+    "suggest_contrast": true,
+    "auto_adapt_settings": true,
+    "cyto_threshold": {
+      "threshold_method": "huang",
+      "global_threshold_weight": 0.18,
+      "sauvola_weight": 0.48,
+      "window_um": 26.9
+    },
+    "cyto_membrane_close_fraction": 0.061,
+    "cyto_membrane_fill_area_factor": 0.57,
+    "cyto_split_by_intensity_gradient": false,
+    "cyto_mask_close_um": 0.72,
+    "cyto_fill_holes": false,
+    "cyto_grow_um": 1.07,
+    "adapt_to_histograms": true,
+    "histogram_rules": {
+      "nuclei_edge_fraction": {
+        "channel": "NUCLEI",
+        "feature": "snr",
+        "log": true,
+        "a": 0.062,
+        "b": 0.152,
+        "lo": 0.15,
+        "hi": 0.4,
+        "round": 3
+      }
+    }
+  }
+}

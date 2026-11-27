@@ -1,4 +1,4 @@
-"""v1.7.6: settings adapted to the conditions read off each channel's histogram.
+"""v1.6.41: settings adapted to the conditions read off each channel's histogram.
 
 Every channel of the image is described by a few numbers read from its own
 intensity histogram, on the same 0-255 min-max scale the stain table's
