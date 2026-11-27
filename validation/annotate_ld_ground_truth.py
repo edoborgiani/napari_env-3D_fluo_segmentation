@@ -7,8 +7,9 @@ channels of the ROI and two editable Labels layers, drafted from the pipeline:
 - ``GT nuclei``: the stained nuclei (``im_segmentation_stack['Nuclei (stained)']``;
   the estimated nuclei of cells without a nuclear stain are left out, they
   are not visible in the image);
-- ``GT cells``: the whole cells (``im_segmentation_stack['Cytoplasm']``,
-  nucleus included).
+- ``GT cells``: the cell bodies (``im_segmentation_stack['Cytoplasm']``,
+  nucleus included), without the pipeline's "cells" that are only a stained
+  nucleus: the two layers are independent ground truths.
 
 The draft errs on the side of too many objects, so that correcting it is
 deleting false positives, not painting missed objects: to the pipeline's
@@ -215,15 +216,32 @@ def _add_candidates(base, candidates):
     return out, len(new), first
 
 
-def _nuclei_outside_cells(nuclei, cells):
-    """Number of GT nuclei with less than half of their voxels inside a GT cell."""
-    if not nuclei.any():
-        return 0
-    total = np.bincount(nuclei.ravel())
-    inside = np.bincount(nuclei.ravel(), weights=(cells.ravel() > 0), minlength=len(total))
-    ids = np.nonzero(total)[0]
-    ids = ids[ids > 0]
-    return int(np.sum(inside[ids] < 0.5 * total[ids]))
+def _per_compartment(value, name):
+    """``value`` as {'nuclei': ..., 'cells': ...}; a single number applies to both."""
+    if isinstance(value, dict):
+        missing = set(COMPARTMENTS) - set(value)
+        if missing:
+            raise ValueError(f"{name} needs a value for {sorted(missing)}.")
+        return {comp: value[comp] for comp in COMPARTMENTS}
+    return {comp: value for comp in COMPARTMENTS}
+
+
+def _drop_nucleus_only_cells(cells, nuclei, fraction=0.8):
+    """Remove the cells lying >= ``fraction`` inside a stained nucleus.
+
+    The pipeline makes a cell of every stained nucleus without cytoplasmic
+    signal (the cell *is* the nucleus): in 'GT cells' it would be a second
+    outline on the nucleus. Returns the cells and how many were removed.
+    """
+    sizes = np.bincount(cells.ravel())
+    inside = np.bincount(cells.ravel(), weights=(nuclei.ravel() > 0), minlength=len(sizes))
+    drop = (sizes > 0) & (inside >= fraction * sizes)
+    drop[0] = False
+    if not drop.any():
+        return cells, 0
+    cells = cells.copy()
+    cells[drop[cells]] = 0
+    return cells, int(np.count_nonzero(drop))
 
 
 def _save(layers, drafts, paths, records, session):
@@ -251,10 +269,6 @@ def _save(layers, drafts, paths, records, session):
         print(f"Saved {n} {comp} to {paths[comp]} "
               f"({100 * changed / labels.size:.2f}% of voxels changed from the pipeline "
               f"draft{kept})")
-    outside = _nuclei_outside_cells(np.asarray(layers["nuclei"].data),
-                                    np.asarray(layers["cells"].data))
-    if outside:
-        print(f"Check: {outside} GT nuclei lie mostly outside every GT cell.")
 
 
 def annotate_ld_from_notebook(img, file_meta, stain_dict, im_segmentation_stack, stain_df,
@@ -271,8 +285,10 @@ def annotate_ld_from_notebook(img, file_meta, stain_dict, im_segmentation_stack,
     (background + ``sensitivity`` x noise), each grown from its brightest
     core down to ``edge_fraction`` x that core's intensity above background
     (see `_candidate_objects`). Nuclei
-    candidates come from the nuclear markers, cell candidates from every
-    marker. Candidates only fill the background, the pipeline's objects are
+    candidates come from the nuclear markers, cell candidates from the
+    other markers only, so the two layers stay independent (the cells
+    draft also leaves out the pipeline's cells that are only a stained
+    nucleus). Candidates only fill the background, the pipeline's objects are
     kept as they are; they are highlighted in yellow in the viewer, and
     Shift+D deletes the whole object under the mouse.
 
@@ -304,12 +320,12 @@ def annotate_ld_from_notebook(img, file_meta, stain_dict, im_segmentation_stack,
     nuclei_diameter, cell_diameter : float
         In um (Cells 3 and 8): candidates smaller than a quarter of a nucleus
         are dropped, touching nuclei / cells are split at these sizes.
-    sensitivity : float
+    sensitivity : float or dict {'nuclei': float, 'cells': float}
         Candidate threshold, background + this x noise. Lower = more
         candidates (more to delete); 0 or None = pipeline objects only.
         Only used when a compartment starts from the pipeline (not when
-        resuming a saved ground truth).
-    edge_fraction : float
+        resuming a saved ground truth). A single number applies to both.
+    edge_fraction : float or dict {'nuclei': float, 'cells': float}
         A candidate extends from its core (local maximum) as long as the
         intensity above background stays >= this x the core's (0.1 = 10 %).
     pipeline_settings : dict, optional
@@ -342,27 +358,44 @@ def annotate_ld_from_notebook(img, file_meta, stain_dict, im_segmentation_stack,
     # Markers giving the candidates: nuclei <- nuclear markers, cells <- all markers.
     loc = {str(k).strip().upper(): v for k, v in (localization or {}).items()}
     conditions = [str(cond).strip().upper() for cond in stain_df.index]
+    nuclear = [c for c, cond in enumerate(conditions) if loc.get(cond) == "nuclear"]
+    # Cells only from the non-nuclear markers: a nuclear stain would draw a
+    # second outline around every nucleus in 'GT cells'.
     candidate_channels = {
-        "nuclei": [c for c, cond in enumerate(conditions) if loc.get(cond) == "nuclear"],
-        "cells": list(range(len(conditions))),
+        "nuclei": nuclear,
+        "cells": [c for c in range(len(conditions)) if c not in nuclear],
     }
     split_diameter = {"nuclei": nuclei_diameter, "cells": cell_diameter or nuclei_diameter}
-    use_candidates = bool(sensitivity) and nuclei_diameter is not None
-    if sensitivity and nuclei_diameter is None:
+    sensitivity = _per_compartment(sensitivity, "sensitivity")
+    edge_fraction = _per_compartment(edge_fraction, "edge_fraction")
+    use_candidates = {comp: bool(sensitivity[comp]) and nuclei_diameter is not None
+                      for comp in COMPARTMENTS}
+    if any(sensitivity.values()) and nuclei_diameter is None:
         print("No nuclei_diameter given: no extra candidates, pipeline objects only.")
+    if use_candidates["cells"] and not candidate_channels["cells"]:
+        print("No non-nuclear marker: no extra cell candidates, pipeline cells only.")
 
-    drafts, start, records, highlight = {}, {}, {}, {}
+    drafts, draft_keys = {}, {}
     for comp, (_, keys) in COMPARTMENTS.items():
-        draft, draft_key = _draft(im_segmentation_stack, keys, shape)
-        drafts[comp] = draft
+        drafts[comp], draft_keys[comp] = _draft(im_segmentation_stack, keys, shape)
+    # 'GT cells' = cell bodies only, independent of 'GT nuclei'.
+    drafts["cells"], n_nucleus_only = _drop_nucleus_only_cells(drafts["cells"],
+                                                               drafts["nuclei"])
+    if n_nucleus_only:
+        print(f"{n_nucleus_only} pipeline cells that are only a stained nucleus left out "
+              "of 'GT cells' (they stay in 'GT nuclei').")
+
+    start, records, highlight = {}, {}, {}
+    for comp in COMPARTMENTS:
+        draft, draft_key = drafts[comp], draft_keys[comp]
         candidates_info = None
         if paths[comp].exists() and not restart:
             start[comp], saved_record = _load_existing(paths[comp], shape)
             candidates_info = saved_record.get("candidates")
             print(f"Resuming {paths[comp]} ({_n_objects(start[comp])} {comp})"
                   + ("; set gt_restart = True to start again with the candidates."
-                     if use_candidates and not candidates_info else "."))
-        elif use_candidates and candidate_channels[comp]:
+                     if use_candidates[comp] and not candidates_info else "."))
+        elif use_candidates[comp] and candidate_channels[comp]:
             print(f"Finding {comp} candidates (minimal signal in "
                   f"{', '.join(conditions[c] for c in candidate_channels[comp])})...")
             found = _candidate_objects(
@@ -370,11 +403,12 @@ def annotate_ld_from_notebook(img, file_meta, stain_dict, im_segmentation_stack,
                 smooth_um=0.1 * nuclei_diameter,
                 split_diameter_um=split_diameter[comp],
                 min_diameter_um=nuclei_diameter,
-                sensitivity=sensitivity,
-                edge_fraction=edge_fraction)
+                sensitivity=sensitivity[comp],
+                edge_fraction=edge_fraction[comp])
             start[comp], n_added, first = _add_candidates(draft, found)
             saved_record = {}
-            candidates_info = {"sensitivity": sensitivity, "edge_fraction": edge_fraction,
+            candidates_info = {"sensitivity": sensitivity[comp],
+                               "edge_fraction": edge_fraction[comp],
                                "added": n_added,
                                "first_label": first, "last_label": first + n_added - 1,
                                "markers": [conditions[c] for c in candidate_channels[comp]]}
@@ -391,6 +425,8 @@ def annotate_ld_from_notebook(img, file_meta, stain_dict, im_segmentation_stack,
             "compartment": comp,
             "created": saved_record.get("created", now()),
             "draft": f"LIVE/DEAD pipeline output, im_segmentation_stack['{draft_key}']"
+                     + (f", without the {n_nucleus_only} cells that are only a stained nucleus"
+                        if comp == "cells" and n_nucleus_only else "")
                      + (", plus candidates of minimal signal" if candidates_info else "")
                      + ", manually corrected",
             "candidates": candidates_info,
@@ -440,7 +476,8 @@ def annotate_ld_from_notebook(img, file_meta, stain_dict, im_segmentation_stack,
                 layer.n_edit_dimensions = 2  # paint slice by slice
             layer.selected_label = int(start[comp].max()) + 1
             layers[comp] = layer
-        layers["cells"].contour = 2  # outlines, so nuclei and signal stay visible
+        for layer in layers.values():
+            layer.contour = 2  # outlines only, so the signal stays visible
         for comp, mask in highlight.items():  # static reference: not updated by edits
             viewer.add_image(mask.astype(np.uint8), name=f"candidates added - {comp}",
                              scale=scale, colormap="yellow", blending="additive",
